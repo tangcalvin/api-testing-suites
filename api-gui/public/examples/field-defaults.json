@@ -1,0 +1,64 @@
+{
+  "version": 1,
+  "kind": "defaults",
+  "variables": {
+    "orderNumber": "ORD-1001",
+    "customerName": "Ada Lovelace",
+    "customerEmail": "ada@example.com",
+    "countryCode": "HK",
+    "warehouseCode": "HK-01",
+    "currency": "HKD",
+    "quantity": "2",
+    "unitPrice": "19.5",
+    "taxRate": "0.08",
+    "orderedAt": "2020-01-15T10:15:30+08:00",
+    "deliveryDate": "2099-12-01",
+    "notes": "Leave at reception"
+  },
+  "global": {
+    "orderNumber": "${orderNumber}",
+    "customerName": "${customerName}",
+    "customerEmail": "${customerEmail}",
+    "countryCode": "${countryCode}",
+    "warehouseCode": "${warehouseCode}",
+    "currency": "${currency}",
+    "quantity": "${quantity}",
+    "unitPrice": "${unitPrice}",
+    "taxRate": "${taxRate}",
+    "orderedAt": "${orderedAt}",
+    "requestedDeliveryDate": "${deliveryDate}",
+    "notes": "${notes}",
+    "status": "CONFIRMED",
+    "priority": "HIGH",
+    "discountAmount": "0",
+    "giftWrap": "true"
+  },
+  "operations": {
+    "GET /api/orders": {
+      "orderNumber": "",
+      "status": "",
+      "priority": "",
+      "customerName": "",
+      "customerEmail": "",
+      "currency": "",
+      "countryCode": "",
+      "warehouseCode": "",
+      "giftWrap": "",
+      "notes": "",
+      "size": "20"
+    },
+    "GET /api/orders/cursor": {
+      "orderNumber": "",
+      "status": "",
+      "priority": "",
+      "customerName": "",
+      "customerEmail": "",
+      "currency": "",
+      "countryCode": "",
+      "warehouseCode": "",
+      "giftWrap": "",
+      "notes": "",
+      "limit": "20"
+    }
+  }
+}

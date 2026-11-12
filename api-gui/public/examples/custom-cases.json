@@ -1,0 +1,67 @@
+{
+  "version": 1,
+  "kind": "cases",
+  "operations": {
+    "POST /api/orders": [
+      {
+        "id": "example-create-confirmed",
+        "name": "Create ${orderNumber}",
+        "request": {
+          "status": "CONFIRMED",
+          "priority": "HIGH"
+        },
+        "omit": [],
+        "expect": {
+          "status": "201",
+          "fields": [
+            { "path": "orderNumber", "equals": "${orderNumber}" },
+            { "path": "customerEmail", "equals": "${customerEmail}" },
+            { "path": "status", "equals": "CONFIRMED" }
+          ]
+        }
+      },
+      {
+        "id": "example-missing-email",
+        "name": "Missing email is rejected",
+        "request": {},
+        "omit": ["customerEmail"],
+        "expect": {
+          "status": "400",
+          "fields": [
+            { "path": "exceptions[].field", "equals": "customerEmail" }
+          ]
+        }
+      }
+    ],
+    "GET /api/orders": [
+      {
+        "id": "example-list-first-page",
+        "name": "First page is returned",
+        "request": {},
+        "omit": [],
+        "expect": {
+          "status": "200",
+          "fields": [
+            { "path": "content", "equals": "" },
+            { "path": "page", "equals": "0" }
+          ]
+        }
+      }
+    ],
+    "GET /api/orders/{id}": [
+      {
+        "id": "example-missing-order",
+        "name": "Unknown order",
+        "request": { "id": "999999" },
+        "omit": [],
+        "expect": {
+          "status": "404",
+          "fields": [
+            { "path": "exceptions[].field", "equals": "id" },
+            { "path": "exceptions[].code", "equals": "NotFound" }
+          ]
+        }
+      }
+    ]
+  }
+}

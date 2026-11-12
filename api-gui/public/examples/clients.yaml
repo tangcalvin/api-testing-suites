@@ -1,0 +1,195 @@
+version: 1
+kind: profiles
+activeId: client-hk
+profiles:
+  - id: client-hk
+    name: Harbour
+    oauth:
+      clientId: orders-hk
+      algorithm: RS256
+      scope: orders.read
+      lifetime: "300"
+    defaults:
+      version: 1
+      kind: defaults
+      variables:
+        orderNumber: ORD-1001
+        customerName: Ada Lovelace
+        customerEmail: ada@example.com
+        countryCode: HK
+        warehouseCode: HK-01
+        currency: HKD
+        quantity: "2"
+        unitPrice: "19.5"
+        taxRate: "0.08"
+        orderedAt: 2020-01-15T10:15:30+08:00
+        deliveryDate: 2099-12-01
+        notes: Leave at reception
+      global:
+        orderNumber: ${orderNumber}
+        customerName: ${customerName}
+        customerEmail: ${customerEmail}
+        countryCode: ${countryCode}
+        warehouseCode: ${warehouseCode}
+        currency: ${currency}
+        quantity: ${quantity}
+        unitPrice: ${unitPrice}
+        taxRate: ${taxRate}
+        orderedAt: ${orderedAt}
+        requestedDeliveryDate: ${deliveryDate}
+        notes: ${notes}
+        status: CONFIRMED
+        priority: HIGH
+        discountAmount: "0"
+        giftWrap: "true"
+      operations:
+        GET /api/orders: &listFilters
+          orderNumber: ""
+          status: ""
+          priority: ""
+          customerName: ""
+          customerEmail: ""
+          currency: ""
+          countryCode: ""
+          warehouseCode: ""
+          giftWrap: ""
+          notes: ""
+          size: "20"
+        GET /api/orders/cursor:
+          orderNumber: ""
+          status: ""
+          priority: ""
+          customerName: ""
+          customerEmail: ""
+          currency: ""
+          countryCode: ""
+          warehouseCode: ""
+          giftWrap: ""
+          notes: ""
+          limit: "20"
+    cases:
+      version: 1
+      kind: cases
+      operations:
+        POST /api/orders:
+          - id: hk-create
+            name: Create ${orderNumber}
+            request:
+              status: CONFIRMED
+              priority: HIGH
+            omit: []
+            expect:
+              status: "201"
+              fields:
+                - path: orderNumber
+                  equals: ${orderNumber}
+                - path: customerEmail
+                  equals: ${customerEmail}
+                - path: status
+                  equals: CONFIRMED
+          - id: hk-missing-email
+            name: Missing email is rejected
+            request: {}
+            omit: [customerEmail]
+            expect:
+              status: "400"
+              fields:
+                - path: exceptions[].field
+                  equals: customerEmail
+        GET /api/orders:
+          - id: hk-first-page
+            name: First page is returned
+            request: {}
+            omit: []
+            expect:
+              status: "200"
+              fields:
+                - path: content
+                  equals: ""
+                - path: page
+                  equals: "0"
+  - id: client-sg
+    name: Marina
+    oauth:
+      clientId: orders-sg
+      algorithm: RS256
+      scope: orders.read
+      lifetime: "300"
+    defaults:
+      version: 1
+      kind: defaults
+      variables:
+        orderNumber: ORD-2002
+        customerName: Grace Hopper
+        customerEmail: grace@example.com
+        countryCode: SG
+        warehouseCode: SG-02
+        currency: USD
+        quantity: "1"
+        unitPrice: "42"
+        taxRate: "0.09"
+        orderedAt: 2021-06-01T09:00:00+08:00
+        deliveryDate: 2099-06-01
+        notes: Call on arrival
+      global:
+        orderNumber: ${orderNumber}
+        customerName: ${customerName}
+        customerEmail: ${customerEmail}
+        countryCode: ${countryCode}
+        warehouseCode: ${warehouseCode}
+        currency: ${currency}
+        quantity: ${quantity}
+        unitPrice: ${unitPrice}
+        taxRate: ${taxRate}
+        orderedAt: ${orderedAt}
+        requestedDeliveryDate: ${deliveryDate}
+        notes: ${notes}
+        status: DRAFT
+        priority: NORMAL
+        discountAmount: "0"
+        giftWrap: "false"
+      operations:
+        GET /api/orders:
+          orderNumber: ""
+          status: ""
+          priority: ""
+          customerName: ""
+          customerEmail: ""
+          currency: ""
+          countryCode: ""
+          warehouseCode: ""
+          giftWrap: ""
+          notes: ""
+          size: "20"
+        GET /api/orders/cursor:
+          orderNumber: ""
+          status: ""
+          priority: ""
+          customerName: ""
+          customerEmail: ""
+          currency: ""
+          countryCode: ""
+          warehouseCode: ""
+          giftWrap: ""
+          notes: ""
+          limit: "20"
+    cases:
+      version: 1
+      kind: cases
+      operations:
+        POST /api/orders:
+          - id: sg-create
+            name: Create ${orderNumber}
+            request:
+              status: DRAFT
+              priority: NORMAL
+            omit: []
+            expect:
+              status: "201"
+              fields:
+                - path: orderNumber
+                  equals: ${orderNumber}
+                - path: customerEmail
+                  equals: ${customerEmail}
+                - path: status
+                  equals: DRAFT

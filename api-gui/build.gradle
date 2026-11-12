@@ -1,0 +1,24 @@
+plugins {
+    id 'base'
+    id 'com.github.node-gradle.node' version '7.1.0'
+}
+
+node {
+    version = '22.15.0'
+    npmVersion = '10.9.2'
+    download = false
+}
+
+tasks.register('dev', com.github.gradle.node.npm.task.NpmTask) {
+    dependsOn tasks.named('npmInstall')
+    group = 'application'
+    description = 'Starts the React API tester on http://localhost:3000'
+    args = ['run', 'dev']
+}
+
+tasks.register('buildUi', com.github.gradle.node.npm.task.NpmTask) {
+    dependsOn tasks.named('npmInstall')
+    group = 'build'
+    description = 'Builds the React API tester into dist/'
+    args = ['run', 'build']
+}
