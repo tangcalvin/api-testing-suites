@@ -51,10 +51,14 @@ import {
   isOmitted,
   casesFor,
   recordId,
+  detectPayloadId,
+  resolvedId,
+  payloadIdFields,
   assignFixture,
   enquiryShouldMiss,
   enquiryTarget,
   fixtureEnabled,
+  fixtureRequest,
   fixtureSteps,
   readCreatedId,
   sampleCall,
@@ -245,7 +249,11 @@ export default function App() {
   const skippedCombinations = activeMode === 'combination' && selected
     ? Math.max(0, caseCount(resolvedFields) - planned.length)
     : 0
-  const preparation = useMemo(() => fixtureSteps(selected, operations, defaults), [defaults, operations, selected])
+  const savedRecordId = selected ? customCases.ids?.[selected.id] : undefined
+  const preparation = useMemo(
+    () => fixtureSteps(selected, operations, defaults, savedRecordId),
+    [defaults, operations, selected, savedRecordId],
+  )
   const finishedChecks = results.filter((result) => !result.step).length
 
   useEffect(() => {
@@ -706,6 +714,16 @@ export default function App() {
     })
   }
 
+  function writePayloadId(operation, name) {
+    const detected = detectPayloadId(operation)?.name || ''
+    setCustomCases((current) => {
+      const ids = { ...(current.ids || {}) }
+      if (name === detected) delete ids[operation.id]
+      else ids[operation.id] = name
+      return { ...current, ids }
+    })
+  }
+
   function writeFixtureStep(operationId, role, enabled) {
     const fallback = role !== 'enquiry'
     setCustomCases((current) => {
@@ -777,7 +795,7 @@ export default function App() {
       return
     }
     const next = []
-    const around = fixtureSteps(selected, operations, defaults)
+    const around = fixtureSteps(selected, operations, defaults, customCases.ids?.[selected.id])
     const plan = around?.plan || null
     const savedSteps = customCases.steps?.[selected.id] || {}
     const useBefore = Boolean(plan) && fixtureEnabled(savedSteps, 'before')
@@ -840,9 +858,9 @@ export default function App() {
           noteCreate(created.response, created.id, `Before · ${plan.create.method} ${plan.create.path}`)
           if (created.id == null) break
           ownId = created.id
-          item = withFixtureId(item, plan.idField, ownId)
+          item = withFixtureId(item, plan.idField, ownId, plan.location)
         } else if (item.needsFixture) {
-          item = withFixtureId(item, plan.idField, sharedId)
+          item = withFixtureId(item, plan.idField, sharedId, plan.location)
         }
         const response = await executeCheck(apiBase, idpBase, selected, item, {
           pace,
@@ -864,10 +882,10 @@ export default function App() {
           pages: response.pages,
         })
         let enquiry = null
-        const target = useEnquiry ? enquiryTarget(item, plan.idField) : null
+        const target = useEnquiry ? enquiryTarget(item, plan.idField, plan.location) : null
         if (target != null && !stopRef.current) {
           setActivity('reading the record back')
-          const follow = await sendOnce(around.enquiry, { body: {}, query: {}, path: { [plan.idField]: target } }, true)
+          const follow = await sendOnce(around.enquiry, fixtureRequest(around.enquiry, plan, target, defaults), true)
           if (follow) {
             const miss = enquiryShouldMiss(item, response.status, ownId != null)
             const ok = miss ? follow.status === 404 : follow.status >= 200 && follow.status < 300
@@ -899,7 +917,7 @@ export default function App() {
       if (useAfter && leftover.length > 0) {
         setActivity('removing the record created for this run')
         for (const id of leftover) {
-          const response = await sendOnce(plan.cleanup, { body: {}, query: {}, path: { [plan.idField]: id } }, false)
+          const response = await sendOnce(plan.cleanup, fixtureRequest(plan.cleanup, plan, id, defaults), false)
           const removed = Boolean(response) && (response.status === 404 || (response.status >= 200 && response.status < 300))
           pushResult({
             step: 'after',
@@ -1060,7 +1078,8 @@ export default function App() {
                                 secondary: { noWrap: true },
                               }}
                             />
-                            <IdMark operation={operation} />
+                            <RoleMark operation={operation} />
+                            <IdMark operation={operation} saved={customCases.ids?.[operation.id]} />
                             <PaginationMark pagination={operation.pagination} />
                           </ListItemButton>
                         ))}
@@ -1088,6 +1107,11 @@ export default function App() {
                     </Typography>
                     <Typography variant="body2" color="text.secondary" noWrap>{selected.summary}</Typography>
                   </Box>
+                  <PayloadIdChoice
+                    operation={selected}
+                    saved={customCases.ids?.[selected.id]}
+                    onChange={(name) => writePayloadId(selected, name)}
+                  />
                   <Button size="small" variant="text" onClick={() => setDefaultsOpen(true)} sx={{ color: 'text.secondary', flexShrink: 0 }}>
                     Defaults
                   </Button>
@@ -1484,16 +1508,64 @@ const PAGINATION_TONE = {
   link: { label: 'Link', bg: '#f3e8ff', fg: '#6d28d9' },
 }
 
-function IdMark({ operation }) {
-  const record = recordId(operation)
+const ROLE_TONE = {
+  create: { label: 'C', title: 'Create', bg: '#ecfdf3', fg: '#166534' },
+  read: { label: 'R', title: 'Read', bg: '#f0f9ff', fg: '#0369a1' },
+  update: { label: 'U', title: 'Update', bg: '#f5f3ff', fg: '#6d28d9' },
+  delete: { label: 'D', title: 'Delete', bg: '#fdecec', fg: '#b42318' },
+}
+
+function RoleMark({ operation }) {
+  const tone = ROLE_TONE[operation?.role]
+  if (!tone) return null
+  const paged = operation.role === 'read' && operation.pagination
+  return (
+    <Chip
+      size="small"
+      label={tone.label}
+      title={paged ? `${tone.title}, with pagination` : tone.title}
+      sx={{ bgcolor: tone.bg, color: tone.fg, fontWeight: 700, height: 22, flexShrink: 0, mt: 0.25 }}
+    />
+  )
+}
+
+function IdMark({ operation, saved }) {
+  const record = resolvedId(operation, saved)
   if (!record) return null
+  const title = record.source === 'path' ? `Needs ${record.name}` : `Payload field ${record.name}`
   return (
     <Chip
       size="small"
       label="ID"
-      title={`Needs ${record.name}`}
+      title={title}
       sx={{ bgcolor: '#eef2ff', color: '#3730a3', fontWeight: 700, height: 22, flexShrink: 0, mt: 0.25 }}
     />
+  )
+}
+
+function PayloadIdChoice({ operation, saved, onChange }) {
+  if (recordId(operation)) return null
+  if (!['read', 'update', 'delete'].includes(operation?.role)) return null
+  const fields = payloadIdFields(operation)
+  if (!fields.length) return null
+  const detected = detectPayloadId(operation)
+  const current = resolvedId(operation, saved)
+  return (
+    <TextField
+      select
+      size="small"
+      label="ID field"
+      value={current?.name || ''}
+      onChange={(event) => onChange(event.target.value)}
+      sx={{ minWidth: 180, flexShrink: 0 }}
+    >
+      <MenuItem value="">None</MenuItem>
+      {fields.map((field) => (
+        <MenuItem key={field.name} value={field.name}>
+          {field.name}{detected?.name === field.name ? ' · detected' : ''}
+        </MenuItem>
+      ))}
+    </TextField>
   )
 }
 

@@ -26,17 +26,20 @@ export function listOperations(spec) {
       if (!operation) {
         continue
       }
-      operations.push({
+      const listed = {
         id: `${method.toUpperCase()} ${path}`,
         method: method.toUpperCase(),
         path,
         tag: operationTag(pathItem, operation),
         summary: operation.summary || operation.operationId || `${method.toUpperCase()} ${path}`,
+        operationId: operation.operationId || '',
         fields: fieldsFor(spec, pathItem, operation),
         exclusive: exclusiveGroups(spec, operation),
         pagination: detectPagination(spec, pathItem, operation),
         responses: responseViews(spec, operation),
-      })
+      }
+      listed.role = operationRole(listed)
+      operations.push(listed)
     }
   }
   const tagOrder = new Map((Array.isArray(spec.tags) ? spec.tags : []).map((tag, index) => [tag?.name, index]))
@@ -60,6 +63,57 @@ export function operationGroups(operations) {
     group.operations.push(operation)
   }
   return groups
+}
+
+const ROLE_WORDS = [
+  ['create', ['create', 'input']],
+  ['update', ['update', 'change']],
+  ['read', ['read', 'get', 'query', 'enquire', 'enquiry']],
+  ['delete', ['delete', 'revoke', 'cancel']],
+]
+
+const METHOD_ROLES = {
+  GET: 'read',
+  POST: 'create',
+  PUT: 'update',
+  PATCH: 'update',
+  DELETE: 'delete',
+}
+
+export function operationRole(operation) {
+  for (const name of roleNames(operation)) {
+    const role = roleFromName(name)
+    if (role) return role
+  }
+  return METHOD_ROLES[String(operation?.method || '').toUpperCase()] || ''
+}
+
+function roleNames(operation) {
+  const names = []
+  if (operation?.operationId) names.push(operation.operationId)
+  const segments = String(operation?.path || '').split('/').filter((part) => part && !part.startsWith('{'))
+  if (segments.length) names.push(segments[segments.length - 1])
+  if (operation?.summary) names.push(operation.summary)
+  return names
+}
+
+function roleFromName(name) {
+  const token = String(name || '').trim().split(/[\s/]+/)[0]
+  if (!token) return ''
+  for (const [role, words] of ROLE_WORDS) {
+    if (words.some((word) => startsWithRoleWord(token, word))) return role
+  }
+  return ''
+}
+
+function startsWithRoleWord(token, word) {
+  const key = word.toLowerCase()
+  if (!token.toLowerCase().startsWith(key)) return false
+  const rest = token.slice(key.length)
+  if (!rest) return true
+  const next = rest[0]
+  if (!/[A-Za-z]/.test(next)) return true
+  return next === next.toUpperCase() && next !== next.toLowerCase()
 }
 
 function operationTag(pathItem, operation) {
@@ -381,42 +435,138 @@ export function recordId(operation) {
   if (pathFields.length !== 1) return null
   const match = String(operation.path).match(/^(.*)\/\{([^}]+)\}$/)
   if (!match || match[2] !== pathFields[0].name) return null
-  return { name: pathFields[0].name, field: pathFields[0], collection: match[1] }
+  return { name: pathFields[0].name, field: pathFields[0], collection: match[1], source: 'path' }
 }
 
-export function fixturePlan(operation, operations, defaults) {
-  const record = recordId(operation)
-  if (!record) return null
-  const idField = record.field
-  if (pathDefaultSet(operation.id, idField.name, defaults)) return null
-  const collection = record.collection
+const PAYLOAD_ID_SUFFIXES = [
+  ['id', 1],
+  ['uuid', 2],
+  ['number', 3],
+  ['num', 4],
+  ['no', 5],
+]
+
+export function payloadIdFields(operation) {
+  return (operation?.fields || []).filter((field) => (
+    field.location === 'body' && field.type !== 'object' && !String(field.name).includes('.')
+  ))
+}
+
+export function idNameRank(name) {
+  const token = String(name || '')
+  if (!token || token.includes('.')) return null
+  if (token.toLowerCase() === 'id') return 0
+  let best = null
+  for (const [word, rank] of PAYLOAD_ID_SUFFIXES) {
+    if (!endsWithIdWord(token, word)) continue
+    if (best == null || rank < best) best = rank
+  }
+  return best
+}
+
+export function detectPayloadId(operation) {
+  if (!operation || recordId(operation)) return null
+  if (!['read', 'update', 'delete'].includes(operation.role)) return null
+  let best = null
+  let bestScore = Infinity
+  for (const field of payloadIdFields(operation)) {
+    const rank = idNameRank(field.name)
+    if (rank == null) continue
+    const score = rank * 2 + (field.required ? 0 : 1)
+    if (score < bestScore) {
+      best = field
+      bestScore = score
+    }
+  }
+  return best
+}
+
+export function resolvedId(operation, saved) {
+  const path = recordId(operation)
+  if (path) return path
+  if (saved === '') return null
+  if (typeof saved === 'string') {
+    const chosen = payloadIdFields(operation).find((field) => field.name === saved)
+    if (chosen) return { name: chosen.name, field: chosen, source: 'user' }
+  }
+  const detected = detectPayloadId(operation)
+  if (!detected) return null
+  return { name: detected.name, field: detected, source: 'detected' }
+}
+
+function endsWithIdWord(token, word) {
+  const key = word.toLowerCase()
+  if (!token.toLowerCase().endsWith(key)) return false
+  const head = token.slice(0, token.length - key.length)
+  if (!head) return word === 'uuid'
+  const prev = head[head.length - 1]
+  if (!/[A-Za-z0-9]/.test(prev)) return true
+  const boundary = token[head.length]
+  return boundary === boundary.toUpperCase() && boundary !== boundary.toLowerCase()
+}
+
+export function fixturePlan(operation, operations, defaults, savedId) {
   const listed = Array.isArray(operations) ? operations : []
-  const create = listed.find((item) => item && item.method === 'POST' && item.path === collection && item.tag === operation.tag)
-    || listed.find((item) => item && item.method === 'POST' && item.path === collection)
-  if (!create || create.id === operation.id) return null
-  const cleanup = listed.find((item) => item && item.method === 'DELETE' && item.path === operation.path) || null
+  const pathRecord = recordId(operation)
+  if (pathRecord) {
+    const idField = pathRecord.field
+    if (pathDefaultSet(operation.id, idField.name, defaults)) return null
+    const collection = pathRecord.collection
+    const create = listed.find((item) => item && item.method === 'POST' && item.path === collection && item.tag === operation.tag)
+      || listed.find((item) => item && item.method === 'POST' && item.path === collection)
+    if (!create || create.id === operation.id) return null
+    const cleanup = listed.find((item) => item && item.method === 'DELETE' && item.path === operation.path) || null
+    return {
+      idField: idField.name,
+      location: 'path',
+      placeholder: idField.sample,
+      missingId: idField.type === 'integer' || idField.type === 'number' ? 0 : 'missing',
+      consumeSuccess: operation.method === 'DELETE',
+      create,
+      cleanup,
+    }
+  }
+  const record = resolvedId(operation, savedId)
+  if (!record) return null
+  if (pathDefaultSet(operation.id, record.name, defaults)) return null
+  const create = roleSibling(listed, operation, 'create')
+  if (!create) return null
+  const cleanup = operation.role === 'delete' ? operation : roleSibling(listed, operation, 'delete')
+  const enquiry = operation.role === 'read' && !operation.pagination ? null : roleSibling(listed, operation, 'read', true)
   return {
-    idField: idField.name,
-    placeholder: idField.sample,
-    missingId: idField.type === 'integer' || idField.type === 'number' ? 0 : 'missing',
-    consumeSuccess: operation.method === 'DELETE',
+    idField: record.name,
+    location: 'body',
+    placeholder: record.field?.sample,
+    missingId: record.field?.type === 'integer' || record.field?.type === 'number' ? 0 : 'missing',
+    consumeSuccess: operation.role === 'delete',
     create,
     cleanup,
+    enquiry,
   }
+}
+
+function roleSibling(listed, operation, role, singleRecord = false) {
+  const matches = listed.filter((item) => {
+    if (!item || item.id === operation?.id || item.role !== role) return false
+    if (singleRecord && item.pagination) return false
+    return true
+  })
+  return matches.find((item) => item.tag && item.tag === operation?.tag) || matches[0] || null
 }
 
 export function assignFixture(cases, plan) {
   return (cases || []).map((item) => {
     if (!plan || !item) return item
-    if (!holdsPlaceholder(item, plan.idField, plan.placeholder)) return item
-    if (expectsMissingRecord(item)) return withFixtureId(item, plan.idField, plan.missingId)
+    if (!holdsPlaceholder(item, plan.idField, plan.placeholder, plan.location)) return item
+    if (expectsMissingRecord(item)) return withFixtureId(item, plan.idField, plan.missingId, plan.location)
     if (plan.consumeSuccess && expectsLiveSuccess(item)) return { ...item, ownRecord: true }
     return { ...item, needsFixture: true }
   })
 }
 
-export function withFixtureId(item, field, id) {
-  const token = `${field}=${valueText(item?.path?.[field])}`
+export function withFixtureId(item, field, id, location = 'path') {
+  const slot = location === 'body' ? 'body' : 'path'
+  const token = `${field}=${valueText(item?.[slot]?.[field])}`
   const next = `${field}=${valueText(id)}`
   let label = item?.label
   if (!label || label === 'Valid sample' || label === token) label = next
@@ -426,12 +576,12 @@ export function withFixtureId(item, field, id) {
     label,
     needsFixture: false,
     ownRecord: false,
-    path: { ...(item?.path || {}), [field]: id },
+    [slot]: { ...(item?.[slot] || {}), [field]: id },
   }
 }
 
-export function fixtureSteps(operation, operations, defaults) {
-  const plan = fixturePlan(operation, operations, defaults)
+export function fixtureSteps(operation, operations, defaults, savedId) {
+  const plan = fixturePlan(operation, operations, defaults, savedId)
   if (!plan) return null
   const calls = []
   if (plan.create) {
@@ -444,7 +594,9 @@ export function fixtureSteps(operation, operations, defaults) {
     })
   }
   const listed = Array.isArray(operations) ? operations : []
-  const enquiry = listed.find((item) => item && item.method === 'GET' && item.path === operation.path && item.id !== operation.id) || null
+  const enquiry = plan.location === 'body'
+    ? (plan.enquiry || null)
+    : (listed.find((item) => item && item.method === 'GET' && item.path === operation.path && item.id !== operation.id) || null)
   if (enquiry) {
     calls.push({
       role: 'enquiry',
@@ -470,10 +622,11 @@ export function fixtureEnabled(saved, role) {
   return role !== 'enquiry'
 }
 
-export function enquiryTarget(item, field) {
-  const value = item?.path?.[field]
+export function enquiryTarget(item, field, location = 'path') {
+  const slot = location === 'body' ? 'body' : 'path'
+  const value = item?.[slot]?.[field]
   if (value == null || value === '') return null
-  if (typeof value === 'string' && !/^-?\d+$/.test(value.trim())) return null
+  if (slot === 'path' && typeof value === 'string' && !/^-?\d+$/.test(value.trim())) return null
   return value
 }
 
@@ -499,6 +652,18 @@ export function fixtureNote(plan, cases) {
 export function sampleCall(operation, defaults) {
   const fields = applyDefaults(operation?.fields || [], operation?.id, defaults)
   return assemble(fields, {})
+}
+
+export function fixtureRequest(operation, plan, id, defaults) {
+  if ((plan?.location || 'path') !== 'body') {
+    return { body: {}, query: {}, path: { [plan.idField]: id } }
+  }
+  const sample = sampleCall(operation, defaults)
+  return {
+    body: { ...(sample.body || {}), [plan.idField]: id },
+    query: { ...(sample.query || {}) },
+    path: { ...(sample.path || {}) },
+  }
 }
 
 export function readCreatedId(status, text, location) {
@@ -541,9 +706,10 @@ function pathDefaultSet(operationId, fieldName, defaults) {
   return Boolean(defaults?.global && Object.prototype.hasOwnProperty.call(defaults.global, fieldName))
 }
 
-function holdsPlaceholder(item, field, placeholder) {
-  if (!item?.path || !Object.prototype.hasOwnProperty.call(item.path, field)) return false
-  const current = item.path[field]
+function holdsPlaceholder(item, field, placeholder, location = 'path') {
+  const slot = location === 'body' ? 'body' : 'path'
+  if (!item?.[slot] || !Object.prototype.hasOwnProperty.call(item[slot], field)) return false
+  const current = item[slot][field]
   if (current == null || current === '') return true
   return String(current) === String(placeholder)
 }
@@ -1286,7 +1452,7 @@ const CURSOR_PARAMS = new Set(['cursor', 'nextcursor', 'pagetoken', 'nextpagetok
 const ITEM_NAMES = ['content', 'items', 'data', 'results', 'records', 'values', 'elements']
 
 export function detectPagination(spec, pathItem, operation) {
-  const parameters = [...(pathItem?.parameters || []), ...(operation?.parameters || [])]
+  const queryParameters = [...(pathItem?.parameters || []), ...(operation?.parameters || [])]
     .map((parameter) => (parameter.$ref ? resolveRef(spec, parameter.$ref) : parameter))
     .filter((parameter) => parameter && parameter.name && (parameter.in || 'query') === 'query')
     .map((parameter) => ({
@@ -1294,6 +1460,7 @@ export function detectPagination(spec, pathItem, operation) {
       key: normalizeName(parameter.name),
       schema: resolveSchema(spec, parameter.schema || {}),
     }))
+  const parameters = [...queryParameters, ...requestBodyParameters(spec, operation)]
   const cursor = parameters.find((parameter) => CURSOR_PARAMS.has(parameter.key))
   const page = parameters.find((parameter) => PAGE_PARAMS.has(parameter.key))
   const offset = parameters.find((parameter) => OFFSET_PARAMS.has(parameter.key))
@@ -1622,6 +1789,18 @@ export function joinUrl(base, path) {
   const left = base.endsWith('/') ? base.slice(0, -1) : base
   const right = path.startsWith('/') ? path : `/${path}`
   return `${left}${right}`
+}
+
+function requestBodyParameters(spec, operation) {
+  const content = operation?.requestBody && operation.requestBody.content
+  const media = content && (content['application/json'] || content['application/*+json'] || content['*/*'] || Object.values(content)[0])
+  if (!media?.schema) return []
+  const schema = resolveSchema(spec, media.schema)
+  return Object.entries(schema.properties || {}).map(([name, property]) => ({
+    raw: name,
+    key: normalizeName(name),
+    schema: resolveSchema(spec, property || {}),
+  }))
 }
 
 function normalizeName(name) {

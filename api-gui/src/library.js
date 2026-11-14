@@ -14,7 +14,7 @@ export function emptyDefaults() {
 }
 
 export function emptyCases() {
-  return { operations: {}, exclusions: {}, values: {}, errors: {}, checks: {}, steps: {} }
+  return { operations: {}, exclusions: {}, values: {}, errors: {}, checks: {}, steps: {}, ids: {} }
 }
 
 export function loadStored(key, empty, parse) {
@@ -57,6 +57,7 @@ export function casesDocument(cases) {
   const errors = cases.errors || {}
   const checks = cases.checks || {}
   const steps = cases.steps || {}
+  const ids = cases.ids || {}
   return {
     version: 1,
     kind: 'cases',
@@ -66,6 +67,7 @@ export function casesDocument(cases) {
     ...(Object.keys(errors).length > 0 ? { errors } : {}),
     ...(Object.keys(checks).length > 0 ? { checks } : {}),
     ...(Object.keys(steps).length > 0 ? { steps } : {}),
+    ...(Object.keys(ids).length > 0 ? { ids } : {}),
   }
 }
 
@@ -99,6 +101,7 @@ export function hasSavedCases(cases) {
     || Object.keys(cases?.exclusions || {}).length > 0
     || Object.keys(cases?.values || {}).length > 0
     || Object.keys(cases?.steps || {}).length > 0
+    || Object.keys(cases?.ids || {}).length > 0
 }
 
 export function emptyOauth() {
@@ -248,7 +251,17 @@ export function parseCases(value) {
     errors: errorMaps(data.errors),
     checks: errorCheckMaps(data.checks),
     steps: stepMaps(data.steps),
+    ids: idMaps(data.ids),
   }
+}
+
+function idMaps(source) {
+  const ids = {}
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return ids
+  for (const [operationId, name] of Object.entries(source)) {
+    if (typeof name === 'string') ids[operationId] = name
+  }
+  return ids
 }
 
 function stepMaps(source) {

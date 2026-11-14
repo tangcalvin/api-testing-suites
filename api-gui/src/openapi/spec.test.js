@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { OMIT, OBJECT_FIELDS, individualChoices, buildIndividualCases, applyErrorOverrides, applyErrorRowToGroup, assignFixture, buildCases, buildCustomCases, buildCustomErrorCases, buildErrorCases, caseCount, detectPagination, enquiryShouldMiss, enquiryTarget, fixtureEnabled, fixtureNote, fixturePlan, fixtureSteps, judge, listOperations, operationGroups, parseSpecText, planContinuation, readCreatedId, recordId, responseChecks, responseViews, responsesForMode, sampleCall, scalarCombinationField, specGaps, textCombinationField, viewsWithStatuses, withFixtureId, withTextCombinationValues } from './spec.js'
+import { OMIT, OBJECT_FIELDS, individualChoices, buildIndividualCases, applyErrorOverrides, applyErrorRowToGroup, assignFixture, buildCases, buildCustomCases, buildCustomErrorCases, buildErrorCases, caseCount, detectPagination, enquiryShouldMiss, enquiryTarget, fixtureEnabled, fixtureNote, fixturePlan, fixtureRequest, fixtureSteps, judge, listOperations, operationGroups, operationRole, parseSpecText, planContinuation, readCreatedId, recordId, detectPayloadId, idNameRank, resolvedId, responseChecks, responseViews, responsesForMode, sampleCall, scalarCombinationField, specGaps, textCombinationField, viewsWithStatuses, withFixtureId, withTextCombinationValues } from './spec.js'
 
 const SPEC = `
 openapi: 3.1.0
@@ -1387,6 +1387,7 @@ test('a run for one record creates it from the collection and deletes it afterwa
   assert.equal(plan.cleanup.id, 'DELETE /api/orders/{id}')
   assert.equal(plan.idField, 'id')
   assert.equal(recordId(getOne).name, 'id')
+  assert.equal(recordId(getOne).source, 'path')
   assert.equal(recordId(byId['POST /api/orders']), null)
   assert.equal(recordId(byId['GET /api/orders']), null)
   assert.equal(plan.placeholder, 1)
@@ -1455,4 +1456,271 @@ test('a run for one record creates it from the collection and deletes it afterwa
   assert.equal(enquiryShouldMiss({ expect: { status: 404 } }, 400, false), true)
   assert.equal(enquiryShouldMiss({ expect: { outcome: 'success' } }, 204, true), true)
   assert.equal(enquiryShouldMiss({ expect: { outcome: 'success' } }, 200, false), false)
+})
+
+test('an operation name gives its create, read, update, or delete role', () => {
+  assert.equal(operationRole({ operationId: 'createOrder' }), 'create')
+  assert.equal(operationRole({ path: '/orders/inputOrder' }), 'create')
+  assert.equal(operationRole({ summary: 'Create an order' }), 'create')
+  assert.equal(operationRole({ operationId: 'updateOrder' }), 'update')
+  assert.equal(operationRole({ path: '/orders/changeStatus' }), 'update')
+  assert.equal(operationRole({ operationId: 'readOrder' }), 'read')
+  assert.equal(operationRole({ operationId: 'getOrder' }), 'read')
+  assert.equal(operationRole({ path: '/orders/queryOrders' }), 'read')
+  assert.equal(operationRole({ operationId: 'enquireOrder' }), 'read')
+  assert.equal(operationRole({ operationId: 'enquiryOrder' }), 'read')
+  assert.equal(operationRole({ operationId: 'deleteOrder' }), 'delete')
+  assert.equal(operationRole({ path: '/orders/revokeAccess' }), 'delete')
+  assert.equal(operationRole({ summary: 'Cancel an order' }), 'delete')
+  assert.equal(operationRole({ operationId: 'listOrders' }), '')
+  assert.equal(operationRole({ operationId: 'replaceOrder' }), '')
+  assert.equal(operationRole({ summary: 'createdAt is returned' }), '')
+  assert.equal(operationRole({ method: 'GET', operationId: 'listOrders' }), 'read')
+  assert.equal(operationRole({ method: 'PUT', operationId: 'replaceProduct' }), 'update')
+  assert.equal(operationRole({ method: 'PATCH', summary: 'Amend a note' }), 'update')
+  assert.equal(operationRole({ method: 'DELETE', path: '/orders/{id}' }), 'delete')
+  assert.equal(operationRole({ method: 'POST', path: '/orders' }), 'create')
+  assert.equal(operationRole({ method: 'POST', operationId: 'getShipment' }), 'read')
+
+  const operations = listOperations(parseSpecText(`
+openapi: 3.1.0
+paths:
+  /orders/queryOrders:
+    post:
+      operationId: queryOrders
+      summary: Query orders
+      parameters:
+        - name: page
+          in: query
+          schema: { type: integer }
+        - name: size
+          in: query
+          schema: { type: integer }
+  /orders/createOrder:
+    post:
+      operationId: createOrder
+      summary: Create order
+  /orders/updateOrder:
+    post:
+      operationId: updateOrder
+      summary: Update order
+  /orders/deleteOrder:
+    post:
+      operationId: deleteOrder
+      summary: Delete order
+`))
+  const byPath = Object.fromEntries(operations.map((operation) => [operation.path, operation]))
+  assert.equal(byPath['/orders/queryOrders'].role, 'read')
+  assert.equal(byPath['/orders/queryOrders'].pagination.style, 'page')
+  assert.equal(byPath['/orders/createOrder'].role, 'create')
+  assert.equal(byPath['/orders/updateOrder'].role, 'update')
+  assert.equal(byPath['/orders/deleteOrder'].role, 'delete')
+
+  const posted = listOperations(parseSpecText(`
+openapi: 3.1.0
+paths:
+  /api/shipments/queryShipments:
+    post:
+      operationId: queryShipments
+      summary: Query shipments
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                page: { type: integer, minimum: 0 }
+                size: { type: integer, minimum: 1, maximum: 100 }
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  content: { type: array, items: { type: object } }
+                  page: { type: integer }
+                  totalPages: { type: integer }
+`))[0]
+  assert.equal(posted.role, 'read')
+  assert.equal(posted.pagination.style, 'page')
+  assert.equal(posted.pagination.request.page, 'page')
+  assert.equal(posted.pagination.request.size, 'size')
+})
+
+test('a payload id accepts names such as instructionNumber and can be changed', () => {
+  assert.equal(idNameRank('id'), 0)
+  assert.equal(idNameRank('ID'), 0)
+  assert.equal(idNameRank('orderId'), 1)
+  assert.equal(idNameRank('instruction_number'), 3)
+  assert.equal(idNameRank('instructionNumber'), 3)
+  assert.equal(idNameRank('inputNumber'), 3)
+  assert.equal(idNameRank('orderNo'), 5)
+  assert.equal(idNameRank('shipmentUuid'), 2)
+  assert.equal(idNameRank('paid'), null)
+  assert.equal(idNameRank('number'), null)
+  assert.equal(idNameRank('piano'), null)
+  assert.equal(idNameRank('delivery.instructionNumber'), null)
+
+  const read = {
+    role: 'read',
+    method: 'POST',
+    path: '/orders/getOrder',
+    fields: [
+      { name: 'instructionNumber', location: 'body', type: 'string', required: true },
+      { name: 'note', location: 'body', type: 'string', required: false },
+      { name: 'address.instructionNumber', location: 'body', type: 'string', required: true },
+    ],
+  }
+  assert.equal(detectPayloadId(read).name, 'instructionNumber')
+  assert.equal(resolvedId(read).source, 'detected')
+  assert.equal(resolvedId(read, 'note').source, 'user')
+  assert.equal(resolvedId(read, 'note').name, 'note')
+  assert.equal(resolvedId(read, ''), null)
+
+  const both = {
+    role: 'update',
+    path: '/orders/changeOrder',
+    fields: [
+      { name: 'instructionNumber', location: 'body', type: 'string', required: true },
+      { name: 'id', location: 'body', type: 'integer', required: false },
+    ],
+  }
+  assert.equal(detectPayloadId(both).name, 'id')
+
+  const create = {
+    role: 'create',
+    path: '/orders/createOrder',
+    fields: [{ name: 'orderNumber', location: 'body', type: 'string', required: true }],
+  }
+  assert.equal(detectPayloadId(create), null)
+  assert.equal(resolvedId(create, 'orderNumber').name, 'orderNumber')
+
+  const pathOp = {
+    role: 'read',
+    method: 'GET',
+    path: '/api/orders/{id}',
+    fields: [{ name: 'id', location: 'path', type: 'integer', required: true }],
+  }
+  assert.equal(resolvedId(pathOp, 'other').source, 'path')
+  assert.equal(detectPayloadId(pathOp), null)
+})
+
+test('an all-POST read, update, or delete can create and remove the record around the run', () => {
+  const operations = listOperations(parseSpecText(`
+openapi: 3.1.0
+tags:
+  - name: Shipments
+paths:
+  /api/shipments/createShipment:
+    post:
+      tags: [Shipments]
+      operationId: createShipment
+      summary: Create a shipment
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reference]
+              properties:
+                reference: { type: string, example: SHP-1 }
+  /api/shipments/getShipment:
+    post:
+      tags: [Shipments]
+      operationId: getShipment
+      summary: Get a shipment
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [instructionNumber]
+              properties:
+                instructionNumber: { type: string, example: IN-1 }
+  /api/shipments/queryShipments:
+    post:
+      tags: [Shipments]
+      operationId: queryShipments
+      summary: Query shipments
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                page: { type: integer, minimum: 0 }
+                size: { type: integer, minimum: 1 }
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  content: { type: array, items: { type: object } }
+                  totalPages: { type: integer }
+  /api/shipments/updateShipment:
+    post:
+      tags: [Shipments]
+      operationId: updateShipment
+      summary: Update a shipment
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [instructionNumber, reference]
+              properties:
+                instructionNumber: { type: string, example: IN-1 }
+                reference: { type: string, example: SHP-1 }
+  /api/shipments/deleteShipment:
+    post:
+      tags: [Shipments]
+      operationId: deleteShipment
+      summary: Delete a shipment
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [instructionNumber]
+              properties:
+                instructionNumber: { type: string, example: IN-1 }
+`))
+  const byPath = Object.fromEntries(operations.map((operation) => [operation.path, operation]))
+  const getOne = byPath['/api/shipments/getShipment']
+  const update = byPath['/api/shipments/updateShipment']
+  const remove = byPath['/api/shipments/deleteShipment']
+  const query = byPath['/api/shipments/queryShipments']
+
+  assert.equal(fixturePlan(query, operations, {}), null)
+  const getPlan = fixturePlan(getOne, operations, {})
+  assert.equal(getPlan.location, 'body')
+  assert.equal(getPlan.idField, 'instructionNumber')
+  assert.equal(getPlan.create.path, '/api/shipments/createShipment')
+  assert.equal(getPlan.cleanup.path, '/api/shipments/deleteShipment')
+  assert.equal(getPlan.enquiry, null)
+  const getSteps = fixtureSteps(getOne, operations, {})
+  assert.deepEqual(getSteps.calls.map((call) => call.role), ['before', 'after'])
+
+  const assigned = assignFixture(buildCases(getOne.fields, {}), getPlan)
+  assert.equal(assigned[0].needsFixture, true)
+  assert.equal(assigned[0].body.instructionNumber, 'IN-1')
+  const filled = withFixtureId(assigned[0], 'instructionNumber', 'IN-15', 'body')
+  assert.equal(filled.body.instructionNumber, 'IN-15')
+  assert.equal(filled.path.instructionNumber, undefined)
+  assert.equal(enquiryTarget(filled, 'instructionNumber', 'body'), 'IN-15')
+  assert.deepEqual(fixtureRequest(getPlan.cleanup, getPlan, 'IN-15', {}).body, { instructionNumber: 'IN-15' })
+
+  const updateSteps = fixtureSteps(update, operations, {})
+  assert.deepEqual(updateSteps.calls.map((call) => `${call.role} ${call.operation.path}`), [
+    'before /api/shipments/createShipment',
+    'enquiry /api/shipments/getShipment',
+    'after /api/shipments/deleteShipment',
+  ])
+  const removePlan = fixturePlan(remove, operations, {})
+  assert.equal(removePlan.consumeSuccess, true)
+  assert.equal(removePlan.cleanup.id, remove.id)
+  assert.equal(fixturePlan(getOne, operations, {}, ''), null)
 })
