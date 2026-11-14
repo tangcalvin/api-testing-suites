@@ -1,5 +1,5 @@
 import yaml from 'js-yaml'
-import { coerceFieldValue, evaluateDynamics, substitute } from '../library.js'
+import { applyDefaults, coerceFieldValue, evaluateDynamics, substitute } from '../library.js'
 
 const METHODS = ['get', 'post', 'put', 'patch', 'delete']
 
@@ -373,6 +373,195 @@ export function applyErrorOverrides(cases, saved = {}) {
     if (Object.keys(values).length > 0) expect.values = values
     return { ...item, expect }
   })
+}
+
+export function recordId(operation) {
+  if (!operation?.path) return null
+  const pathFields = (operation.fields || []).filter((field) => field.location === 'path')
+  if (pathFields.length !== 1) return null
+  const match = String(operation.path).match(/^(.*)\/\{([^}]+)\}$/)
+  if (!match || match[2] !== pathFields[0].name) return null
+  return { name: pathFields[0].name, field: pathFields[0], collection: match[1] }
+}
+
+export function fixturePlan(operation, operations, defaults) {
+  const record = recordId(operation)
+  if (!record) return null
+  const idField = record.field
+  if (pathDefaultSet(operation.id, idField.name, defaults)) return null
+  const collection = record.collection
+  const listed = Array.isArray(operations) ? operations : []
+  const create = listed.find((item) => item && item.method === 'POST' && item.path === collection && item.tag === operation.tag)
+    || listed.find((item) => item && item.method === 'POST' && item.path === collection)
+  if (!create || create.id === operation.id) return null
+  const cleanup = listed.find((item) => item && item.method === 'DELETE' && item.path === operation.path) || null
+  return {
+    idField: idField.name,
+    placeholder: idField.sample,
+    missingId: idField.type === 'integer' || idField.type === 'number' ? 0 : 'missing',
+    consumeSuccess: operation.method === 'DELETE',
+    create,
+    cleanup,
+  }
+}
+
+export function assignFixture(cases, plan) {
+  return (cases || []).map((item) => {
+    if (!plan || !item) return item
+    if (!holdsPlaceholder(item, plan.idField, plan.placeholder)) return item
+    if (expectsMissingRecord(item)) return withFixtureId(item, plan.idField, plan.missingId)
+    if (plan.consumeSuccess && expectsLiveSuccess(item)) return { ...item, ownRecord: true }
+    return { ...item, needsFixture: true }
+  })
+}
+
+export function withFixtureId(item, field, id) {
+  const token = `${field}=${valueText(item?.path?.[field])}`
+  const next = `${field}=${valueText(id)}`
+  let label = item?.label
+  if (!label || label === 'Valid sample' || label === token) label = next
+  else if (String(label).includes(token)) label = String(label).split(token).join(next)
+  return {
+    ...item,
+    label,
+    needsFixture: false,
+    ownRecord: false,
+    path: { ...(item?.path || {}), [field]: id },
+  }
+}
+
+export function fixtureSteps(operation, operations, defaults) {
+  const plan = fixturePlan(operation, operations, defaults)
+  if (!plan) return null
+  const calls = []
+  if (plan.create) {
+    calls.push({
+      role: 'before',
+      operation: plan.create,
+      hint: plan.consumeSuccess
+        ? 'Creates a record before each successful delete.'
+        : 'Creates the record, then the checks use its id.',
+    })
+  }
+  const listed = Array.isArray(operations) ? operations : []
+  const enquiry = listed.find((item) => item && item.method === 'GET' && item.path === operation.path && item.id !== operation.id) || null
+  if (enquiry) {
+    calls.push({
+      role: 'enquiry',
+      operation: enquiry,
+      hint: 'Reads the record after each check.',
+    })
+  }
+  if (plan.cleanup) {
+    calls.push({
+      role: 'after',
+      operation: plan.cleanup,
+      hint: plan.cleanup.id === operation.id
+        ? 'Removes a record that a check did not delete.'
+        : 'Deletes the record created for this run.',
+    })
+  }
+  if (calls.length === 0) return null
+  return { plan, enquiry, calls }
+}
+
+export function fixtureEnabled(saved, role) {
+  if (saved && typeof saved[role] === 'boolean') return saved[role]
+  return role !== 'enquiry'
+}
+
+export function enquiryTarget(item, field) {
+  const value = item?.path?.[field]
+  if (value == null || value === '') return null
+  if (typeof value === 'string' && !/^-?\d+$/.test(value.trim())) return null
+  return value
+}
+
+export function enquiryShouldMiss(item, status, ownRecord) {
+  if (expectsMissingRecord(item)) return true
+  return Boolean(ownRecord) && Number(status) >= 200 && Number(status) < 300
+}
+
+export function fixtureNote(plan, cases) {
+  if (!plan) return ''
+  const assigned = assignFixture(cases, plan)
+  const shared = assigned.some((item) => item?.needsFixture)
+  const own = assigned.some((item) => item?.ownRecord)
+  if (shared && own && plan.cleanup) {
+    return 'This run creates a record first and deletes it afterwards. Each successful delete creates another record and deletes that one.'
+  }
+  if (own) return 'Each successful delete creates its own record, then deletes it.'
+  if (shared && plan.cleanup) return 'This run creates a record first, uses its id, and deletes that record afterwards.'
+  if (shared) return 'This run creates a record first and uses its id.'
+  return ''
+}
+
+export function sampleCall(operation, defaults) {
+  const fields = applyDefaults(operation?.fields || [], operation?.id, defaults)
+  return assemble(fields, {})
+}
+
+export function readCreatedId(status, text, location) {
+  const code = Number(status)
+  if (!(code >= 200 && code < 300)) return null
+  let body = null
+  if (typeof text === 'string' && text.trim()) {
+    try {
+      body = JSON.parse(text)
+    } catch {
+      body = null
+    }
+  } else if (text && typeof text === 'object') {
+    body = text
+  }
+  if (body && typeof body === 'object' && !Array.isArray(body) && body.id != null && body.id !== '') return body.id
+  const header = String(location || '').trim()
+  if (!header) return null
+  let path = header
+  try {
+    path = new URL(header, 'http://tester.local').pathname
+  } catch {
+    path = header.split('?')[0]
+  }
+  const part = String(path).split('/').filter(Boolean).pop()
+  if (!part) return null
+  let decoded = part
+  try {
+    decoded = decodeURIComponent(part)
+  } catch {
+    decoded = part
+  }
+  const numeric = Number(decoded)
+  return Number.isFinite(numeric) && String(numeric) === decoded ? numeric : decoded
+}
+
+function pathDefaultSet(operationId, fieldName, defaults) {
+  const endpoint = defaults?.operations?.[operationId]
+  if (endpoint && Object.prototype.hasOwnProperty.call(endpoint, fieldName)) return true
+  return Boolean(defaults?.global && Object.prototype.hasOwnProperty.call(defaults.global, fieldName))
+}
+
+function holdsPlaceholder(item, field, placeholder) {
+  if (!item?.path || !Object.prototype.hasOwnProperty.call(item.path, field)) return false
+  const current = item.path[field]
+  if (current == null || current === '') return true
+  return String(current) === String(placeholder)
+}
+
+function expectsMissingRecord(item) {
+  if (Number(item?.expect?.status) === 404) return true
+  if (item?.expect?.code === 'NotFound') return true
+  return item?.expect?.values?.['exceptions[].code'] === 'NotFound'
+}
+
+function expectsLiveSuccess(item) {
+  const outcome = item?.expect?.outcome
+  if (outcome === 'error') return false
+  if (outcome === 'custom') {
+    const status = String(item.expect?.status || '')
+    return status === '' || /^2/.test(status)
+  }
+  return true
 }
 
 export function casesFor(mode, fields, customCases = [], exclusions = {}, errorCases = []) {

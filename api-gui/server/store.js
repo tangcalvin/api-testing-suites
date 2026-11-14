@@ -122,6 +122,9 @@ function cleanResult(item) {
       text: text(page?.text),
     }))
     : null
+  const enquiry = item?.enquiry && typeof item.enquiry === 'object'
+    ? { label: text(item.enquiry.label), status: Number(item.enquiry.status) || 0, text: text(item.enquiry.text) }
+    : null
   return {
     index: Number(item?.index) || 0,
     label: text(item?.label),
@@ -130,6 +133,8 @@ function cleanResult(item) {
     detail: text(item?.detail),
     text: text(item?.text),
     pages,
+    ...(item?.step ? { step: text(item.step) } : {}),
+    ...(enquiry ? { enquiry } : {}),
   }
 }
 

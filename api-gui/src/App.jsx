@@ -50,6 +50,15 @@ import {
   caseCount,
   isOmitted,
   casesFor,
+  recordId,
+  assignFixture,
+  enquiryShouldMiss,
+  enquiryTarget,
+  fixtureEnabled,
+  fixtureSteps,
+  readCreatedId,
+  sampleCall,
+  withFixtureId,
   applyErrorOverrides,
   applyErrorRowToGroup,
   errorCheckKey,
@@ -236,6 +245,8 @@ export default function App() {
   const skippedCombinations = activeMode === 'combination' && selected
     ? Math.max(0, caseCount(resolvedFields) - planned.length)
     : 0
+  const preparation = useMemo(() => fixtureSteps(selected, operations, defaults), [defaults, operations, selected])
+  const finishedChecks = results.filter((result) => !result.step).length
 
   useEffect(() => {
     let cancelled = false
@@ -695,6 +706,19 @@ export default function App() {
     })
   }
 
+  function writeFixtureStep(operationId, role, enabled) {
+    const fallback = role !== 'enquiry'
+    setCustomCases((current) => {
+      const steps = { ...(current.steps || {}) }
+      const operation = { ...(steps[operationId] || {}) }
+      if (enabled === fallback) delete operation[role]
+      else operation[role] = enabled
+      if (Object.keys(operation).length === 0) delete steps[operationId]
+      else steps[operationId] = operation
+      return { ...current, steps }
+    })
+  }
+
   function writeExclusions(operationId, exclusion) {
     setCustomCases((current) => {
       const exclusions = { ...(current.exclusions || {}) }
@@ -753,59 +777,158 @@ export default function App() {
       return
     }
     const next = []
-    for (let index = 0; index < cases.length; index += 1) {
-      if (stopRef.current) {
-        break
+    const around = fixtureSteps(selected, operations, defaults)
+    const plan = around?.plan || null
+    const savedSteps = customCases.steps?.[selected.id] || {}
+    const useBefore = Boolean(plan) && fixtureEnabled(savedSteps, 'before')
+    const useAfter = useBefore && Boolean(plan?.cleanup) && fixtureEnabled(savedSteps, 'after')
+    const useEnquiry = Boolean(around?.enquiry) && fixtureEnabled(savedSteps, 'enquiry')
+    const assigned = useBefore ? assignFixture(cases, plan) : cases
+    let sharedId = null
+    const releaseIds = []
+    const headers = requestHeaders(defaults)
+    const sendOnce = async (operation, item, honorStop) => {
+      if (honorStop && stopRef.current) return null
+      await pace()
+      if (honorStop && stopRef.current) return null
+      if (oauthMode(oauth) === 'on') setActivity('requesting access token')
+      const sent = {
+        body: evaluateDynamics(item.body),
+        query: evaluateDynamics(item.query || {}),
+        path: evaluateDynamics(item.path || {}),
       }
-      const item = cases[index]
-      const response = await executeCheck(apiBase, idpBase, selected, item, {
-        pace,
-        shouldStop: () => stopRef.current,
-        onActivity: setActivity,
-        headers: requestHeaders(defaults),
-        oauth,
-      })
-      if (!response) {
-        break
-      }
-      const bodyText = item.expect?.outcome === 'custom' && response.pages?.[0] ? response.pages[0].text : response.text
-      const verdict = judge(item.expect, response.status, bodyText, {
-        request: response.request || { body: item.body, query: item.query, path: item.path },
-        expectations: responseChecks(responsesForMode(selected.responses, activeMode), new Set(fields.map((field) => field.name)), defaults.responses?.[selected.id]),
-        variables: defaults.variables,
-        pages: response.pages,
-      })
-      const request = formatRequestBody(response.request?.body ?? item.body)
-      next.push({
-        index: index + 1,
-        label: item.label,
-        status: response.status,
-        passed: verdict.passed,
-        detail: verdict.detail,
-        text: response.pages ? response.text : pretty(response.text),
-        pages: response.pages ? response.pages.map((page) => ({ ...page, text: pretty(page.text) })) : null,
-        ...(response.records?.length ? { records: response.records } : {}),
-        ...(request ? { request } : {}),
-      })
+      const response = await callOperation(apiBase, idpBase, operation, sent, null, headers, oauth)
+      return { ...response, request: { body: item.rawBody != null ? item.rawBody : sent.body, query: sent.query, path: sent.path } }
+    }
+    const createRecord = async () => {
+      setActivity('creating a record to test')
+      const response = await sendOnce(plan.create, sampleCall(plan.create, defaults), true)
+      if (!response) return { stopped: true }
+      return { id: readCreatedId(response.status, response.text, response.location), response }
+    }
+    const pushResult = (entry) => {
+      next.push({ index: next.length + 1, ...entry })
       setResults([...next])
     }
-    setActivity('')
-    setRunning(false)
-    if (next.length > 0) {
-      try {
-        const saved = await saveRun({
-          client: profileLabel({ name: profileName, oauth }),
-          clientId: oauth.clientId || '',
-          operation: selected.id,
-          mode: modeInfo?.label || mode,
-          baseUrl: apiBase,
-          stopped: stopRef.current,
-          results: next,
+    const noteCreate = (response, id, label) => {
+      const request = formatRequestBody(response.request?.body)
+      pushResult({
+        step: 'before',
+        label,
+        status: response.status,
+        passed: id != null,
+        detail: id != null ? `Created id ${id}.` : 'Creating a record did not return an id.',
+        text: pretty(response.text),
+        ...(request ? { request } : {}),
+      })
+    }
+    try {
+      if (assigned.some((item) => item.needsFixture)) {
+        const created = await createRecord()
+        if (created.stopped) return
+        noteCreate(created.response, created.id, `Before · ${plan.create.method} ${plan.create.path}`)
+        if (created.id == null) return
+        sharedId = created.id
+      }
+      for (let index = 0; index < assigned.length; index += 1) {
+        if (stopRef.current) break
+        let item = assigned[index]
+        let ownId = null
+        if (item.ownRecord) {
+          const created = await createRecord()
+          if (created.stopped) break
+          noteCreate(created.response, created.id, `Before · ${plan.create.method} ${plan.create.path}`)
+          if (created.id == null) break
+          ownId = created.id
+          item = withFixtureId(item, plan.idField, ownId)
+        } else if (item.needsFixture) {
+          item = withFixtureId(item, plan.idField, sharedId)
+        }
+        const response = await executeCheck(apiBase, idpBase, selected, item, {
+          pace,
+          shouldStop: () => stopRef.current,
+          onActivity: setActivity,
+          headers,
+          oauth,
         })
-        setSavedRunName(saved.name)
-        setSavedRuns(await listRuns())
-      } catch (error) {
-        setFileNotice(error.message || 'Could not save that run.')
+        if (!response) {
+          if (ownId != null) releaseIds.push(ownId)
+          break
+        }
+        if (ownId != null && !(response.status >= 200 && response.status < 300)) releaseIds.push(ownId)
+        const bodyText = item.expect?.outcome === 'custom' && response.pages?.[0] ? response.pages[0].text : response.text
+        const verdict = judge(item.expect, response.status, bodyText, {
+          request: response.request || { body: item.body, query: item.query, path: item.path },
+          expectations: responseChecks(responsesForMode(selected.responses, activeMode), new Set(fields.map((field) => field.name)), defaults.responses?.[selected.id]),
+          variables: defaults.variables,
+          pages: response.pages,
+        })
+        let enquiry = null
+        const target = useEnquiry ? enquiryTarget(item, plan.idField) : null
+        if (target != null && !stopRef.current) {
+          setActivity('reading the record back')
+          const follow = await sendOnce(around.enquiry, { body: {}, query: {}, path: { [plan.idField]: target } }, true)
+          if (follow) {
+            const miss = enquiryShouldMiss(item, response.status, ownId != null)
+            const ok = miss ? follow.status === 404 : follow.status >= 200 && follow.status < 300
+            const call = `${around.enquiry.method} ${around.enquiry.path}`
+            enquiry = { status: follow.status, text: pretty(follow.text), label: call }
+            const note = ok
+              ? `Enquiry ${call} returned ${follow.status}.`
+              : `Enquiry ${call} returned ${follow.status}; ${miss ? 'expected the record to be gone' : 'expected the record to still be there'}.`
+            verdict.detail = [verdict.detail, note].filter(Boolean).join(' ')
+            if (!ok) verdict.passed = false
+          }
+        }
+        const request = formatRequestBody(response.request?.body ?? item.body)
+        pushResult({
+          label: item.label,
+          status: response.status,
+          passed: verdict.passed,
+          detail: verdict.detail,
+          text: response.pages ? response.text : pretty(response.text),
+          pages: response.pages ? response.pages.map((page) => ({ ...page, text: pretty(page.text) })) : null,
+          ...(response.records?.length ? { records: response.records } : {}),
+          ...(request ? { request } : {}),
+          ...(enquiry ? { enquiry } : {}),
+        })
+      }
+    } finally {
+      const leftover = [...releaseIds]
+      if (sharedId != null) leftover.push(sharedId)
+      if (useAfter && leftover.length > 0) {
+        setActivity('removing the record created for this run')
+        for (const id of leftover) {
+          const response = await sendOnce(plan.cleanup, { body: {}, query: {}, path: { [plan.idField]: id } }, false)
+          const removed = Boolean(response) && (response.status === 404 || (response.status >= 200 && response.status < 300))
+          pushResult({
+            step: 'after',
+            label: `After · ${plan.cleanup.method} ${plan.cleanup.path}`,
+            status: response?.status || 0,
+            passed: removed,
+            detail: removed ? `Removed id ${id}.` : 'The record created for this run could not be removed.',
+            text: pretty(response?.text || ''),
+          })
+        }
+      }
+      setActivity('')
+      setRunning(false)
+      if (next.length > 0) {
+        try {
+          const saved = await saveRun({
+            client: profileLabel({ name: profileName, oauth }),
+            clientId: oauth.clientId || '',
+            operation: selected.id,
+            mode: modeInfo?.label || mode,
+            baseUrl: apiBase,
+            stopped: stopRef.current,
+            results: next,
+          })
+          setSavedRunName(saved.name)
+          setSavedRuns(await listRuns())
+        } catch (error) {
+          setFileNotice(error.message || 'Could not save that run.')
+        }
       }
     }
   }
@@ -937,6 +1060,7 @@ export default function App() {
                                 secondary: { noWrap: true },
                               }}
                             />
+                            <IdMark operation={operation} />
                             <PaginationMark pagination={operation.pagination} />
                           </ListItemButton>
                         ))}
@@ -1150,6 +1274,14 @@ export default function App() {
                 )}
 
                 <Stack spacing={1}>
+                  {preparation && (
+                    <FixtureCalls
+                      calls={preparation.calls}
+                      saved={customCases.steps?.[selected.id]}
+                      disabled={running}
+                      onChange={(role, enabled) => writeFixtureStep(selected.id, role, enabled)}
+                    />
+                  )}
                   <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ alignItems: { sm: 'center' } }}>
                     <Button
                       variant="contained"
@@ -1186,7 +1318,7 @@ export default function App() {
                           : planned.length === 0
                             ? 'This operation has no checks in the selected mode.'
                             : running
-                              ? `${results.length} of ${planned.length} complete${activity ? ` · ${activity}` : ''}`
+                              ? `${finishedChecks} of ${planned.length} complete${activity ? ` · ${activity}` : ''}`
                               : `List checks follow the spec. Requests stay within this rate.${skippedCombinations > 0 ? ` ${skippedCombinations} combinations skipped.` : ''}`}
                     </Typography>
                     <PaginationHelp pagination={selected.pagination} />
@@ -1194,7 +1326,7 @@ export default function App() {
                   {running && (
                     <LinearProgress
                       variant="determinate"
-                      value={results.length === 0 ? 0 : (results.length / planned.length) * 100}
+                      value={finishedChecks === 0 ? 0 : (finishedChecks / planned.length) * 100}
                       sx={{ borderRadius: 99, height: 6 }}
                     />
                   )}
@@ -1350,6 +1482,19 @@ const PAGINATION_TONE = {
   cursor: { label: 'Cursor', bg: '#e7f6f3', fg: '#0f766e' },
   offset: { label: 'Offset', bg: '#fef3e2', fg: '#b45309' },
   link: { label: 'Link', bg: '#f3e8ff', fg: '#6d28d9' },
+}
+
+function IdMark({ operation }) {
+  const record = recordId(operation)
+  if (!record) return null
+  return (
+    <Chip
+      size="small"
+      label="ID"
+      title={`Needs ${record.name}`}
+      sx={{ bgcolor: '#eef2ff', color: '#3730a3', fontWeight: 700, height: 22, flexShrink: 0, mt: 0.25 }}
+    />
+  )
 }
 
 function PaginationMark({ pagination }) {
@@ -2798,21 +2943,75 @@ function ResponsePreview({ result, open }) {
 }
 
 function ResponseBody({ result }) {
-  if (result.pages && result.pages.length > 1) {
-    return (
-      <Stack spacing={0.75}>
-        {result.pages.map((page) => (
-          <Box key={`${page.label}-${page.status}`} sx={{ border: 1, borderColor: 'divider', borderRadius: 1, overflow: 'hidden' }}>
-            <Typography variant="caption" sx={{ display: 'block', px: 1.25, py: 0.4, bgcolor: '#f8fafc', color: 'text.secondary', fontWeight: 700 }}>
-              {page.label} · HTTP {page.status} · {page.count} records
-            </Typography>
-            <PayloadText text={page.text} open />
-          </Box>
-        ))}
+  const body = result.pages && result.pages.length > 1 ? (
+    <Stack spacing={0.75}>
+      {result.pages.map((page) => (
+        <Box key={`${page.label}-${page.status}`} sx={{ border: 1, borderColor: 'divider', borderRadius: 1, overflow: 'hidden' }}>
+          <Typography variant="caption" sx={{ display: 'block', px: 1.25, py: 0.4, bgcolor: '#f8fafc', color: 'text.secondary', fontWeight: 700 }}>
+            {page.label} · HTTP {page.status} · {page.count} records
+          </Typography>
+          <PayloadText text={page.text} open />
+        </Box>
+      ))}
+    </Stack>
+  ) : <PayloadText text={result.text} open />
+  if (!result.enquiry) return body
+  return (
+    <Stack spacing={0.75}>
+      {body}
+      <Box sx={{ border: 1, borderColor: 'divider', borderRadius: 1, overflow: 'hidden' }}>
+        <Typography variant="caption" sx={{ display: 'block', px: 1.25, py: 0.4, bgcolor: '#f8fafc', color: 'text.secondary', fontWeight: 700 }}>
+          Enquiry {result.enquiry.label} · HTTP {result.enquiry.status}
+        </Typography>
+        <PayloadText text={result.enquiry.text} open />
+      </Box>
+    </Stack>
+  )
+}
+
+function FixtureCalls({ calls, saved, disabled, onChange }) {
+  const beforeOn = fixtureEnabled(saved, 'before')
+  return (
+    <Box sx={{ border: 1, borderColor: 'divider', borderRadius: 1, px: 1.5, py: 1 }}>
+      <Typography variant="subtitle2" sx={{ mb: 0.75 }}>Calls around this run</Typography>
+      <Stack spacing={0.5}>
+        {calls.map((call) => {
+          const locked = call.role === 'after' && !beforeOn
+          const checked = fixtureEnabled(saved, call.role) && !locked
+          return (
+            <FormControlLabel
+              key={call.role}
+              sx={{ m: 0, alignItems: 'flex-start' }}
+              control={(
+                <Checkbox
+                  size="small"
+                  checked={checked}
+                  disabled={disabled || locked}
+                  onChange={(event) => onChange(call.role, event.target.checked)}
+                  sx={{ pt: 0.25 }}
+                />
+              )}
+              label={(
+                <Stack spacing={0.15}>
+                  <Stack direction="row" spacing={1} useFlexGap sx={{ alignItems: 'center', flexWrap: 'wrap' }}>
+                    <Typography variant="body2" sx={{ width: 64, fontWeight: 700 }}>
+                      {call.role === 'before' ? 'Before' : call.role === 'after' ? 'After' : 'Enquiry'}
+                    </Typography>
+                    <MethodBadge method={call.operation.method} />
+                    <Typography variant="body2" sx={{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}>{call.operation.path}</Typography>
+                    <Typography variant="body2" color="text.secondary">{call.operation.summary}</Typography>
+                  </Stack>
+                  <Typography variant="caption" color="text.secondary">
+                    {locked ? 'Turn on Before to remove the record this run creates.' : call.hint}
+                  </Typography>
+                </Stack>
+              )}
+            />
+          )
+        })}
       </Stack>
-    )
-  }
-  return <PayloadText text={result.text} open />
+    </Box>
+  )
 }
 
 function responseSummary(result) {
@@ -3683,7 +3882,7 @@ async function callOperation(apiBase, idpBase, operation, item, urlOverride, ext
         ? String(item.rawBody)
         : JSON.stringify(item.body)
     const response = await fetch(url, { method, headers, body })
-    return { status: response.status, text: await response.text(), link: response.headers.get('link') }
+    return { status: response.status, text: await response.text(), link: response.headers.get('link'), location: response.headers.get('location') }
   } catch (error) {
     return { status: 0, text: error.message || 'Request failed', link: null }
   }

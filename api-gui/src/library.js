@@ -14,7 +14,7 @@ export function emptyDefaults() {
 }
 
 export function emptyCases() {
-  return { operations: {}, exclusions: {}, values: {}, errors: {}, checks: {} }
+  return { operations: {}, exclusions: {}, values: {}, errors: {}, checks: {}, steps: {} }
 }
 
 export function loadStored(key, empty, parse) {
@@ -56,6 +56,7 @@ export function casesDocument(cases) {
   const values = cases.values || {}
   const errors = cases.errors || {}
   const checks = cases.checks || {}
+  const steps = cases.steps || {}
   return {
     version: 1,
     kind: 'cases',
@@ -64,6 +65,7 @@ export function casesDocument(cases) {
     ...(Object.keys(values).length > 0 ? { values } : {}),
     ...(Object.keys(errors).length > 0 ? { errors } : {}),
     ...(Object.keys(checks).length > 0 ? { checks } : {}),
+    ...(Object.keys(steps).length > 0 ? { steps } : {}),
   }
 }
 
@@ -96,6 +98,7 @@ export function hasSavedCases(cases) {
   return Object.values(cases?.operations || {}).some((list) => Array.isArray(list) && list.length > 0)
     || Object.keys(cases?.exclusions || {}).length > 0
     || Object.keys(cases?.values || {}).length > 0
+    || Object.keys(cases?.steps || {}).length > 0
 }
 
 export function emptyOauth() {
@@ -244,7 +247,22 @@ export function parseCases(value) {
     values: combinationValueMaps(data.values),
     errors: errorMaps(data.errors),
     checks: errorCheckMaps(data.checks),
+    steps: stepMaps(data.steps),
   }
+}
+
+function stepMaps(source) {
+  const steps = {}
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return steps
+  for (const [operationId, item] of Object.entries(source)) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue
+    const next = {}
+    for (const role of ['before', 'after', 'enquiry']) {
+      if (typeof item[role] === 'boolean') next[role] = item[role]
+    }
+    if (Object.keys(next).length > 0) steps[operationId] = next
+  }
+  return steps
 }
 
 function errorMaps(source) {

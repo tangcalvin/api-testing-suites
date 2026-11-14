@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { OMIT, OBJECT_FIELDS, individualChoices, buildIndividualCases, applyErrorOverrides, applyErrorRowToGroup, buildCases, buildCustomCases, buildCustomErrorCases, buildErrorCases, caseCount, detectPagination, judge, listOperations, operationGroups, parseSpecText, planContinuation, responseChecks, responseViews, responsesForMode, scalarCombinationField, specGaps, textCombinationField, viewsWithStatuses, withTextCombinationValues } from './spec.js'
+import { OMIT, OBJECT_FIELDS, individualChoices, buildIndividualCases, applyErrorOverrides, applyErrorRowToGroup, assignFixture, buildCases, buildCustomCases, buildCustomErrorCases, buildErrorCases, caseCount, detectPagination, enquiryShouldMiss, enquiryTarget, fixtureEnabled, fixtureNote, fixturePlan, fixtureSteps, judge, listOperations, operationGroups, parseSpecText, planContinuation, readCreatedId, recordId, responseChecks, responseViews, responsesForMode, sampleCall, scalarCombinationField, specGaps, textCombinationField, viewsWithStatuses, withFixtureId, withTextCombinationValues } from './spec.js'
 
 const SPEC = `
 openapi: 3.1.0
@@ -1317,4 +1317,142 @@ test('an array of objects matches each listed object', () => {
   )
   assert.equal(customOrdered.passed, false)
   assert.match(customOrdered.detail, /\[0\] expected \{"field":"quantity"\}/)
+})
+
+const RESOURCE = `
+openapi: 3.1.0
+tags:
+  - name: Orders
+paths:
+  /api/orders:
+    get:
+      tags: [Orders]
+      summary: List orders
+    post:
+      tags: [Orders]
+      summary: Create an order
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [orderNumber]
+              properties:
+                orderNumber:
+                  type: string
+                  example: ORD-1
+  /api/orders/{id}:
+    get:
+      tags: [Orders]
+      summary: Get one order
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+    put:
+      tags: [Orders]
+      summary: Replace an order
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [orderNumber]
+              properties:
+                orderNumber:
+                  type: string
+                  example: ORD-1
+    delete:
+      tags: [Orders]
+      summary: Delete an order
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+`
+
+test('a run for one record creates it from the collection and deletes it afterwards', () => {
+  const operations = listOperations(parseSpecText(RESOURCE))
+  const byId = Object.fromEntries(operations.map((operation) => [operation.id, operation]))
+  const getOne = byId['GET /api/orders/{id}']
+  const plan = fixturePlan(getOne, operations, {})
+  assert.equal(plan.create.id, 'POST /api/orders')
+  assert.equal(plan.cleanup.id, 'DELETE /api/orders/{id}')
+  assert.equal(plan.idField, 'id')
+  assert.equal(recordId(getOne).name, 'id')
+  assert.equal(recordId(byId['POST /api/orders']), null)
+  assert.equal(recordId(byId['GET /api/orders']), null)
+  assert.equal(plan.placeholder, 1)
+  assert.equal(plan.missingId, 0)
+  assert.equal(plan.consumeSuccess, false)
+
+  const fields = getOne.fields
+  const success = buildCases(fields, {})
+  const errors = buildErrorCases(fields)
+  const missing = buildCustomErrorCases(fields, [{ name: 'Missing order', status: '404', code: 'NotFound' }])
+  const chosen = buildCustomCases(fields, [{ name: 'Known order', request: { id: 42 }, expect: { status: '200' } }])
+  const assigned = assignFixture([...success, ...errors, ...missing, ...chosen], plan)
+  assert.equal(assigned[0].needsFixture, true)
+  assert.equal(assigned[0].path.id, 1)
+  const invalid = assigned.find((item) => item.path.id === 'abc')
+  assert.ok(invalid)
+  assert.equal(invalid.needsFixture, undefined)
+  const notFound = assigned.find((item) => item.label === 'Missing order')
+  assert.equal(notFound.path.id, 0)
+  assert.equal(notFound.needsFixture, false)
+  const known = assigned.find((item) => item.label === 'Known order')
+  assert.equal(known.path.id, 42)
+  assert.equal(known.needsFixture, undefined)
+  assert.match(fixtureNote(plan, success), /creates a record first/)
+
+  const replaced = withFixtureId(assigned[0], 'id', 15)
+  assert.equal(replaced.path.id, 15)
+  assert.equal(replaced.label, 'id=15')
+  assert.equal(replaced.needsFixture, false)
+
+  assert.equal(fixturePlan(byId['POST /api/orders'], operations, {}), null)
+  assert.equal(fixturePlan(byId['GET /api/orders'], operations, {}), null)
+  assert.equal(fixturePlan(getOne, operations, { operations: { 'GET /api/orders/{id}': { id: '${orderId}' } } }), null)
+  assert.equal(fixturePlan(getOne, operations, { global: { id: 7 } }), null)
+
+  const remove = fixturePlan(byId['DELETE /api/orders/{id}'], operations, {})
+  assert.equal(remove.consumeSuccess, true)
+  const deleted = assignFixture(buildCases(byId['DELETE /api/orders/{id}'].fields, {}), remove)
+  assert.equal(deleted[0].ownRecord, true)
+  assert.equal(deleted[0].needsFixture, undefined)
+  assert.match(fixtureNote(remove, deleted), /own record/)
+
+  const call = sampleCall(byId['POST /api/orders'], { operations: { 'POST /api/orders': { orderNumber: 'ORD-9' } } })
+  assert.equal(call.body.orderNumber, 'ORD-9')
+  assert.equal(readCreatedId(201, '{"id":15,"orderNumber":"ORD-9"}', null), 15)
+  assert.equal(readCreatedId(201, '{}', '/api/orders/15'), 15)
+  assert.equal(readCreatedId(201, 'not-json', 'http://localhost:8088/api/orders/9'), 9)
+  assert.equal(readCreatedId(400, '{"id":1}', '/api/orders/1'), null)
+
+  const getSteps = fixtureSteps(getOne, operations, {})
+  assert.deepEqual(getSteps.calls.map((call) => call.role), ['before', 'after'])
+  assert.equal(getSteps.calls[0].operation.id, 'POST /api/orders')
+  assert.equal(getSteps.calls[1].operation.id, 'DELETE /api/orders/{id}')
+  assert.equal(getSteps.enquiry, null)
+  const replaceSteps = fixtureSteps(byId['PUT /api/orders/{id}'], operations, {})
+  assert.deepEqual(replaceSteps.calls.map((call) => `${call.role} ${call.operation.method} ${call.operation.path}`), [
+    'before POST /api/orders',
+    'enquiry GET /api/orders/{id}',
+    'after DELETE /api/orders/{id}',
+  ])
+  assert.equal(fixtureEnabled(undefined, 'before'), true)
+  assert.equal(fixtureEnabled(undefined, 'enquiry'), false)
+  assert.equal(fixtureEnabled({ before: false }, 'before'), false)
+  assert.equal(enquiryTarget({ path: { id: 15 } }, 'id'), 15)
+  assert.equal(enquiryTarget({ path: { id: 'abc' } }, 'id'), null)
+  assert.equal(enquiryShouldMiss({ expect: { status: 404 } }, 400, false), true)
+  assert.equal(enquiryShouldMiss({ expect: { outcome: 'success' } }, 204, true), true)
+  assert.equal(enquiryShouldMiss({ expect: { outcome: 'success' } }, 200, false), false)
 })
