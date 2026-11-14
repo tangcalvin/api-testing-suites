@@ -1,6 +1,50 @@
-import { fetchWithCa, shouldUseCa } from './caFetch.js'
-
 const textEncoder = new TextEncoder()
+
+export function relativeTokenPath(tokenUrl) {
+  const raw = String(tokenUrl || '').trim()
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) return raw
+  try {
+    const absolute = new URL(raw)
+    const path = `${absolute.pathname}${absolute.search}`
+    return path === '/' ? raw : path
+  } catch {
+    return raw
+  }
+}
+
+export function derivedAudience(tokenUrl, idpBase) {
+  return tokenTarget(tokenUrl, idpBase).audience || ''
+}
+
+export function tokenTarget(tokenUrl, idpBase) {
+  const raw = String(tokenUrl || '').trim()
+  const configured = String(idpBase || '').trim()
+  let path = ''
+  let origin = ''
+  try {
+    const absolute = new URL(raw)
+    path = `${absolute.pathname}${absolute.search}`
+    origin = absolute.origin
+  } catch {
+    path = raw ? (raw.startsWith('/') ? raw : `/${raw}`) : ''
+  }
+  const base = configured || origin
+  if (!base || !path || path === '/') {
+    return { error: 'Enter the OAuth base URL and a token path.' }
+  }
+  const suffix = path.startsWith('/') ? path : `/${path}`
+  return {
+    requestPath: `/idp${suffix}`,
+    base,
+    audience: joinBase(base, suffix),
+  }
+}
+
+function joinBase(base, path) {
+  const left = base.endsWith('/') ? base.slice(0, -1) : base
+  const right = path.startsWith('/') ? path : `/${path}`
+  return `${left}${right}`
+}
 
 export async function signClientAssertion({ algorithm = 'RS256', privateKey, clientId, audience, lifetimeSeconds = 300 }) {
   if (!clientId) throw new Error('Client ID is required.')
@@ -31,25 +75,26 @@ export function oauthMode(oauth) {
   return 'on'
 }
 
-export async function accessTokenFor(oauth) {
+export async function accessTokenFor(oauth, idpBase) {
   const mode = oauthMode(oauth)
   if (mode === 'off') return ''
   if (mode === 'incomplete') {
-    throw new Error('Fill the token URL, client ID, and key for this client before running checks.')
+    throw new Error('Fill the token path, client ID, and key for this client before running checks.')
   }
-  const tokenUrl = String(oauth.tokenUrl).trim()
+  const target = tokenTarget(oauth.tokenUrl, idpBase)
+  if (target.error) throw new Error(target.error)
   const assertion = await signClientAssertion({
     algorithm: oauth.algorithm || 'RS256',
     privateKey: oauth.privateKey,
     clientId: String(oauth.clientId).trim(),
-    audience: String(oauth.audience || '').trim() || tokenUrl,
+    audience: String(oauth.audience || '').trim() || target.audience,
     lifetimeSeconds: Number(oauth.lifetime) || 300,
   })
   const result = await requestAccessToken({
-    tokenUrl,
+    requestPath: target.requestPath,
+    base: target.base,
     assertion,
     scope: String(oauth.scope || '').trim(),
-    ca: oauth.caCert,
   })
   if (!result.ok) {
     throw new Error(result.error || `Token request failed (${result.status}).`)
@@ -57,17 +102,19 @@ export async function accessTokenFor(oauth) {
   return result.accessToken
 }
 
-export async function requestAccessToken({ tokenUrl, assertion, scope, ca }) {
+export async function requestAccessToken({ requestPath, base, assertion, scope }) {
   const body = new URLSearchParams({
     grant_type: 'client_credentials',
     client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer',
     client_assertion: assertion,
   })
   if (scope) body.set('scope', scope)
-  const headers = { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' }
-  const sent = shouldUseCa(tokenUrl, { caCert: ca })
-    ? await fetchWithCa(tokenUrl, { method: 'POST', headers, body: body.toString(), ca })
-    : await readFetch(await fetch(tokenUrl, { method: 'POST', headers, body }))
+  const headers = {
+    'Content-Type': 'application/x-www-form-urlencoded',
+    Accept: 'application/json',
+    'x-tester-base': base,
+  }
+  const sent = await readFetch(await fetch(requestPath, { method: 'POST', headers, body }))
   let parsed = null
   try {
     parsed = JSON.parse(sent.text)

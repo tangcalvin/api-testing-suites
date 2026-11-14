@@ -1,4 +1,5 @@
 import { requestHttps } from './https.js'
+import { createProxy, forward } from './proxy.js'
 import { createStore } from './store.js'
 
 const FILE_HEADER = 'x-tester-files'
@@ -17,19 +18,53 @@ export function fileApiPlugin() {
 
 function install(server, root) {
   const store = createStore(`${root}/data`)
+  const proxy = createProxy(`${root}/data/proxy.json`)
   server.middlewares.use((request, response, next) => {
     const url = new URL(request.url || '/', 'http://tester.local')
+    const prefix = proxyPrefix(url.pathname)
+    if (prefix) {
+      const headerBase = request.headers['x-tester-base']
+      const base = typeof headerBase === 'string' && headerBase.trim() ? headerBase : proxy.baseFor(prefix)
+      forward(request, response, { prefix, base }).catch((error) => {
+        if (!response.headersSent) {
+          response.statusCode = error.status || 502
+          response.end(error.message || 'The upstream call failed.')
+        }
+      })
+      return
+    }
     if (!url.pathname.startsWith('/files')) {
       next()
       return
     }
-    handle(store, request, response, url.pathname).catch((error) => {
+    handle(store, proxy, request, response, url.pathname).catch((error) => {
       send(response, error.status || 500, error.message || 'Could not use the file store.')
     })
   })
 }
 
-async function handle(store, request, response, pathname) {
+function proxyPrefix(pathname) {
+  if (pathname === '/api' || pathname.startsWith('/api/')) return '/api'
+  if (pathname === '/idp' || pathname.startsWith('/idp/')) return '/idp'
+  return ''
+}
+
+async function handle(store, proxy, request, response, pathname) {
+  if (pathname === '/files/proxy' && request.method === 'GET') {
+    send(response, 200, JSON.stringify(await proxy.snapshot()), 'application/json')
+    return
+  }
+  if (pathname === '/files/proxy' && request.method === 'PUT') {
+    let payload
+    try {
+      payload = JSON.parse(await readBody(request))
+    } catch {
+      send(response, 400, 'Proxy settings must be JSON.')
+      return
+    }
+    send(response, 200, JSON.stringify(await proxy.configure(payload || {})), 'application/json')
+    return
+  }
   if (pathname === '/files/clients' && request.method === 'GET') {
     const text = await store.readClients()
     if (text == null) {

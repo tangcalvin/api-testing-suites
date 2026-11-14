@@ -14,7 +14,7 @@ export function emptyDefaults() {
 }
 
 export function emptyCases() {
-  return { operations: {} }
+  return { operations: {}, exclusions: {}, values: {} }
 }
 
 export function loadStored(key, empty, parse) {
@@ -52,10 +52,14 @@ export function defaultsDocument(defaults) {
 }
 
 export function casesDocument(cases) {
+  const exclusions = cases.exclusions || {}
+  const values = cases.values || {}
   return {
     version: 1,
     kind: 'cases',
     operations: cases.operations || {},
+    ...(Object.keys(exclusions).length > 0 ? { exclusions } : {}),
+    ...(Object.keys(values).length > 0 ? { values } : {}),
   }
 }
 
@@ -86,6 +90,8 @@ export function hasSavedDefaults(defaults) {
 
 export function hasSavedCases(cases) {
   return Object.values(cases?.operations || {}).some((list) => Array.isArray(list) && list.length > 0)
+    || Object.keys(cases?.exclusions || {}).length > 0
+    || Object.keys(cases?.values || {}).length > 0
 }
 
 export function emptyOauth() {
@@ -228,7 +234,58 @@ export function parseCases(value) {
     }
     operations[operationId] = list.map(normalizeCase).filter(Boolean)
   }
-  return { operations }
+  return { operations, exclusions: exclusionMaps(data.exclusions), values: combinationValueMaps(data.values) }
+}
+
+function combinationValueMaps(source) {
+  const values = {}
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return values
+  for (const [operationId, fields] of Object.entries(source)) {
+    if (!fields || typeof fields !== 'object' || Array.isArray(fields)) continue
+    const next = {}
+    for (const [name, list] of Object.entries(fields)) {
+      if (!Array.isArray(list)) continue
+      const texts = []
+      for (const item of list) {
+        if (typeof item !== 'string') continue
+        const text = item.trim()
+        if (!text || texts.includes(text)) continue
+        texts.push(text)
+      }
+      if (texts.length > 0) next[name] = texts
+    }
+    if (Object.keys(next).length > 0) values[operationId] = next
+  }
+  return values
+}
+
+function exclusionMaps(source) {
+  const exclusions = {}
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return exclusions
+  for (const [operationId, raw] of Object.entries(source)) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue
+    const fieldsets = (Array.isArray(raw.fieldsets) ? raw.fieldsets : []).map(normalizeFieldset).filter(Boolean)
+    const distinct = (Array.isArray(raw.distinct) ? raw.distinct : []).map(normalizeDistinct).filter(Boolean)
+    if (fieldsets.length || distinct.length) exclusions[operationId] = { fieldsets, distinct }
+  }
+  return exclusions
+}
+
+function normalizeFieldset(rule) {
+  if (!rule || typeof rule !== 'object' || Array.isArray(rule)) return null
+  const values = {}
+  const source = rule.values && typeof rule.values === 'object' && !Array.isArray(rule.values) ? rule.values : {}
+  for (const [name, raw] of Object.entries(source)) {
+    if (typeof raw === 'string' || typeof raw === 'number' || typeof raw === 'boolean') values[name] = String(raw)
+  }
+  if (Object.keys(values).length === 0) return null
+  return { id: typeof rule.id === 'string' && rule.id ? rule.id : newId(), values }
+}
+
+function normalizeDistinct(rule) {
+  const names = Array.isArray(rule?.fields) ? rule.fields.filter((name) => typeof name === 'string' && name) : []
+  if (names.length < 2) return null
+  return { id: typeof rule.id === 'string' && rule.id ? rule.id : newId(), fields: [names[0], names[1]] }
 }
 
 export function newCustomCase() {

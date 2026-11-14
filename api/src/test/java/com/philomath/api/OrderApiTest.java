@@ -49,7 +49,11 @@ class OrderApiTest {
               "deliveryAddress": {
                 "line1": "1 Harbour Road",
                 "city": "Hong Kong",
-                "postalCode": "999077"
+                "postalCode": "999077",
+                "region": {
+                  "code": "HK-IS",
+                  "name": "Hong Kong Island"
+                }
               }
             }
             """;
@@ -66,6 +70,35 @@ class OrderApiTest {
     }
 
     @Test
+    void trimsTextBeforeSaving() throws Exception {
+        String padded = VALID_ORDER
+                .replace("\"customerName\": \"Ada Lovelace\"", "\"customerName\": \"  Ada Lovelace  \"")
+                .replace("\"notes\": \"Leave at reception\"", "\"notes\": \"   \"")
+                .replace("\"warehouseCode\": \"HK-01\"", "\"warehouseCode\": \"  HK-01  \"")
+                .replace("\"line1\": \"1 Harbour Road\"", "\"line1\": \"  1 Harbour Road  \"");
+        mockMvc.perform(post("/api/orders")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(padded))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.customerName").value("Ada Lovelace"))
+                .andExpect(jsonPath("$.warehouseCode").value("HK-01"))
+                .andExpect(jsonPath("$.notes").value(nullValue()))
+                .andExpect(jsonPath("$.deliveryAddress.line1").value("1 Harbour Road"));
+    }
+
+    @Test
+    void rejectsAListFilterPastItsMaximumLength() throws Exception {
+        mockMvc.perform(get("/api/orders").param("notes", "A".repeat(500)))
+                .andExpect(status().isOk());
+
+        mockMvc.perform(get("/api/orders").param("notes", "A".repeat(501)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.exceptions", hasSize(1)))
+                .andExpect(jsonPath("$.exceptions[0].field").value("notes"))
+                .andExpect(jsonPath("$.exceptions[0].code").value("Size"));
+    }
+
+    @Test
     void createsReadsUpdatesAndDeletesAnOrder() throws Exception {
         mockMvc.perform(post("/api/orders")
                         .contentType(MediaType.APPLICATION_JSON)
@@ -77,7 +110,9 @@ class OrderApiTest {
                 .andExpect(jsonPath("$.status").value("CONFIRMED"))
                 .andExpect(jsonPath("$.deliveryAddress.line1").value("1 Harbour Road"))
                 .andExpect(jsonPath("$.deliveryAddress.city").value("Hong Kong"))
-                .andExpect(jsonPath("$.deliveryAddress.postalCode").value("999077"));
+                .andExpect(jsonPath("$.deliveryAddress.postalCode").value("999077"))
+                .andExpect(jsonPath("$.deliveryAddress.region.code").value("HK-IS"))
+                .andExpect(jsonPath("$.deliveryAddress.region.name").value("Hong Kong Island"));
 
         mockMvc.perform(get("/api/orders"))
                 .andExpect(status().isOk())
@@ -132,7 +167,11 @@ class OrderApiTest {
                   "deliveryAddress": {
                     "line1": "1 Harbour Road",
                     "city": "Hong Kong",
-                    "postalCode": "999077"
+                    "postalCode": "999077",
+                    "region": {
+                      "code": "HK-IS",
+                      "name": "Hong Kong Island"
+                    }
                   }
                 }
                 """;
@@ -159,6 +198,19 @@ class OrderApiTest {
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.exceptions", hasSize(1)))
                 .andExpect(jsonPath("$.exceptions[0].field").value("deliveryAddress.postalCode"))
+                .andExpect(jsonPath("$.exceptions[0].code").value("Size"));
+    }
+
+    @Test
+    void namesAFieldOnTheThirdLevelOfTheAddress() throws Exception {
+        String invalid = VALID_ORDER.replace("\"code\": \"HK-IS\"", "\"code\": \"" + "R".repeat(13) + "\"");
+
+        mockMvc.perform(post("/api/orders")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(invalid))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.exceptions", hasSize(1)))
+                .andExpect(jsonPath("$.exceptions[0].field").value("deliveryAddress.region.code"))
                 .andExpect(jsonPath("$.exceptions[0].code").value("Size"));
     }
 
@@ -206,6 +258,28 @@ class OrderApiTest {
                 .andExpect(jsonPath("$.exceptions", hasSize(1)))
                 .andExpect(jsonPath("$.exceptions[0].field").value("orderedAt"))
                 .andExpect(jsonPath("$.exceptions[0].code").value("InvalidFormat"));
+    }
+
+    @Test
+    void rejectsACouponTogetherWithAPromotion() throws Exception {
+        String both = VALID_ORDER.replace(
+                "\"notes\":",
+                "\"couponCode\": \"SAVE10\", \"promotionCode\": \"SPRING\", \"notes\":");
+        mockMvc.perform(post("/api/orders")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(both))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.exceptions", hasSize(2)))
+                .andExpect(jsonPath("$.exceptions[?(@.field == 'couponCode')].code", hasItem("MutuallyExclusive")))
+                .andExpect(jsonPath("$.exceptions[?(@.field == 'promotionCode')].code", hasItem("MutuallyExclusive")));
+
+        String coupon = VALID_ORDER.replace("\"notes\":", "\"couponCode\": \"SAVE10\", \"notes\":");
+        mockMvc.perform(post("/api/orders")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(coupon))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.couponCode").value("SAVE10"))
+                .andExpect(jsonPath("$.promotionCode").value(nullValue()));
     }
 
     @Test
@@ -357,9 +431,21 @@ class OrderApiTest {
                 .andExpect(jsonPath("$.paths['/api/orders/{id}'].get").exists())
                 .andExpect(jsonPath("$.paths['/api/orders/{id}'].put").exists())
                 .andExpect(jsonPath("$.paths['/api/orders/{id}'].delete").exists())
-                .andExpect(jsonPath("$.paths['/api/customers']").doesNotExist())
+                .andExpect(jsonPath("$.paths['/api/orders'].get.tags[0]").value("Orders"))
+                .andExpect(jsonPath("$.paths['/api/customers'].get.tags[0]").value("Customers"))
+                .andExpect(jsonPath("$.paths['/api/customers'].post").exists())
+                .andExpect(jsonPath("$.paths['/api/customers/{id}'].get").exists())
+                .andExpect(jsonPath("$.paths['/api/customers/{id}'].put").exists())
+                .andExpect(jsonPath("$.paths['/api/customers/{id}'].delete").exists())
                 .andExpect(jsonPath("$.components.schemas.OrderRequest.required", hasSize(16)))
+                .andExpect(jsonPath("$.components.schemas.OrderRequest.properties.couponCode").exists())
+                .andExpect(jsonPath("$.components.schemas.OrderRequest.properties.promotionCode").exists())
+                .andExpect(jsonPath("$.components.schemas.OrderRequest['x-mutually-exclusive'][0][0]").value("couponCode"))
+                .andExpect(jsonPath("$.components.schemas.OrderRequest['x-mutually-exclusive'][0][1]").value("promotionCode"))
                 .andExpect(jsonPath("$.components.schemas.DeliveryAddress.properties.line1").exists())
+                .andExpect(jsonPath("$.components.schemas.DeliveryAddress.properties.region").exists())
+                .andExpect(jsonPath("$.components.schemas.Region.properties.code").exists())
+                .andExpect(jsonPath("$.components.schemas.CustomerProfile.properties.company").exists())
                 .andExpect(jsonPath("$.components.schemas.DeliveryAddress.properties.city").exists())
                 .andExpect(jsonPath("$.components.schemas.DeliveryAddress.properties.postalCode").exists())
                 .andExpect(jsonPath("$.components.schemas.ApiErrorResponse.properties.exceptions").exists())

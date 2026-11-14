@@ -62,6 +62,24 @@ public class ApiExceptionHandler {
         )));
     }
 
+    @ExceptionHandler(CustomerNotFoundException.class)
+    public ResponseEntity<ApiErrorResponse> handleCustomerNotFound(CustomerNotFoundException exception) {
+        return error(HttpStatus.NOT_FOUND, List.of(new FieldException(
+                "id",
+                "NotFound",
+                exception.getMessage()
+        )));
+    }
+
+    @ExceptionHandler(ProductNotFoundException.class)
+    public ResponseEntity<ApiErrorResponse> handleProductNotFound(ProductNotFoundException exception) {
+        return error(HttpStatus.NOT_FOUND, List.of(new FieldException(
+                "id",
+                "NotFound",
+                exception.getMessage()
+        )));
+    }
+
     private static ResponseEntity<ApiErrorResponse> error(HttpStatus status, List<FieldException> exceptions) {
         return ResponseEntity.status(status).body(new ApiErrorResponse(status.value(), exceptions));
     }

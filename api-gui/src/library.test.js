@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { readFileSync } from 'node:fs'
-import { acceptsTemporal, applyDefaults, clockToken, evaluateDynamics, formatClock, keptTemporal, parseCases, parseDefaults, parseProfiles, parseProfilesText, profileLabel, profilesDocument, profilesYaml, resolveCases, sampleSource, substitute, temporalDraftOk, uuidToken } from './library.js'
+import { acceptsTemporal, applyDefaults, casesDocument, clockToken, evaluateDynamics, formatClock, keptTemporal, parseCases, parseDefaults, parseProfiles, parseProfilesText, profileLabel, profilesDocument, profilesYaml, resolveCases, sampleSource, substitute, temporalDraftOk, uuidToken } from './library.js'
 
 const orderNumber = { name: 'orderNumber', location: 'body', type: 'string', sample: 'Sample', values: [], constraints: {} }
 const queryNumber = { name: 'orderNumber', location: 'query', type: 'string', sample: '', values: [], constraints: {} }
@@ -63,6 +63,26 @@ test('defaults and custom cases import as separate files', () => {
   assert.deepEqual(saved.omit, ['notes'])
   assert.equal(saved.expect.status, '201')
   assert.equal(saved.expect.fields.length, 1)
+  const withExclusions = parseCases(JSON.stringify({
+    kind: 'cases',
+    operations: {},
+    exclusions: {
+      'POST /api/orders': {
+        fieldsets: [{ id: 'fs-1', values: { status: 'CANCELLED', priority: 'HIGH' } }],
+        distinct: [{ id: 'ds-1', fields: ['fromAccount', 'toAccount'] }],
+      },
+    },
+  }))
+  assert.equal(withExclusions.exclusions['POST /api/orders'].fieldsets[0].values.status, 'CANCELLED')
+  assert.deepEqual(withExclusions.exclusions['POST /api/orders'].distinct[0].fields, ['fromAccount', 'toAccount'])
+  const withValues = parseCases(JSON.stringify({
+    kind: 'cases',
+    operations: {},
+    values: { 'POST /api/orders': { customerName: [' Grace ', 'Grace', 'Ada', ''] } },
+  }))
+  assert.deepEqual(withValues.values['POST /api/orders'].customerName, ['Grace', 'Ada'])
+  assert.deepEqual(casesDocument(withValues).values['POST /api/orders'].customerName, ['Grace', 'Ada'])
+  assert.equal(casesDocument(parseCases('{"kind":"cases","operations":{}}')).values, undefined)
   assert.throws(() => parseCases('{"kind":"defaults","global":{}}'), /custom cases/)
   assert.deepEqual(defaults.variables, {})
 })

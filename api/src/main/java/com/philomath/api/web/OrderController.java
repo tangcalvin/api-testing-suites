@@ -13,7 +13,9 @@ import io.swagger.v3.oas.annotations.media.Content;
 import io.swagger.v3.oas.annotations.media.Schema;
 import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import io.swagger.v3.oas.annotations.tags.Tag;
+import jakarta.validation.ConstraintViolation;
 import jakarta.validation.Valid;
+import jakarta.validation.Validator;
 import org.springframework.data.domain.Page;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -29,6 +31,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 import java.net.URI;
 import java.util.List;
+import java.util.Set;
 
 @RestController
 @RequestMapping("/api/orders")
@@ -36,9 +39,11 @@ import java.util.List;
 public class OrderController {
 
     private final OrderStore orders;
+    private final Validator validator;
 
-    public OrderController(OrderStore orders) {
+    public OrderController(OrderStore orders, Validator validator) {
         this.orders = orders;
+        this.validator = validator;
     }
 
     @GetMapping
@@ -57,6 +62,10 @@ public class OrderController {
                     schema = @Schema(type = "integer", format = "int32", minimum = "1", maximum = "100", defaultValue = "20"))
             @RequestParam(name = "size", defaultValue = "20") int size
     ) {
+        ResponseEntity<ApiErrorResponse> invalid = filterErrors(filter);
+        if (invalid != null) {
+            return invalid;
+        }
         if (page < 0) {
             return constraint("page", "Min", "page must be zero or greater");
         }
@@ -86,6 +95,10 @@ public class OrderController {
                     schema = @Schema(type = "integer", format = "int32", minimum = "1", maximum = "100", defaultValue = "20"))
             @RequestParam(name = "limit", defaultValue = "20") int limit
     ) {
+        ResponseEntity<ApiErrorResponse> invalid = filterErrors(filter);
+        if (invalid != null) {
+            return invalid;
+        }
         if (limit < 1) {
             return constraint("limit", "Min", "limit must be at least 1");
         }
@@ -153,6 +166,20 @@ public class OrderController {
             throw new OrderNotFoundException(id);
         }
         return ResponseEntity.noContent().build();
+    }
+
+    private ResponseEntity<ApiErrorResponse> filterErrors(OrderFilter filter) {
+        Set<ConstraintViolation<OrderFilter>> violations = validator.validate(filter);
+        if (violations.isEmpty()) {
+            return null;
+        }
+        List<FieldException> exceptions = violations.stream()
+                .map(violation -> new FieldException(
+                        violation.getPropertyPath().toString(),
+                        violation.getConstraintDescriptor().getAnnotation().annotationType().getSimpleName(),
+                        violation.getMessage() == null || violation.getMessage().isBlank() ? "invalid" : violation.getMessage()))
+                .toList();
+        return ResponseEntity.badRequest().body(new ApiErrorResponse(400, exceptions));
     }
 
     private static ResponseEntity<ApiErrorResponse> constraint(String field, String code, String message) {

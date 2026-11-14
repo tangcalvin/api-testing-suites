@@ -3,6 +3,7 @@ package com.philomath.api.web;
 import com.philomath.api.dto.CurrencyCode;
 import com.philomath.api.dto.OrderStatus;
 import com.philomath.api.dto.Priority;
+import jakarta.validation.constraints.Size;
 import org.springframework.format.annotation.DateTimeFormat;
 
 import java.time.LocalDate;
@@ -10,15 +11,21 @@ import java.time.OffsetDateTime;
 
 public class OrderFilter {
 
+    @Size(max = 40)
     private String orderNumber;
     private OrderStatus status;
     private Priority priority;
+    @Size(max = 80)
     private String customerName;
+    @Size(max = 120)
     private String customerEmail;
     private CurrencyCode currency;
+    @Size(max = 2)
     private String countryCode;
+    @Size(max = 20)
     private String warehouseCode;
     private Boolean giftWrap;
+    @Size(max = 500)
     private String notes;
     private Integer quantityMin;
     private Integer quantityMax;

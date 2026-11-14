@@ -2,7 +2,6 @@ import yaml from 'js-yaml'
 import { coerceFieldValue, evaluateDynamics, substitute } from '../library.js'
 
 const METHODS = ['get', 'post', 'put', 'patch', 'delete']
-export const MAX_CASES = 500
 
 export function parseSpecText(text) {
   const trimmed = text.trim()
@@ -31,15 +30,41 @@ export function listOperations(spec) {
         id: `${method.toUpperCase()} ${path}`,
         method: method.toUpperCase(),
         path,
+        tag: operationTag(pathItem, operation),
         summary: operation.summary || operation.operationId || `${method.toUpperCase()} ${path}`,
         fields: fieldsFor(spec, pathItem, operation),
+        exclusive: exclusiveGroups(spec, operation),
         pagination: detectPagination(spec, pathItem, operation),
         responses: responseViews(spec, operation),
       })
     }
   }
-  operations.sort((left, right) => left.path.localeCompare(right.path) || left.method.localeCompare(right.method))
+  const tagOrder = new Map((Array.isArray(spec.tags) ? spec.tags : []).map((tag, index) => [tag?.name, index]))
+  operations.sort((left, right) => {
+    const tagDelta = (tagOrder.get(left.tag) ?? 999) - (tagOrder.get(right.tag) ?? 999)
+    if (tagDelta !== 0) return tagDelta
+    return left.tag.localeCompare(right.tag) || left.path.localeCompare(right.path) || left.method.localeCompare(right.method)
+  })
   return operations
+}
+
+export function operationGroups(operations) {
+  const groups = []
+  for (const operation of operations || []) {
+    const tag = operation.tag || 'Other'
+    let group = groups.find((item) => item.tag === tag)
+    if (!group) {
+      group = { tag, operations: [] }
+      groups.push(group)
+    }
+    group.operations.push(operation)
+  }
+  return groups
+}
+
+function operationTag(pathItem, operation) {
+  const tags = Array.isArray(operation?.tags) && operation.tags.length ? operation.tags : pathItem?.tags
+  return Array.isArray(tags) && tags[0] ? String(tags[0]) : 'Other'
 }
 
 export function serverUrl(spec) {
@@ -79,6 +104,30 @@ export function specGaps(operations, profiles) {
         }
       }
     }
+    for (const [operationId, exclusion] of Object.entries(profile.cases?.exclusions || {})) {
+      if (!byId.has(operationId)) {
+        gaps.push(`${label} exclusions ${operationId}`)
+        continue
+      }
+      const names = byId.get(operationId)
+      const used = [
+        ...(exclusion.fieldsets || []).flatMap((rule) => Object.keys(rule.values || {})),
+        ...(exclusion.distinct || []).flatMap((rule) => rule.fields || []),
+      ]
+      for (const fieldName of used) {
+        if (fieldName && !names.has(fieldName)) gaps.push(`${label} exclusion ${operationId} ${fieldName}`)
+      }
+    }
+    for (const [operationId, combinationValues] of Object.entries(profile.cases?.values || {})) {
+      if (!byId.has(operationId)) {
+        gaps.push(`${label} values ${operationId}`)
+        continue
+      }
+      const names = byId.get(operationId)
+      for (const fieldName of Object.keys(combinationValues || {})) {
+        if (fieldName && !names.has(fieldName)) gaps.push(`${label} value ${operationId} ${fieldName}`)
+      }
+    }
     for (const [operationId, statuses] of Object.entries(profile.defaults?.responses || {})) {
       const operation = operationById.get(operationId)
       if (!operation) {
@@ -111,7 +160,7 @@ export function caseCount(fields) {
   return varied.reduce((count, field) => count * field.values.length, 1)
 }
 
-export function buildCases(fields) {
+export function buildCases(fields, exclusions = {}) {
   const varied = fields.filter((field) => field.vary && field.values.length > 0)
   const groups = varied.map((field) => field.values.map((value) => [field.name, value]))
   const combinations = groups.reduce(
@@ -125,22 +174,132 @@ export function buildCases(fields) {
       label: pairs.length ? pairs.map(([name, value]) => `${name}=${valueText(value)}`).join(', ') : 'Valid sample',
       expect: { outcome: 'success' },
       varied: overrides,
-      ...assemble(fields, overrides),
+      ...assemble(fields, overrides, { combination: true }),
     }
-  })
+  }).filter((item) => !combinationExcluded(fields, item.varied, exclusions))
 }
 
-export const OMIT = Symbol('omit')
+function combinationExcluded(fields, varied, exclusions) {
+  const valueOf = (name) => (Object.prototype.hasOwnProperty.call(varied, name)
+    ? varied[name]
+    : fields.find((field) => field.name === name)?.sample)
+  for (const rule of exclusions.fieldsets || []) {
+    const entries = Object.entries(rule.values || {}).filter(([name, expected]) => name && expected !== '')
+    if (entries.length > 0 && entries.every(([name, expected]) => valuesMatch(valueOf(name), expected))) return true
+  }
+  for (const rule of exclusions.distinct || []) {
+    const names = Array.isArray(rule.fields) ? rule.fields : []
+    const [left, right] = names
+    if (!left || !right || left === right) continue
+    const leftValue = valueOf(left)
+    const rightValue = valueOf(right)
+    if (isSet(leftValue) && isSet(rightValue) && valuesMatch(leftValue, rightValue)) return true
+  }
+  for (const group of exclusions.exclusive || []) {
+    if (Array.isArray(group) && group.filter((name) => isSet(valueOf(name))).length > 1) return true
+  }
+  return false
+}
+
+function isSet(value) {
+  return !isOmitted(value) && value !== undefined && value !== null && value !== ''
+}
+
+function valuesMatch(actual, expected) {
+  if (isOmitted(actual)) return isOmitted(expected) || expected === 'omit'
+  if (actual === null || actual === undefined) return expected === 'null' || expected === null
+  return String(actual) === String(expected)
+}
+
+export const OMIT = '@omit'
+
+export function isOmitted(value) {
+  if (value === OMIT) return true
+  if (typeof value === 'symbol') return String(value) === 'Symbol(omit)'
+  return value === 'Symbol(omit)'
+}
+export const OBJECT_NULL = '@null'
+export const OBJECT_EMPTY = '@empty'
+export const OBJECT_FIELDS = '@fields'
+
+export function objectChoice(value) {
+  if (value === OBJECT_NULL || value === null) return 'null'
+  if (value === OBJECT_EMPTY) return 'empty'
+  return 'fields'
+}
 
 export function valueText(value) {
-  if (value === OMIT) return 'omit'
+  if (isOmitted(value)) return 'omit'
   if (value === null) return 'null'
+  if (value === '') return 'blank'
   return String(value)
 }
 
-export function casesFor(mode, fields, customCases = []) {
-  if (mode === 'boundary') {
-    return buildBoundaryCases(fields)
+export function textCombinationField(field) {
+  return scalarCombinationField(field) && field.type === 'string' && field.format !== 'date' && field.format !== 'date-time'
+}
+
+export function scalarCombinationField(field) {
+  return Boolean(
+    field
+    && !field.object
+    && !field.enum
+    && (field.type === 'string' || field.type === 'integer' || field.type === 'number'),
+  )
+}
+
+export function textCombinationValues(sample, extras) {
+  return scalarCombinationValues({ type: 'string', sample, required: true }, extras)
+}
+
+export function scalarCombinationValues(field, extras) {
+  const values = []
+  const push = (value) => {
+    if (value === undefined) return
+    if (values.some((item) => sameCombinationValue(item, value))) return
+    values.push(value)
+  }
+  push(field.sample)
+  for (const extra of extras || []) push(parseCombinationExtra(field, extra))
+  return values.length < 2 ? [] : values
+}
+
+function parseCombinationExtra(field, extra) {
+  const text = String(extra ?? '').trim()
+  if (!text) return undefined
+  if (text === '@null') return field.required ? undefined : null
+  if (text === '@omit' || text === OMIT) return field.required ? undefined : OMIT
+  if (field.type === 'integer' || field.type === 'number') {
+    const value = Number(text)
+    return Number.isFinite(value) ? value : undefined
+  }
+  return text
+}
+
+function sameCombinationValue(left, right) {
+  if (isOmitted(left) || left === '' || left === undefined) return isOmitted(right) || right === '' || right === undefined
+  if (isOmitted(right) || right === '' || right === undefined) return false
+  return Object.is(left, right)
+}
+
+export function withTextCombinationValues(fields, saved, variables) {
+  const source = saved && typeof saved === 'object' && !Array.isArray(saved) ? saved : {}
+  return fields.map((field) => {
+    if (!scalarCombinationField(field)) return field
+    const raw = Array.isArray(source[field.name]) ? source[field.name] : []
+    const extras = raw.map((item) => {
+      const resolved = substitute(item, variables)
+      return resolved == null ? '' : String(resolved)
+    })
+    const values = scalarCombinationValues(field, extras)
+    if (values.length < 2) return { ...field, values: [] }
+    return { ...field, values, vary: field.textVary === false ? false : true }
+  })
+}
+
+export function casesFor(mode, fields, customCases = [], exclusions = {}) {
+  if (mode === 'individual' || mode === 'boundary') {
+    return buildIndividualCases(fields)
   }
   if (mode === 'error') {
     return buildErrorCases(fields)
@@ -148,7 +307,7 @@ export function casesFor(mode, fields, customCases = []) {
   if (mode === 'custom') {
     return buildCustomCases(fields, customCases)
   }
-  return buildCases(fields)
+  return buildCases(fields, exclusions)
 }
 
 export function buildCustomCases(fields, cases) {
@@ -182,37 +341,123 @@ export function buildCustomCases(fields, cases) {
   })
 }
 
-export function boundaryChoices(field) {
+export function individualChoices(field) {
   if (!field || (field.location !== 'body' && field.location !== 'query')) return []
   const choices = []
-  const limits = numericLimits(field)
-  if (limits.min != null) {
-    choices.push({ id: 'min', label: `Min ${limits.min}`, value: limits.min, text: `${field.name} at minimum ${limits.min}` })
+  if (field.object) {
+    if (!field.required) choices.push(nullChoice(field), omitChoice(field))
+    return distinctChoices(field, choices)
   }
-  if (limits.max != null && limits.max !== limits.min) {
-    choices.push({ id: 'max', label: `Max ${limits.max}`, value: limits.max, text: `${field.name} at maximum ${limits.max}` })
+  if (field.enum) {
+    for (const value of field.values || []) {
+      if (value == null || isOmitted(value)) continue
+      const label = valueText(value)
+      choices.push({ id: `enum:${label}`, label, value, text: `${field.name}=${label}` })
+    }
+  } else if (field.type === 'boolean') {
+    for (const value of [false, true]) {
+      choices.push({ id: `bool:${value}`, label: String(value), value, text: `${field.name}=${value}` })
+    }
+  } else {
+    const limits = numericLimits(field)
+    if (limits.min != null) {
+      choices.push({ id: 'min', label: `Min ${limits.min}`, value: limits.min, text: `${field.name} at minimum ${limits.min}` })
+    }
+    if (limits.max != null && limits.max !== limits.min) {
+      choices.push({ id: 'max', label: `Max ${limits.max}`, value: limits.max, text: `${field.name} at maximum ${limits.max}` })
+    }
+    if (field.type === 'string') {
+      const minLength = field.constraints?.minLength
+      if (plainText(field) && minLength > 0) {
+        choices.push({ id: 'minLength', label: `Min ${minLength}`, value: 'A'.repeat(minLength), text: `${field.name} at minimum length ${minLength}` })
+      }
+      const exact = exactLength(field)
+      if (exact) {
+        choices.push({ id: 'maxLength', label: `Max ${field.constraints.maxLength}`, value: exact.value, text: `${field.name} ${exact.label}` })
+      }
+      for (const edge of patternEdges(field)) {
+        choices.push({ id: `pattern:${edge.value}`, label: edge.label, value: edge.value, text: `${field.name} ${edge.label}` })
+      }
+      choices.push(...spaceChoices(field))
+    }
   }
-  const minLength = field.constraints?.minLength
-  if (plainText(field) && minLength > 0) {
-    choices.push({ id: 'minLength', label: `Min length ${minLength}`, value: 'A'.repeat(minLength), text: `${field.name} at minimum length ${minLength}` })
-  }
-  const exact = exactLength(field)
-  if (exact) {
-    choices.push({ id: 'maxLength', label: `Max length ${field.constraints.maxLength}`, value: exact.value, text: `${field.name} ${exact.label}` })
-  }
-  for (const edge of patternEdges(field)) {
-    choices.push({ id: `pattern:${edge.value}`, label: edge.label, value: edge.value, text: `${field.name} ${edge.label}` })
-  }
-  return choices
+  if (!field.required) choices.push(nullChoice(field), omitChoice(field))
+  return distinctChoices(field, choices)
 }
 
-export function buildBoundaryCases(fields) {
+function distinctChoices(field, choices) {
+  const kept = []
+  for (const choice of choices) {
+    if (sameSent(choice.value, field.sample)) continue
+    if (isOmitted(choice.value) && defaultAbsent(field)) continue
+    if (kept.some((item) => sameSent(item.value, choice.value))) continue
+    kept.push(choice)
+  }
+  return kept
+}
+
+function sameSent(left, right) {
+  return Object.is(left, right)
+}
+
+export function individualIncluded(field, choice) {
+  return field.individual?.[choice.id] !== false && field.boundary?.[choice.id] !== false
+}
+
+function nullChoice(field) {
+  return { id: 'null', label: 'Null', value: null, text: `${field.name}=null` }
+}
+
+function omitChoice(field) {
+  return { id: 'omit', label: 'Omit', value: OMIT, text: `${field.name}=omit` }
+}
+
+function defaultAbsent(field) {
+  if (field.object) return isOmitted(field.sample)
+  return isOmitted(field.sample) || field.sample === undefined || field.sample === ''
+}
+
+function spaceChoices(field) {
+  if (!plainText(field) || field.enum || field.object) return []
+  const modes = [
+    { id: 'space:leading', label: 'Leading', text: 'leading space', edges: ['leading'] },
+    { id: 'space:trailing', label: 'Trailing', text: 'trailing space', edges: ['trailing'] },
+    { id: 'space:both', label: 'Both', text: 'both spaces', edges: ['leading', 'trailing'] },
+  ]
+  const maxLength = field.constraints?.maxLength
+  const core = field.sample == null ? '' : String(field.sample)
+  return modes.flatMap((mode) => {
+    const value = spacedText(core, mode.edges, maxLength)
+    if (value == null) return []
+    return [{
+      id: mode.id,
+      label: mode.label,
+      value,
+      text: `${field.name} ${mode.text}`,
+    }]
+  })
+}
+
+function spacedText(core, edges, maxLength) {
+  const lead = edges.includes('leading') ? ' ' : ''
+  const trail = edges.includes('trailing') ? ' ' : ''
+  core = String(core ?? '')
+  if (typeof maxLength === 'number' && maxLength > 0) {
+    const room = maxLength - lead.length - trail.length
+    if (room < 1) return null
+    if (core.length > room) core = core.slice(0, room)
+  }
+  const value = `${lead}${core}${trail}`
+  return value === core ? null : value
+}
+
+export function buildIndividualCases(fields) {
   const cases = []
   for (const field of fields) {
-    for (const choice of boundaryChoices(field)) {
-      if (field.boundary && field.boundary[choice.id] === false) continue
+    for (const choice of individualChoices(field)) {
+      if (!individualIncluded(field, choice)) continue
       cases.push({
-        kind: 'boundary',
+        kind: 'individual',
         label: choice.text,
         expect: { outcome: 'accepted' },
         varied: { [field.name]: choice.value },
@@ -223,7 +468,8 @@ export function buildBoundaryCases(fields) {
   return cases
 }
 
-export function buildErrorCases(fields) {
+export function buildErrorCases(input) {
+  const fields = input.map((field) => (field.object ? { ...field, sample: '' } : field))
   const cases = []
   const required = fields.filter((field) => field.required && field.location === 'body')
   if (required.length > 0) {
@@ -457,12 +703,18 @@ function resolveRequestTemplate(template, request, variables) {
   return { skip: false, value: text }
 }
 
+function storedText(value) {
+  const trimmed = String(value).trim()
+  return trimmed === '' ? null : trimmed
+}
+
 function sentValue(request, name) {
   for (const source of [request?.body, request?.path, request?.query]) {
     const found = valueAt(source, name)
     if (!found.present) continue
     if (found.value === undefined || found.value === null || found.value === '') return { sent: false }
-    return { sent: true, value: found.value }
+    if (typeof found.value !== 'string') return { sent: true, value: found.value }
+    return { sent: true, value: storedText(found.value) }
   }
   return { sent: false }
 }
@@ -605,7 +857,7 @@ export function detectPagination(spec, pathItem, operation) {
   const fields = schemaFields(spec, successSchema(spec, operation))
   const itemsField = findItems(fields)
   const totalPages = findField(fields, ['totalpages', 'pagecount'])
-  const total = findField(fields, ['totalelements', 'totalcount', 'totalitems', 'total'])
+  const total = findField(fields, ['totalsize', 'totalelements', 'totalcount', 'totalitems', 'total'])
   const pageField = findField(fields, ['page', 'pagenumber', 'number'])
   const sizeField = findField(fields, ['size', 'pagesize', 'limit', 'perpage'])
   const nextCursor = findField(fields, ['nextcursor', 'nextpagetoken', 'nexttoken', 'continuationtoken', cursor?.key].filter(Boolean))
@@ -674,6 +926,16 @@ export function planContinuation(pagination, query, body, fetched, linkHeader) {
     return href ? { url: href, label: `link ${fetched.length + 1}` } : null
   }
   if (pagination.style === 'cursor') {
+    const items = readItems(body, pagination)
+    const total = numberOrNull(readPath(body, pagination.response.total))
+    const fetchedCount = fetched.reduce((sum, step) => sum + (Number(step.count) || 0), 0)
+    if (items.length === 0 || (total != null && fetchedCount >= total)) {
+      return null
+    }
+    const size = numberOrNull(readPath(body, pagination.response.size)) ?? numberOrNull(query[pagination.request.size])
+    if (size != null && items.length < size) {
+      return null
+    }
     const token = readPath(body, pagination.response.nextCursor)
     if (token == null || token === '') {
       return null
@@ -681,8 +943,12 @@ export function planContinuation(pagination, query, body, fetched, linkHeader) {
     if (fetched.some((step) => step.cursor === token)) {
       return null
     }
+    const nextQuery = { ...query, [pagination.request.cursor]: token }
+    if (pagination.request.size && nextQuery[pagination.request.size] == null && size != null) {
+      nextQuery[pagination.request.size] = size
+    }
     return {
-      query: { ...query, [pagination.request.cursor]: token },
+      query: nextQuery,
       cursor: token,
       label: `cursor ${String(token).slice(0, 24)}`,
     }
@@ -900,7 +1166,7 @@ export function responseViews(spec, operation) {
 
 function schemaRows(spec, schema, prefix, depth) {
   const resolved = resolveSchema(spec, schema)
-  if (!resolved || depth > 3) {
+  if (!resolved || depth > 8) {
     return []
   }
   if (resolved.type === 'array' || resolved.items) {
@@ -964,7 +1230,7 @@ function successSchema(spec, operation) {
 }
 
 function schemaFields(spec, schema, prefix = [], depth = 0, into = []) {
-  if (!schema || schema.type === 'array' || depth > 2) {
+  if (!schema || schema.type === 'array' || depth > 8) {
     return into
   }
   for (const [name, property] of Object.entries(schema.properties || {})) {
@@ -998,6 +1264,42 @@ function findItems(fields) {
   return fields.find((field) => field.schema.type === 'array' || field.schema.items) || null
 }
 
+function exclusiveGroups(spec, operation) {
+  const content = operation.requestBody && operation.requestBody.content
+  const media = content && (content['application/json'] || content['application/*+json'] || content['*/*'] || Object.values(content)[0])
+  if (!media) return []
+  const groups = []
+  collectExclusive(spec, resolveSchema(spec, media.schema || {}), '', groups, 0, new Set())
+  return groups
+}
+
+function collectExclusive(spec, schema, prefix, into, depth, seen) {
+  if (!schema || depth > 8) return
+  for (const group of readExclusiveGroups(schema)) {
+    const names = group.map((name) => (prefix ? `${prefix}.${name}` : name))
+    if (names.length > 1) into.push(names)
+  }
+  for (const [name, property] of Object.entries(schema.properties || {})) {
+    const resolved = resolveSchema(spec, property)
+    if (!isObjectSchema(resolved)) continue
+    const path = prefix ? `${prefix}.${name}` : name
+    const ref = property && property.$ref
+    if (ref && seen.has(ref)) continue
+    const nextSeen = new Set(seen)
+    if (ref) nextSeen.add(ref)
+    collectExclusive(spec, resolved, path, into, depth + 1, nextSeen)
+  }
+}
+
+function readExclusiveGroups(schema) {
+  const raw = schema?.['x-mutually-exclusive']
+  const source = Array.isArray(raw) ? raw : (raw && Array.isArray(raw.groups) ? raw.groups : null)
+  if (!source) return []
+  return source
+    .map((group) => (Array.isArray(group) ? group.filter((name) => typeof name === 'string' && name) : []))
+    .filter((group) => group.length > 1)
+}
+
 function fieldsFor(spec, pathItem, operation) {
   const fields = []
   for (const parameter of [...(pathItem.parameters || []), ...(operation.parameters || [])]) {
@@ -1007,46 +1309,60 @@ function fieldsFor(spec, pathItem, operation) {
   }
 
   const content = operation.requestBody && operation.requestBody.content
-  const media = content && (content['application/json'] || content['application/*+json'])
+  const media = content && (content['application/json'] || content['application/*+json'] || content['*/*'] || Object.values(content)[0])
   if (!media) {
     return fields
   }
   const schema = resolveSchema(spec, media.schema || {})
-  appendBodyFields(spec, schema, '', fields, 0)
+  appendBodyFields(spec, schema, '', fields, 0, new Set())
   return fields
 }
 
-function appendBodyFields(spec, schema, prefix, into, depth) {
-  if (!schema || depth > 3) {
+function appendBodyFields(spec, schema, prefix, into, depth, seen) {
+  if (!schema || depth > 8) {
     return
   }
   const required = new Set(schema.required || [])
   for (const [name, property] of Object.entries(schema.properties || {})) {
     const resolved = resolveSchema(spec, property)
     const path = prefix ? `${prefix}.${name}` : name
-    if (resolved.properties && resolved.type !== 'array' && !resolved.items) {
-      appendBodyFields(spec, resolved, path, into, depth + 1)
+    if (isObjectSchema(resolved)) {
+      into.push(fieldFromSchema(path, resolved, required.has(name), 'body', true))
+      const ref = property && property.$ref
+      if (ref && seen.has(ref)) continue
+      const nextSeen = new Set(seen)
+      if (ref) nextSeen.add(ref)
+      appendBodyFields(spec, resolved, path, into, depth + 1, nextSeen)
     } else {
-      into.push(fieldFromSchema(path, resolved, required.has(name), 'body'))
+      into.push(fieldFromSchema(path, resolved, required.has(name), 'body', false))
     }
   }
 }
 
-function fieldFromSchema(name, schema, required, location) {
+function isObjectSchema(schema) {
+  if (!schema) return false
+  const types = Array.isArray(schema.type) ? schema.type : (schema.type ? [schema.type] : [])
+  if (types.includes('array') || schema.items) return false
+  return Boolean(schema.properties) || types.includes('object')
+}
+
+function fieldFromSchema(name, schema, required, location, object = false) {
   const values = discreteValues(schema)
   const isEnum = Array.isArray(schema.enum) && schema.enum.length > 0
   // Optional query filters stay empty so a list call is not narrowed to a placeholder range.
   const optionalQuery = location === 'query' && !required
-  const sample = optionalQuery ? undefined : sampleFor(schema, name, required)
+  const sample = object || optionalQuery ? undefined : sampleFor(schema, name, required)
   return {
     name,
     location,
-    type: schemaType(schema),
-    enum: isEnum,
-    format: schema.format || '',
+    type: object ? 'object' : schemaType(schema),
+    object,
+    enum: object ? false : isEnum,
+    format: object ? '' : (schema.format || ''),
     required,
-    values: isEnum && !required ? [...values, null, OMIT] : (values || []),
-    vary: isEnum,
+    members: isEnum ? uniqueMembers(values) : undefined,
+    values: object ? [] : (isEnum ? enumLoopValues(uniqueMembers(values), required) : (values || [])),
+    vary: object ? false : isEnum,
     sample: sample === undefined ? '' : sample,
     constraints: {
       minimum: numberOrNull(schema.minimum),
@@ -1058,6 +1374,32 @@ function fieldFromSchema(name, schema, required, location) {
       pattern: schema.pattern || '',
     },
   }
+}
+
+function uniqueMembers(values) {
+  const members = []
+  let sawNull = false
+  for (const value of values || []) {
+    if (isOmitted(value)) continue
+    if (value == null) {
+      if (sawNull) continue
+      sawNull = true
+      members.push(null)
+      continue
+    }
+    if (members.some((item) => item === value)) continue
+    members.push(value)
+  }
+  return members
+}
+
+function enumLoopValues(members, required) {
+  const loop = [...members]
+  if (!required) {
+    if (!loop.some((value) => value == null)) loop.push(null)
+    loop.push(OMIT)
+  }
+  return loop
 }
 
 function discreteValues(schema) {
@@ -1155,13 +1497,16 @@ function sampleFromPattern(pattern) {
 function single(fields, field, value, kind, label, errorExpect = {}) {
   const overrides = { [field.name]: value }
   for (const other of fields) {
-    if (other.name !== field.name && !other.required) overrides[other.name] = OMIT
+    if (other.name === field.name || other.required) continue
+    if (other.object && (field.name === other.name || field.name.startsWith(`${other.name}.`))) continue
+    if (field.object && (other.name === field.name || other.name.startsWith(`${field.name}.`))) continue
+    overrides[other.name] = OMIT
   }
   return {
     kind,
     label,
     expect: kind === 'error' ? { outcome: 'error', ...errorExpect } : { outcome: 'accepted' },
-    varied: { [field.name]: value === OMIT ? '(omitted)' : value },
+    varied: { [field.name]: isOmitted(value) ? '(omitted)' : value },
     ...assemble(fields, overrides),
   }
 }
@@ -1276,13 +1621,30 @@ function numberOrNull(value) {
   return null
 }
 
-function assemble(fields, overrides) {
+const PAGINATION_QUERY = new Set(['page', 'size', 'limit', 'offset', 'cursor', 'nextcursor'])
+
+function assemble(fields, overrides, options = {}) {
   const body = {}
   const query = {}
   const path = {}
+  const suppressed = new Set()
   for (const field of fields) {
+    if (!field.object || field.location !== 'body') continue
     const value = Object.prototype.hasOwnProperty.call(overrides, field.name) ? overrides[field.name] : field.sample
-    if (value === OMIT || value === undefined || value === '') {
+    if (isOmitted(value) || objectChoice(value) !== 'fields') suppressed.add(field.name)
+  }
+  for (const field of fields) {
+    if (nestedUnder(field.name, suppressed)) continue
+    if (options.combination && field.location === 'query' && !field.required && !Object.prototype.hasOwnProperty.call(overrides, field.name) && !PAGINATION_QUERY.has(String(field.name).toLowerCase())) {
+      continue
+    }
+    const value = Object.prototype.hasOwnProperty.call(overrides, field.name) ? overrides[field.name] : field.sample
+    if (field.object) {
+      if (isOmitted(value) || objectChoice(value) === 'fields') continue
+      place(body, field.name, objectChoice(value) === 'null' ? null : {})
+      continue
+    }
+    if (isOmitted(value) || value === undefined || value === '') {
       continue
     }
     if (value === null) {
@@ -1299,6 +1661,14 @@ function assemble(fields, overrides) {
     }
   }
   return { body, query, path }
+}
+
+function nestedUnder(name, roots) {
+  const parts = String(name).split('.')
+  for (let length = 1; length < parts.length; length += 1) {
+    if (roots.has(parts.slice(0, length).join('.'))) return true
+  }
+  return false
 }
 
 function place(body, name, value) {
@@ -1333,17 +1703,33 @@ function resolveSchema(spec, schema, seen = new Set()) {
     if (seen.has(schema.$ref)) {
       return {}
     }
-    seen.add(schema.$ref)
-    return resolveSchema(spec, resolveRef(spec, schema.$ref), seen)
+    const next = new Set(seen)
+    next.add(schema.$ref)
+    return resolveSchema(spec, resolveRef(spec, schema.$ref), next)
   }
   if (Array.isArray(schema.allOf)) {
+    const parts = schema.allOf.map((part) => resolveSchema(spec, part, seen))
+    const objectParts = parts.filter((part) => part?.properties || part?.type === 'object')
+    if (objectParts.length === 0 && !schema.properties) {
+      return { ...(parts.find((part) => part?.type && part.type !== 'object') || parts[0] || {}), ...schema, allOf: undefined }
+    }
     const merged = { type: 'object', properties: {}, required: [] }
-    for (const part of schema.allOf) {
-      const resolved = resolveSchema(spec, part, seen)
+    for (const resolved of parts) {
       Object.assign(merged.properties, resolved.properties || {})
       merged.required.push(...(resolved.required || []))
     }
+    Object.assign(merged.properties, schema.properties || {})
+    merged.required.push(...(schema.required || []))
     return merged
+  }
+  const branches = schema.oneOf || schema.anyOf
+  if (Array.isArray(branches)) {
+    const objects = branches
+      .map((part) => resolveSchema(spec, part, seen))
+      .filter((part) => part && part.properties && !part.items)
+    if (objects.length > 0) {
+      return objects.sort((left, right) => Object.keys(right.properties).length - Object.keys(left.properties).length)[0]
+    }
   }
   return schema
 }

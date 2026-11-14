@@ -1,5 +1,22 @@
 const FILE_HEADER = 'x-tester-files'
 
+export async function loadProxy() {
+  const response = await fetch('/files/proxy')
+  if (!fromFileApi(response) || !response.ok) return null
+  return response.json()
+}
+
+export async function saveProxy(settings) {
+  const response = await fetch('/files/proxy', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(settings),
+  })
+  if (!fromFileApi(response)) throw new Error('Restart the tester so /api and /idp can reach the base URLs.')
+  if (!response.ok) throw new Error(await response.text() || 'Could not save the proxy settings.')
+  return response.json()
+}
+
 export async function loadClientsFile() {
   const response = await fetch('/files/clients')
   if (!fromFileApi(response)) return null

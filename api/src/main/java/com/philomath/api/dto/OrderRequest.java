@@ -1,5 +1,6 @@
 package com.philomath.api.dto;
 
+import com.philomath.api.validation.MutuallyExclusive;
 import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.DecimalMax;
@@ -18,6 +19,7 @@ import jakarta.validation.constraints.Size;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
 
+@MutuallyExclusive({ "couponCode", "promotionCode" })
 @Schema(description = "Fields accepted when creating or replacing an order")
 public record OrderRequest(
         @Schema(example = "ORD-1001")
@@ -93,6 +95,14 @@ public record OrderRequest(
         @NotBlank
         @Size(max = 20)
         String warehouseCode,
+
+        @Schema(description = "Discount coupon. Cannot be sent together with promotionCode.", maxLength = 20)
+        @Size(max = 20)
+        String couponCode,
+
+        @Schema(description = "Promotion. Cannot be sent together with couponCode.", maxLength = 20)
+        @Size(max = 20)
+        String promotionCode,
 
         @NotNull
         @Valid

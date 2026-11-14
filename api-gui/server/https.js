@@ -1,15 +1,7 @@
 import http from 'node:http'
 import https from 'node:https'
-import tls from 'node:tls'
 
-export function trustedCertificates(ca) {
-  const extra = String(ca || '').trim()
-  const roots = tls.rootCertificates || []
-  if (!extra) return [...roots]
-  return [...roots, extra]
-}
-
-export function requestHttps({ url, method = 'GET', headers = {}, body = '', ca = '', timeout = 20000 }) {
+export function requestHttps({ url, method = 'GET', headers = {}, body = '', timeout = 20000 }) {
   let target
   try {
     target = new URL(String(url || ''))
@@ -17,11 +9,11 @@ export function requestHttps({ url, method = 'GET', headers = {}, body = '', ca 
     return Promise.reject(Object.assign(new Error('The HTTPS address is not a valid URL.'), { status: 400 }))
   }
   if (target.protocol !== 'https:' && target.protocol !== 'http:') {
-    return Promise.reject(Object.assign(new Error('Only an http or https address can use the internal CA.'), { status: 400 }))
+    return Promise.reject(Object.assign(new Error('Only an http or https address can be called.'), { status: 400 }))
   }
   const transport = target.protocol === 'https:' ? https : http
   const agent = target.protocol === 'https:'
-    ? new https.Agent({ ca: trustedCertificates(ca), rejectUnauthorized: true })
+    ? new https.Agent({ rejectUnauthorized: false })
     : undefined
   return new Promise((resolve, reject) => {
     const request = transport.request(target, {
@@ -29,6 +21,7 @@ export function requestHttps({ url, method = 'GET', headers = {}, body = '', ca 
       headers: outboundHeaders(headers),
       timeout,
       agent,
+      rejectUnauthorized: false,
     }, (response) => {
       const chunks = []
       response.on('data', (chunk) => chunks.push(chunk))

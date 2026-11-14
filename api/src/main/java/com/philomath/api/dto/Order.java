@@ -25,6 +25,8 @@ public record Order(
         String notes,
         Boolean giftWrap,
         String warehouseCode,
+        String couponCode,
+        String promotionCode,
         DeliveryAddress deliveryAddress
 ) {
 }

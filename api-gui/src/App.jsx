@@ -1,4 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import CloseIcon from '@mui/icons-material/Close'
+import EditOutlinedIcon from '@mui/icons-material/EditOutlined'
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore'
 import FileDownloadOutlinedIcon from '@mui/icons-material/FileDownloadOutlined'
 import FileUploadOutlinedIcon from '@mui/icons-material/FileUploadOutlined'
@@ -14,6 +16,7 @@ import {
   Button,
   Checkbox,
   Chip,
+  Collapse,
   Dialog,
   DialogActions,
   DialogContent,
@@ -41,8 +44,10 @@ import {
   Typography,
 } from '@mui/material'
 import {
-  MAX_CASES,
-  boundaryChoices,
+  individualChoices,
+  individualIncluded,
+  caseCount,
+  isOmitted,
   casesFor,
   createPacer,
   defaultResponseExpected,
@@ -54,6 +59,11 @@ import {
   joinUrl,
   judge,
   listOperations,
+  operationGroups,
+  OBJECT_EMPTY,
+  OBJECT_FIELDS,
+  OBJECT_NULL,
+  objectChoice,
   parseSpecText,
   planContinuation,
   readItems,
@@ -61,8 +71,11 @@ import {
   responseChecks,
   serverUrl,
   specGaps,
+  scalarCombinationField,
+  textCombinationField,
   valueText,
   viewsWithStatuses,
+  withTextCombinationValues,
 } from './openapi/spec'
 import {
   CASES_KEY,
@@ -110,26 +123,23 @@ import {
   temporalDraftOk,
   uuidToken,
 } from './library'
-import { fetchWithCa, shouldUseCa } from './caFetch'
-import { accessTokenFor, oauthMode } from './jwt'
-import { listRuns, loadClientsFile, loadRun, loadSpecFile, saveClientsFile, saveRun, saveSpecFile } from './files'
+import { accessTokenFor, derivedAudience, oauthMode, relativeTokenPath } from './jwt'
+import { listRuns, loadClientsFile, loadProxy, loadRun, loadSpecFile, saveClientsFile, saveProxy, saveRun, saveSpecFile } from './files'
 
 const EXAMPLES_SEEDED_KEY = 'api-tester.examples-loaded'
 const EXAMPLE_CLIENTS_KEY = 'api-tester.example-clients'
-const PROXY_SPEC = '/backend/v3/api-docs.yaml'
-const PROXY_BASE = '/backend'
-const DIRECT_BASE = 'http://localhost:8088'
+const PROXY_SPEC = '/api/v3/api-docs.yaml'
 
 const MODES = [
   {
     id: 'combination',
     label: 'Combinations',
-    detail: 'Crosses the selected enum fields. A check passes on a success status, and when each expected response value matches.',
+    detail: 'Crosses each selected enum. An optional enum includes null and omit, and a null already in the enum is listed once. An enum that is not crossed uses one selected value. A string or number uses its default plus any other values you add, and can include null and omit when it is optional. Other optional query filters stay off the request. Skip rules are left out. A check passes on a success status, and when each expected response value matches.',
   },
   {
-    id: 'boundary',
-    label: 'Boundaries',
-    detail: 'Each selected minimum, maximum, or length is one check for that field. Every other field keeps its default. A check passes when validation accepts the value and the expected response values match.',
+    id: 'individual',
+    label: 'Individual',
+    detail: 'Each check changes one field. The value on the left is the default kept by every other field. Select the values to try. A check passes when validation accepts the value and the expected response values match.',
   },
   {
     id: 'error',
@@ -159,9 +169,12 @@ const LOCATION_TONE = {
 
 export default function App() {
   const [specUrl, setSpecUrl] = useState(PROXY_SPEC)
-  const [baseUrl, setBaseUrl] = useState(PROXY_BASE)
+  const [apiBase, setApiBase] = useState('http://localhost:8088')
+  const [idpBase, setIdpBase] = useState('')
+  const [proxyLoaded, setProxyLoaded] = useState(false)
   const [operations, setOperations] = useState([])
   const [selectedId, setSelectedId] = useState('')
+  const [openTag, setOpenTag] = useState('')
   const [fields, setFields] = useState([])
   const [mode, setMode] = useState('combination')
   const [loadError, setLoadError] = useState('')
@@ -192,16 +205,50 @@ export default function App() {
   const clientsBody = useRef('')
 
   const selected = operations.find((operation) => operation.id === selectedId) || null
-  const modeInfo = MODES.find((item) => item.id === mode)
-  const resolvedFields = useMemo(
-    () => (selected ? applyDefaults(fields, selected.id, defaults) : []),
-    [defaults, fields, selected],
-  )
+  const activeMode = mode === 'boundary' ? 'individual' : mode
+  const modeInfo = MODES.find((item) => item.id === activeMode)
+  const resolvedFields = useMemo(() => {
+    if (!selected) return []
+    const applied = applyDefaults(fields, selected.id, defaults)
+    if (activeMode !== 'combination') return applied
+    return withTextCombinationValues(applied, customCases.values?.[selected.id], defaults.variables)
+  }, [activeMode, customCases.values, defaults, fields, selected])
   const operationCases = selected ? customCases.operations[selected.id] : undefined
+  const operationExclusions = selected ? customCases.exclusions?.[selected.id] : undefined
   const planned = useMemo(
-    () => (selected ? casesFor(mode, resolvedFields, resolveCases(operationCases || [], defaults.variables)) : []),
-    [defaults.variables, mode, operationCases, resolvedFields, selected],
+    () => (selected ? casesFor(activeMode, resolvedFields, resolveCases(operationCases || [], defaults.variables), {
+      fieldsets: operationExclusions?.fieldsets || [],
+      distinct: operationExclusions?.distinct || [],
+      exclusive: selected.exclusive || [],
+    }) : []),
+    [activeMode, defaults.variables, operationCases, operationExclusions, resolvedFields, selected],
   )
+  const skippedCombinations = activeMode === 'combination' && selected
+    ? Math.max(0, caseCount(resolvedFields) - planned.length)
+    : 0
+
+  useEffect(() => {
+    let cancelled = false
+    loadProxy().then((saved) => {
+      if (cancelled) return
+      if (saved?.api) setApiBase(saved.api)
+      if (typeof saved?.idp === 'string') setIdpBase(saved.idp)
+      setProxyLoaded(true)
+    }).catch(() => {
+      if (!cancelled) setProxyLoaded(true)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!proxyLoaded) return undefined
+    const timer = setTimeout(() => {
+      saveProxy({ api: apiBase, idp: idpBase }).catch(() => {})
+    }, 400)
+    return () => clearTimeout(timer)
+  }, [proxyLoaded, apiBase, idpBase])
 
   useEffect(() => {
     let cancelled = false
@@ -310,6 +357,7 @@ export default function App() {
     }
     setOperations(nextOperations)
     setSelectedId(nextOperations[0].id)
+    setOpenTag('')
     setFields(nextOperations[0].fields.map((field) => ({ ...field })))
     setResults([])
     setLoadError('')
@@ -324,13 +372,17 @@ export default function App() {
   async function loadFromUrl() {
     setLoadError('')
     try {
-      const response = shouldUseCa(specUrl, oauth)
-        ? await fetchWithCa(specUrl, { ca: oauth.caCert })
-        : await fetch(specUrl).then(async (result) => ({ status: result.status, text: await result.text() }))
+      const target = specThroughProxy(specUrl, apiBase)
+      if (!target.base) throw new Error('Enter the backend base URL.')
+      await saveProxy({ api: target.base, idp: idpBase })
+      const response = await fetch(target.path, {
+        headers: { 'x-tester-base': target.base, Accept: 'application/yaml, application/json, */*' },
+      })
+      const text = await response.text()
       if (response.status < 200 || response.status >= 300) {
-        throw new Error(`The spec URL returned HTTP ${response.status}.`)
+        throw new Error(text || `The spec URL returned HTTP ${response.status}.`)
       }
-      await applySpec(response.text, 'Loaded', { save: true })
+      await applySpec(text, 'Loaded', { save: true })
     } catch (error) {
       setLoadError(error.message || 'Could not load the OpenAPI document.')
     }
@@ -580,6 +632,16 @@ export default function App() {
     })
   }
 
+  function writeObject(field, mode) {
+    const globalMode = objectChoice(defaults.global?.[field.name])
+    if (mode === 'fields' && globalMode === 'fields') {
+      writeEndpoint(field, '', true)
+      return
+    }
+    const raw = mode === 'null' ? OBJECT_NULL : mode === 'empty' ? OBJECT_EMPTY : OBJECT_FIELDS
+    writeEndpoint(field, raw)
+  }
+
   function writeEndpoint(field, raw, inherit = false) {
     if (!selected) {
       return
@@ -607,7 +669,36 @@ export default function App() {
       } else {
         operations[operationId] = list
       }
-      return { operations }
+      return { ...current, operations }
+    })
+  }
+
+  function writeCombinationValues(operationId, fieldName, list) {
+    setCustomCases((current) => {
+      const values = { ...(current.values || {}) }
+      const operation = { ...(values[operationId] || {}) }
+      const next = []
+      for (const item of list || []) {
+        const text = String(item ?? '').trim()
+        if (!text || next.includes(text)) continue
+        next.push(text)
+      }
+      if (next.length === 0) delete operation[fieldName]
+      else operation[fieldName] = next
+      if (Object.keys(operation).length === 0) delete values[operationId]
+      else values[operationId] = operation
+      return { ...current, values }
+    })
+  }
+
+  function writeExclusions(operationId, exclusion) {
+    setCustomCases((current) => {
+      const exclusions = { ...(current.exclusions || {}) }
+      const fieldsets = exclusion.fieldsets || []
+      const distinct = exclusion.distinct || []
+      if (fieldsets.length === 0 && distinct.length === 0) delete exclusions[operationId]
+      else exclusions[operationId] = { fieldsets, distinct }
+      return { ...current, exclusions }
     })
   }
 
@@ -638,7 +729,7 @@ export default function App() {
   }
 
   async function run() {
-    if (!selected || planned.length === 0 || planned.length > MAX_CASES) {
+    if (!selected || planned.length === 0) {
       return
     }
     const cases = planned
@@ -650,13 +741,20 @@ export default function App() {
     setResults([])
     setSavedRunName('')
     setOpenResult(null)
+    try {
+      await saveProxy({ api: apiBase, idp: idpBase })
+    } catch (error) {
+      setRunning(false)
+      setFileNotice(error.message || 'Could not prepare the proxy.')
+      return
+    }
     const next = []
     for (let index = 0; index < cases.length; index += 1) {
       if (stopRef.current) {
         break
       }
       const item = cases[index]
-      const response = await executeCheck(baseUrl, selected, item, {
+      const response = await executeCheck(apiBase, idpBase, selected, item, {
         pace,
         shouldStop: () => stopRef.current,
         onActivity: setActivity,
@@ -682,6 +780,7 @@ export default function App() {
         detail: verdict.detail,
         text: response.pages ? response.text : pretty(response.text),
         pages: response.pages ? response.pages.map((page) => ({ ...page, text: pretty(page.text) })) : null,
+        ...(response.records?.length ? { records: response.records } : {}),
         ...(request ? { request } : {}),
       })
       setResults([...next])
@@ -695,7 +794,7 @@ export default function App() {
           clientId: oauth.clientId || '',
           operation: selected.id,
           mode: modeInfo?.label || mode,
-          baseUrl,
+          baseUrl: apiBase,
           stopped: stopRef.current,
           results: next,
         })
@@ -747,7 +846,7 @@ export default function App() {
               </TextField>
             )}
             <Button color="inherit" onClick={() => setLibraryOpen(true)} sx={{ color: '#fff' }}>
-              Library
+              Setting
             </Button>
           </Stack>
         </Toolbar>
@@ -774,20 +873,16 @@ export default function App() {
             </Stack>
             <Stack spacing={0.75}>
               <Typography variant="overline" color="text.secondary">Target</Typography>
-              <Stack direction={{ xs: 'column', md: 'row' }} spacing={1} sx={{ alignItems: { md: 'center' } }}>
-                <TextField
-                  label="API base URL"
-                  value={baseUrl}
-                  onChange={(event) => setBaseUrl(event.target.value)}
-                  fullWidth
-                />
-                <Button variant="outlined" onClick={() => { setSpecUrl(PROXY_SPEC); setBaseUrl(PROXY_BASE) }} sx={{ flexShrink: 0 }}>
-                  Dev proxy
-                </Button>
-                <Button variant="outlined" onClick={() => { setSpecUrl(`${DIRECT_BASE}/v3/api-docs.yaml`); setBaseUrl(DIRECT_BASE) }} sx={{ whiteSpace: 'nowrap', flexShrink: 0 }}>
-                  localhost:8088
-                </Button>
-              </Stack>
+              <TextField
+                label="Backend base URL"
+                value={apiBase}
+                placeholder="http://localhost:8088"
+                onChange={(event) => setApiBase(event.target.value)}
+                fullWidth
+              />
+              <Typography variant="caption" color="text.secondary">
+                API calls use /api on this page. The tester forwards them to this base URL. HTTPS certificate checks are skipped.
+              </Typography>
             </Stack>
           </Box>
           {loadError && <Alert severity="error" sx={{ mt: 1.5 }}>{loadError}</Alert>}
@@ -804,25 +899,48 @@ export default function App() {
               {operations.length > 0 && <Chip size="small" label={operations.length} variant="outlined" />}
             </Stack>
             <List dense disablePadding sx={{ maxHeight: { lg: 'calc(100vh - 250px)' }, overflow: 'auto' }}>
-              {operations.map((operation) => (
-                <ListItemButton
-                  key={operation.id}
-                  selected={operation.id === selectedId}
-                  onClick={() => selectOperation(operation)}
-                  sx={{ py: 1, gap: 1.25, alignItems: 'flex-start' }}
-                >
-                  <MethodBadge method={operation.method} />
-                  <ListItemText
-                    primary={operation.path}
-                    secondary={operation.summary}
-                    slotProps={{
-                      primary: { noWrap: true, variant: 'body2', sx: { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12.5 } },
-                      secondary: { noWrap: true },
-                    }}
-                  />
-                  <PaginationMark pagination={operation.pagination} />
-                </ListItemButton>
-              ))}
+              {operationGroups(operations).map((group) => {
+                const open = openTag === group.tag
+                return (
+                  <Box key={group.tag} component="li" sx={{ display: 'block' }}>
+                    <ListItemButton
+                      onClick={() => setOpenTag(open ? '' : group.tag)}
+                      aria-expanded={open}
+                      sx={{ py: 0.75, bgcolor: '#f8fafc', borderBottom: 1, borderColor: 'divider' }}
+                    >
+                      <ExpandMoreIcon sx={{ mr: 0.75, color: 'text.secondary', transform: open ? 'none' : 'rotate(-90deg)', transition: 'transform 120ms' }} />
+                      <ListItemText
+                        primary={group.tag}
+                        slotProps={{ primary: { variant: 'body2', sx: { fontWeight: 700, color: 'text.secondary' } } }}
+                      />
+                      <Chip size="small" label={group.operations.length} variant="outlined" />
+                    </ListItemButton>
+                    <Collapse in={open} timeout="auto" unmountOnExit>
+                      <List dense disablePadding component="div">
+                        {group.operations.map((operation) => (
+                          <ListItemButton
+                            key={operation.id}
+                            selected={operation.id === selectedId}
+                            onClick={() => selectOperation(operation)}
+                            sx={{ py: 1, gap: 1.25, alignItems: 'flex-start' }}
+                          >
+                            <MethodBadge method={operation.method} />
+                            <ListItemText
+                              primary={operation.path}
+                              secondary={operation.summary}
+                              slotProps={{
+                                primary: { noWrap: true, variant: 'body2', sx: { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12.5 } },
+                                secondary: { noWrap: true },
+                              }}
+                            />
+                            <PaginationMark pagination={operation.pagination} />
+                          </ListItemButton>
+                        ))}
+                      </List>
+                    </Collapse>
+                  </Box>
+                )
+              })}
               {operations.length === 0 && (
                 <Typography variant="body2" color="text.secondary" sx={{ px: 2, py: 3 }}>
                   Load an OpenAPI document to list operations.
@@ -862,7 +980,7 @@ export default function App() {
                   <ToggleButtonGroup
                     exclusive
                     size="small"
-                    value={mode}
+                    value={activeMode}
                     sx={{ flexWrap: 'wrap' }}
                     onChange={(_event, value) => {
                       if (value) {
@@ -879,11 +997,12 @@ export default function App() {
                   {libraryNotice && <Alert severity="info" onClose={() => setLibraryNotice('')}>{libraryNotice}</Alert>}
                 </Stack>
 
-                {mode === 'custom' ? (
+                {activeMode === 'custom' ? (
                   <CustomCases
                     operation={selected}
                     fields={fields}
                     defaults={defaults}
+                    exclusive={selected.exclusive || []}
                     cases={operationCases || []}
                     onChange={(list) => writeCases(selected.id, list)}
                     onExport={() => downloadJson('custom-cases.json', casesDocument(customCases))}
@@ -891,47 +1010,87 @@ export default function App() {
                   />
                 ) : (
                 <Box sx={{ overflow: 'auto', maxHeight: 'min(440px, calc(100vh - 420px))', border: 1, borderColor: 'divider', borderRadius: 1 }}>
-                  <Table size="small" stickyHeader sx={{ tableLayout: 'fixed', width: '100%' }}>
+                  <Table size="small" stickyHeader sx={{ tableLayout: 'fixed', width: '100%', minWidth: activeMode === 'combination' ? 1080 : undefined }}>
                     <TableHead>
-                      <TableRow>
-                        <TableCell sx={{ width: 48 }}>{mode === 'boundary' ? 'Use' : 'Vary'}</TableCell>
-                        <TableCell sx={{ width: 128 }}>Field</TableCell>
-                        <TableCell sx={{ width: 76 }}>Type</TableCell>
-                        <TableCell sx={{ width: 120 }}>Constraints</TableCell>
-                        <TableCell>{mode === 'boundary' ? 'Include' : 'Sample'}</TableCell>
-                      </TableRow>
+                      {activeMode === 'individual' ? (
+                        <TableRow>
+                          <TableCell sx={{ width: 176 }}>Field</TableCell>
+                          <TableCell sx={{ width: 268 }}>Default</TableCell>
+                          <TableCell>Try</TableCell>
+                        </TableRow>
+                      ) : (
+                        <TableRow>
+                          <TableCell sx={{ width: 48 }}>Vary</TableCell>
+                          <TableCell sx={{ width: 220 }}>Field</TableCell>
+                          <TableCell sx={{ width: 76 }}>Type</TableCell>
+                          <TableCell sx={{ width: 120 }}>Constraints</TableCell>
+                          <TableCell>{activeMode === 'combination' ? 'Default' : 'Sample'}</TableCell>
+                        </TableRow>
+                      )}
                     </TableHead>
                     <TableBody>
                       {fields.map((field) => {
                         const resolved = resolvedFields.find((item) => item.location === field.location && item.name === field.name) || field
+                        if (hiddenByObject(field, resolvedFields)) return null
                         const source = sampleSource(field, selected.id, defaults)
+                        const depth = field.name.split('.').length - 1
+                        const leaf = field.name.split('.').pop()
+                        const individualField = { ...resolved, individual: field.individual }
+                        const toggleIndividual = (id, checked) => updateField(field.name, { individual: { ...(field.individual || {}), [id]: checked } })
+                        if (activeMode === 'individual') {
+                          return (
+                            <TableRow key={`${field.location}-${field.name}`} hover>
+                              <TableCell sx={{ py: 0.5 }}>
+                                <Stack direction="row" spacing={0.5} useFlexGap sx={{ alignItems: 'center', flexWrap: 'wrap', pl: depth * 1.5 }}>
+                                  <Typography variant="body2" sx={{ fontWeight: field.object ? 700 : 650 }}>{leaf}</Typography>
+                                  {depth === 0 && <ToneChip label={field.location} tone={LOCATION_TONE[field.location]} />}
+                                  {field.required && <Typography variant="caption" color="text.secondary">required</Typography>}
+                                  {source === 'global' && <Typography variant="caption" color="text.secondary">global</Typography>}
+                                  <ExclusiveMark name={field.name} groups={selected.exclusive} />
+                                </Stack>
+                              </TableCell>
+                              <TableCell sx={{ py: 0.5 }}>
+                                <Box sx={{ display: 'grid', gridTemplateColumns: field.object ? 'auto auto' : '180px auto', columnGap: 0.75, alignItems: 'center' }}>
+                                  {field.object ? (
+                                    <ObjectChoice value={objectChoice(resolved.sample)} onChange={(next) => writeObject(field, next)} />
+                                  ) : (
+                                    <CompactDefault field={defaultEditorField(field, resolved)} onChange={(sample) => writeEndpoint(field, sample)} />
+                                  )}
+                                  {source === 'endpoint' ? (
+                                    <Button size="small" onClick={() => writeEndpoint(field, '', true)} sx={{ minWidth: 0, px: 0.75, whiteSpace: 'nowrap', color: 'text.secondary' }}>
+                                      Inherit
+                                    </Button>
+                                  ) : <Box />}
+                                </Box>
+                              </TableCell>
+                              <TableCell sx={{ py: 0.5 }}>
+                                <IndividualChoices field={individualField} onToggle={toggleIndividual} />
+                              </TableCell>
+                            </TableRow>
+                          )
+                        }
                         return (
                         <TableRow key={`${field.location}-${field.name}`} hover>
                           <TableCell>
-                            {mode === 'boundary' ? (
-                              <Typography variant="caption" color="text.secondary">
-                                {boundaryChoices(field).filter((choice) => field.boundary?.[choice.id] !== false).length || ''}
-                              </Typography>
-                            ) : (
-                              <FormControlLabel
-                                sx={{ mr: 0 }}
-                                control={(
-                                  <Checkbox
-                                    size="small"
-                                    checked={field.vary}
-                                    disabled={mode !== 'combination' || field.values.length === 0}
-                                    onChange={(event) => updateField(field.name, { vary: event.target.checked })}
-                                  />
-                                )}
-                                label={field.values.length > 1 ? String(field.values.length) : ''}
-                              />
-                            )}
+                            <FormControlLabel
+                              sx={{ mr: 0 }}
+                              control={(
+                                <Checkbox
+                                  size="small"
+                                  checked={resolved.vary}
+                                  disabled={activeMode !== 'combination' || resolved.values.length === 0}
+                                  onChange={(event) => updateField(field.name, { vary: event.target.checked, textVary: event.target.checked })}
+                                />
+                              )}
+                              label={resolved.values.length > 1 ? String(resolved.values.length) : ''}
+                            />
                           </TableCell>
                           <TableCell>
-                            <Stack direction="row" spacing={0.75} useFlexGap sx={{ alignItems: 'center', flexWrap: 'wrap' }}>
-                              <Typography variant="body2" sx={{ fontWeight: 650 }}>{field.name}</Typography>
-                              <ToneChip label={field.location} tone={LOCATION_TONE[field.location]} />
+                            <Stack direction="row" spacing={0.75} useFlexGap sx={{ alignItems: 'center', flexWrap: 'wrap', pl: depth * 1.5 }}>
+                              <Typography variant="body2" sx={{ fontWeight: field.object ? 700 : 650 }}>{leaf}</Typography>
+                              {depth === 0 && <ToneChip label={field.location} tone={LOCATION_TONE[field.location]} />}
                               {field.required && <Chip label="required" size="small" variant="outlined" />}
+                              <ExclusiveMark name={field.name} groups={selected.exclusive} />
                             </Stack>
                           </TableCell>
                           <TableCell sx={{ color: 'text.secondary' }}>
@@ -945,28 +1104,35 @@ export default function App() {
                             </Stack>
                           </TableCell>
                           <TableCell>
-                            {mode === 'boundary' ? (
-                              <BoundaryChoices
-                                field={field}
-                                sample={resolved.sample}
-                                onToggle={(id, checked) => updateField(field.name, { boundary: { ...(field.boundary || {}), [id]: checked } })}
-                              />
-                            ) : mode === 'combination' && field.vary && field.values.length > 0 ? (
+                            {field.object ? (
+                              <ObjectChoice value={objectChoice(resolved.sample)} onChange={(next) => writeObject(field, next)} />
+                            ) : activeMode === 'combination' && field.enum && resolved.vary ? (
                               <Stack direction="row" spacing={0.5} useFlexGap sx={{ flexWrap: 'wrap' }}>
-                                {field.values.map((value) => <Chip key={valueText(value)} label={valueText(value)} size="small" />)}
+                                {resolved.values.map((value, index) => <Chip key={`${valueText(value)}-${index}`} label={loopLabel(value)} size="small" />)}
                               </Stack>
                             ) : (
                               <Box>
-                                <Box sx={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', columnGap: 0.75, alignItems: 'center' }}>
-                                  <SampleEditor field={resolved} onChange={(sample) => writeEndpoint(field, sample)} />
-                                  <Box>
-                                    {source === 'endpoint' && (
-                                      <Button size="small" onClick={() => writeEndpoint(field, '', true)} sx={{ minWidth: 0, px: 0.75, color: 'text.secondary' }}>
-                                        Inherit
-                                      </Button>
+                                <Stack direction="row" spacing={0.75} useFlexGap sx={{ alignItems: 'center', flexWrap: activeMode === 'combination' ? 'nowrap' : 'wrap' }}>
+                                  <Box sx={{ width: activeMode === 'combination' ? 180 : 'auto', flex: activeMode === 'combination' ? '0 0 180px' : '1 1 180px', minWidth: 0 }}>
+                                    {activeMode === 'combination' ? (
+                                      <CombinationDefault field={resolved} onChange={(sample) => writeEndpoint(field, sample)} />
+                                    ) : (
+                                      <SampleEditor field={defaultEditorField(field, resolved)} onChange={(sample) => writeEndpoint(field, sample)} />
                                     )}
                                   </Box>
-                                </Box>
+                                  {source === 'endpoint' && (
+                                    <Button size="small" onClick={() => writeEndpoint(field, '', true)} sx={{ flexShrink: 0, px: 0.75, whiteSpace: 'nowrap', color: 'text.secondary' }}>
+                                      Inherit
+                                    </Button>
+                                  )}
+                                  {activeMode === 'combination' && scalarCombinationField(field) && (
+                                    <CombinationValuesEditor
+                                      field={resolved}
+                                      values={customCases.values?.[selected.id]?.[field.name] || []}
+                                      onChange={(list) => writeCombinationValues(selected.id, field.name, list)}
+                                    />
+                                  )}
+                                </Stack>
                                 {source === 'global' && <Typography variant="caption" color="text.secondary">Global default</Typography>}
                                 {source === 'endpoint' && (
                                   <Typography variant="caption" color="text.secondary">
@@ -984,12 +1150,22 @@ export default function App() {
                 </Box>
                 )}
 
+                {activeMode === 'combination' && selected && (
+                  <CombinationExclusions
+                    key={selected.id}
+                    fields={resolvedFields}
+                    exclusive={selected.exclusive || []}
+                    value={operationExclusions}
+                    onChange={(next) => writeExclusions(selected.id, next)}
+                  />
+                )}
+
                 <Stack spacing={1}>
                   <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ alignItems: { sm: 'center' } }}>
                     <Button
                       variant="contained"
                       startIcon={<PlayArrowIcon />}
-                      disabled={running || planned.length === 0 || planned.length > MAX_CASES}
+                      disabled={running || planned.length === 0}
                       onClick={run}
                     >
                       Run {planned.length} {planned.length === 1 ? 'check' : 'checks'}
@@ -1015,14 +1191,14 @@ export default function App() {
                       sx={{ width: { xs: '100%', sm: 170 } }}
                       slotProps={{ htmlInput: { min: 0.1, step: 1 } }}
                     />
-                    <Typography variant="body2" color={planned.length > MAX_CASES ? 'error' : 'text.secondary'} sx={{ flex: 1 }}>
-                      {planned.length > MAX_CASES
-                        ? `${planned.length} checks exceeds the ${MAX_CASES} limit.`
-                        : planned.length === 0
-                          ? 'This operation has no checks in the selected mode.'
-                          : running
-                            ? `${results.length} of ${planned.length} complete${activity ? ` · ${activity}` : ''}`
-                            : 'List checks follow the spec. Requests stay within this rate.'}
+                    <Typography variant="body2" color="text.secondary" sx={{ flex: 1 }}>
+                      {planned.length === 0 && skippedCombinations > 0
+                          ? 'Every combination is excluded.'
+                          : planned.length === 0
+                            ? 'This operation has no checks in the selected mode.'
+                            : running
+                              ? `${results.length} of ${planned.length} complete${activity ? ` · ${activity}` : ''}`
+                              : `List checks follow the spec. Requests stay within this rate.${skippedCombinations > 0 ? ` ${skippedCombinations} combinations skipped.` : ''}`}
                     </Typography>
                     <PaginationHelp pagination={selected.pagination} />
                   </Stack>
@@ -1057,6 +1233,8 @@ export default function App() {
             open={libraryOpen}
             defaults={defaults}
             oauth={oauth}
+            idpBase={idpBase}
+            onIdpBase={setIdpBase}
             profileName={profileName}
             profileCount={profiles.length}
             notice={libraryNotice}
@@ -1155,7 +1333,7 @@ export default function App() {
                       <TableCell sx={{ color: 'text.secondary' }}>{result.detail}</TableCell>
                       {showRequest && (
                         <TableCell>
-                          {result.request && <PayloadText text={result.request} open={openResult === result.index} />}
+                          {openResult === result.index && result.request && <PayloadText text={result.request} open />}
                         </TableCell>
                       )}
                       <TableCell>
@@ -1349,7 +1527,7 @@ function ResponseSchema({ responses, requestNames, expected, onExpected, onAddSt
           ) : (
             <Box sx={{ maxHeight: 280, overflow: 'auto' }}>
               <Typography variant="caption" color="text.secondary" sx={{ display: 'block', px: 1.5, py: 0.75, borderBottom: 1, borderColor: 'divider' }}>
-                {'@{name}'} is the value sent for that request field. A success field with the same name starts as that reference. Clear a value to skip it. {'${name}'} still reads a variable. For an array of objects, enter a JSON array. Each object must appear, and only the fields you include are compared. In sequence requires those objects to be the first items, in the order you wrote.
+                {'@{name}'} is the value sent for that request field. Text is compared after leading and trailing spaces are removed, and a value that is only spaces is null. A success field with the same name starts as that reference. Clear a value to skip it. {'${name}'} still reads a variable. For an array of objects, enter a JSON array. Each object must appear, and only the fields you include are compared. In sequence requires those objects to be the first items, in the order you wrote.
               </Typography>
               <Table size="small">
                 <TableHead>
@@ -1364,7 +1542,9 @@ function ResponseSchema({ responses, requestNames, expected, onExpected, onAddSt
                 <TableBody>
                   {current.fields.map((field) => {
                     const objectArray = isArrayOfObjects(field)
-                    const scalar = field.type !== 'object' && !String(field.type).startsWith('array')
+                    const parent = field.type === 'object' || String(field.type).startsWith('array')
+                    const scalar = !parent
+                    const depth = field.name.split('.').length - 1
                     const automatic = defaultResponseExpected(field, requestNames, current.status)
                     const stored = expected?.[current.status]
                     const hasOverride = stored && Object.prototype.hasOwnProperty.call(stored, field.name)
@@ -1374,7 +1554,15 @@ function ResponseSchema({ responses, requestNames, expected, onExpected, onAddSt
                     const objectArrayError = objectArray ? parseObjectArray(shown)?.error : ''
                     return (
                       <TableRow key={field.name} hover>
-                        <TableCell sx={{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12.5 }}>{field.name}</TableCell>
+                        <TableCell>
+                          <Typography
+                            variant="body2"
+                            title={field.name}
+                            sx={{ fontWeight: parent ? 700 : 500, pl: depth * 1.5 }}
+                          >
+                            {field.name.split('.').pop()}
+                          </Typography>
+                        </TableCell>
                         <TableCell sx={{ color: 'text.secondary', whiteSpace: 'nowrap' }}>
                           <Stack spacing={0.25} sx={{ alignItems: 'flex-start' }}>
                             <span>{field.type}</span>
@@ -1439,7 +1627,7 @@ function ResponseSchema({ responses, requestNames, expected, onExpected, onAddSt
   )
 }
 
-function CustomCases({ operation, fields, defaults, cases, onChange, onExport, onImport }) {
+function CustomCases({ operation, fields, defaults, exclusive = [], cases, onChange, onExport, onImport }) {
   const [activeId, setActiveId] = useState(cases[0]?.id || '')
   const active = cases.find((item) => item.id === activeId) || cases[0] || null
 
@@ -1534,18 +1722,27 @@ function CustomCases({ operation, fields, defaults, cases, onChange, onExport, o
                   </TableHead>
                   <TableBody>
                     {fields.map((field) => {
+                      if (customAncestorClosed(field.name, fields, active, defaults, operation)) return null
                       const omitted = (active.omit || []).includes(field.name)
                       const hasValue = Object.prototype.hasOwnProperty.call(active.request || {}, field.name)
                       const inherited = effectiveSample(field, operation.id, defaults)
+                      const depth = field.name.split('.').length - 1
                       return (
                         <TableRow key={`${field.location}-${field.name}`}>
                           <TableCell>
-                            <Stack direction="row" spacing={0.75} sx={{ alignItems: 'center' }}>
-                              <Typography variant="body2">{field.name}</Typography>
-                              <ToneChip label={field.location} tone={LOCATION_TONE[field.location]} />
+                            <Stack direction="row" spacing={0.75} sx={{ alignItems: 'center', pl: depth * 1.5 }}>
+                              <Typography variant="body2" sx={{ fontWeight: field.object ? 700 : 500 }}>{field.name.split('.').pop()}</Typography>
+                              {depth === 0 && <ToneChip label={field.location} tone={LOCATION_TONE[field.location]} />}
+                              <ExclusiveMark name={field.name} groups={exclusive} />
                             </Stack>
                           </TableCell>
                           <TableCell sx={{ minWidth: 180 }}>
+                            {field.object ? (
+                              <ObjectChoice
+                                value={objectChoice(hasValue ? active.request[field.name] : inherited)}
+                                onChange={(mode) => updateRequest(field.name, mode === 'null' ? OBJECT_NULL : mode === 'empty' ? OBJECT_EMPTY : OBJECT_FIELDS, field)}
+                              />
+                            ) : (
                             <TextField
                               size="small"
                               fullWidth
@@ -1554,6 +1751,7 @@ function CustomCases({ operation, fields, defaults, cases, onChange, onExport, o
                               value={hasValue ? String(active.request[field.name]) : ''}
                               onChange={(event) => updateRequest(field.name, event.target.value, field)}
                             />
+                            )}
                           </TableCell>
                           <TableCell>
                             <Checkbox size="small" checked={omitted} onChange={() => toggleOmit(field.name)} />
@@ -1579,6 +1777,8 @@ function LibraryDialog({
   open,
   defaults,
   oauth,
+  idpBase,
+  onIdpBase,
   profileName,
   profileCount,
   notice,
@@ -1609,10 +1809,10 @@ function LibraryDialog({
       maxWidth="lg"
       slotProps={{ paper: { sx: { height: 'min(820px, calc(100% - 48px))' } } }}
     >
-      <DialogTitle sx={{ pb: 0.5 }}>Library</DialogTitle>
+      <DialogTitle sx={{ pb: 0.5 }}>Setting</DialogTitle>
       <DialogContent sx={{ minHeight: 0, minWidth: 0 }}>
         <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
-          Each client has its own variables, defaults, custom cases, signing key, and internal CA. Switch clients from the menu in the top bar. Write ${'{'}name{'}'} for a variable. Date, timestamp, and UUID values are filled when the request is sent: ${'{'}today+1d{'}'}, ${'{'}now-2h{'}'}, ${'{'}uuid:12{'}'}.
+          Each client has its own variables, defaults, custom cases, and signing key. Switch clients from the menu in the top bar. Write ${'{'}name{'}'} for a variable. Date, timestamp, and UUID values are filled when the request is sent: ${'{'}today+1d{'}'}, ${'{'}now-2h{'}'}, ${'{'}uuid:12{'}'}.
         </Typography>
         <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ mb: 2, alignItems: { sm: 'center' } }}>
           <TextField
@@ -1657,28 +1857,42 @@ function LibraryDialog({
           onValue={(name, value) => onWriteNamed('headers', name, value)}
           onRemove={(name) => onRemoveNamed('headers', name)}
         />
-        <Typography variant="subtitle2" sx={{ mt: 2, mb: 0.5 }}>Internal CA certificate</Typography>
-        <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
-          Paste the PEM for an internal certificate authority. HTTPS calls for this client, including the token request and an HTTPS OpenAPI URL, are made by the tester and trust this CA together with the public roots. Leave it blank to use the browser.
-        </Typography>
-        <TextField
-          label="Internal CA (PEM)"
-          value={oauth.caCert || ''}
-          placeholder={'-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----'}
-          onChange={(event) => onOauth({ caCert: event.target.value })}
-          fullWidth
-          multiline
-          minRows={4}
-          sx={{ '& textarea': { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12 } }}
-        />
         <Typography variant="subtitle2" sx={{ mt: 2, mb: 0.5 }}>Access token</Typography>
         <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
-          Before every HTTP request, the tester signs a client assertion with this key and requests an access token, then sends it as Authorization: Bearer. Leave these blank to call the API without a token. The token server must allow this page’s origin. A new client is written to data/clients.yaml immediately, and later edits follow. Export downloads that same file, including the key.
+          Before every HTTP request, the tester signs a client assertion with this key and requests an access token through /idp, then sends it as Authorization: Bearer. Token calls use /idp on this page and are forwarded to the OAuth base URL. The token path is the path on that server. Audience is the base URL plus that path. HTTPS certificate checks are skipped. Leave the token path blank to call the API without a token.
         </Typography>
+        <TextField
+          label="OAuth base URL"
+          value={idpBase}
+          placeholder="https://idp.example"
+          onChange={(event) => {
+            const next = event.target.value
+            onIdpBase(next)
+            onOauth({ audience: derivedAudience(oauth.tokenUrl, next) })
+          }}
+          fullWidth
+          sx={{ mb: 1.25 }}
+        />
         <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: '1fr 1fr' }, gap: 1.25 }}>
-          <TextField label="Token URL" value={oauth.tokenUrl} onChange={(event) => onOauth({ tokenUrl: event.target.value })} fullWidth />
+          <TextField
+            label="Token path"
+            placeholder="/oauth/token"
+            value={relativeTokenPath(oauth.tokenUrl)}
+            onChange={(event) => {
+              const tokenUrl = relativeTokenPath(event.target.value)
+              onOauth({ tokenUrl, audience: derivedAudience(tokenUrl, idpBase) })
+            }}
+            fullWidth
+          />
           <TextField label="Client ID" value={oauth.clientId} onChange={(event) => onOauth({ clientId: event.target.value })} fullWidth />
-          <TextField label="Audience" placeholder="Defaults to the token URL" value={oauth.audience} onChange={(event) => onOauth({ audience: event.target.value })} fullWidth />
+          <TextField
+            label="Audience"
+            placeholder="OAuth base URL + token path"
+            value={oauth.audience || derivedAudience(oauth.tokenUrl, idpBase)}
+            onChange={(event) => onOauth({ audience: event.target.value })}
+            helperText="OAuth base URL + token path"
+            fullWidth
+          />
           <TextField select label="Algorithm" value={oauth.algorithm} onChange={(event) => onOauth({ algorithm: event.target.value })}>
             <MenuItem value="RS256">RS256</MenuItem>
             <MenuItem value="ES256">ES256</MenuItem>
@@ -1755,7 +1969,7 @@ function DefaultsDialog({ open, operation, fields, defaults, onClose, onGlobal, 
       <DialogTitle sx={{ pb: 0.5 }}>Field defaults</DialogTitle>
       <DialogContent sx={{ display: 'flex', flexDirection: 'column', minHeight: 0, overflow: 'hidden' }}>
         <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5, flexShrink: 0 }}>
-          A global value is used wherever that field name appears. A value for this endpoint replaces it. Every variable and every global default is listed under Library. Write ${'{'}name{'}'} to use a variable, ${'{'}today+1d{'}'} or ${'{'}now-2h{'}'} for a moving date or timestamp, and ${'{'}uuid:12{'}'} for a random id.
+          A global value is used wherever that field name appears. A value for this endpoint replaces it. Every variable and every global default is listed under Setting. Write ${'{'}name{'}'} to use a variable, ${'{'}today+1d{'}'} or ${'{'}now-2h{'}'} for a moving date or timestamp, and ${'{'}uuid:12{'}'} for a random id.
         </Typography>
         {operation ? (
           <Box sx={{ border: 1, borderColor: 'divider', borderRadius: 1, overflow: 'auto', flex: 1, minHeight: 0 }}>
@@ -1777,11 +1991,32 @@ function DefaultsDialog({ open, operation, fields, defaults, onClose, onGlobal, 
                     '&:last-of-type': { borderBottom: 0 },
                   }}
                 >
-                  <Stack direction="row" spacing={0.75} useFlexGap sx={{ alignItems: 'center', flexWrap: 'wrap' }}>
-                    <Typography variant="body2" sx={{ fontWeight: 650 }}>{field.name}</Typography>
-                    <ToneChip label={field.location} tone={LOCATION_TONE[field.location]} />
+                  <Stack direction="row" spacing={0.75} useFlexGap sx={{ alignItems: 'center', flexWrap: 'wrap', pl: (field.name.split('.').length - 1) * 1.5 }}>
+                    <Typography variant="body2" sx={{ fontWeight: field.object ? 700 : 650 }}>{field.name.split('.').pop()}</Typography>
+                    {field.name.split('.').length === 1 && <ToneChip label={field.location} tone={LOCATION_TONE[field.location]} />}
                   </Stack>
                   <Stack spacing={0.75}>
+                    {field.object ? (
+                      <>
+                        <LabeledValue label="Global">
+                          <ObjectChoice
+                            value={objectChoice(hasGlobal ? defaults.global[field.name] : '')}
+                            onChange={(mode) => onGlobal(field, mode === 'fields' ? '' : mode === 'null' ? OBJECT_NULL : OBJECT_EMPTY)}
+                          />
+                        </LabeledValue>
+                        <LabeledValue label="Endpoint">
+                          <ObjectChoice
+                            value={objectChoice(hasEndpoint ? endpoint[field.name] : '')}
+                            onChange={(mode) => {
+                              const inherit = mode === 'fields' && objectChoice(hasGlobal ? defaults.global[field.name] : '') === 'fields'
+                              const raw = mode === 'null' ? OBJECT_NULL : mode === 'empty' ? OBJECT_EMPTY : OBJECT_FIELDS
+                              onEndpoint(field, inherit ? '' : raw, inherit)
+                            }}
+                          />
+                        </LabeledValue>
+                      </>
+                    ) : (
+                    <>
                     <LabeledValue label="Global">
                       <TypedValue
                         value={hasGlobal ? defaults.global[field.name] : ''}
@@ -1804,6 +2039,8 @@ function DefaultsDialog({ open, operation, fields, defaults, onClose, onGlobal, 
                         }}
                       />
                     </LabeledValue>
+                    </>
+                    )}
                   </Stack>
                 </Box>
               )
@@ -1928,6 +2165,241 @@ function downloadText(filename, text, type) {
   URL.revokeObjectURL(url)
 }
 
+function CombinationExclusions({ fields, exclusive, value, onChange }) {
+  const rules = value || { fieldsets: [], distinct: [] }
+  const choices = fields.filter((field) => !field.object)
+  const [editingId, setEditingId] = useState('')
+  function update(next) {
+    onChange({ fieldsets: next.fieldsets || [], distinct: next.distinct || [] })
+  }
+  function addFieldset() {
+    const rule = newFieldset(choices)
+    setEditingId(rule.id)
+    update({ ...rules, fieldsets: [...rules.fieldsets, rule] })
+  }
+  function addDistinct() {
+    const rule = newDistinct(choices)
+    setEditingId(rule.id)
+    update({ ...rules, distinct: [...rules.distinct, rule] })
+  }
+  return (
+    <Stack spacing={0.75} sx={{ border: 1, borderColor: 'divider', borderRadius: 1, px: 1.25, py: 1 }}>
+      <Typography variant="subtitle2">Skip combinations</Typography>
+      {exclusive.map((group) => (
+        <RuleSummary key={group.join('|')} text={exclusiveText(group)} />
+      ))}
+      {rules.fieldsets.map((rule) => (editingId === rule.id ? (
+        <FieldsetEditor
+          key={rule.id}
+          rule={rule}
+          choices={choices}
+          onChange={(next) => update({ ...rules, fieldsets: rules.fieldsets.map((item) => item.id === rule.id ? next : item) })}
+          onDone={() => setEditingId('')}
+          onRemove={() => update({ ...rules, fieldsets: rules.fieldsets.filter((item) => item.id !== rule.id) })}
+        />
+      ) : (
+        <RuleSummary
+          key={rule.id}
+          text={fieldsetText(rule)}
+          onEdit={() => setEditingId(rule.id)}
+          onRemove={() => update({ ...rules, fieldsets: rules.fieldsets.filter((item) => item.id !== rule.id) })}
+        />
+      )))}
+      {rules.distinct.map((rule) => (editingId === rule.id ? (
+        <Stack key={rule.id} direction="row" spacing={0.75} useFlexGap sx={{ alignItems: 'center', flexWrap: 'wrap' }}>
+          <TextField
+            select
+            size="small"
+            label="Field"
+            value={rule.fields[0] || ''}
+            onChange={(event) => update({ ...rules, distinct: rules.distinct.map((item) => item.id === rule.id ? { ...item, fields: [event.target.value, item.fields[1]] } : item) })}
+            sx={{ width: 180 }}
+          >
+            {choices.map((field) => <MenuItem key={field.name} value={field.name}>{field.name}</MenuItem>)}
+          </TextField>
+          <Typography variant="body2" color="text.secondary">must differ from</Typography>
+          <TextField
+            select
+            size="small"
+            label="Field"
+            value={rule.fields[1] || ''}
+            onChange={(event) => update({ ...rules, distinct: rules.distinct.map((item) => item.id === rule.id ? { ...item, fields: [item.fields[0], event.target.value] } : item) })}
+            sx={{ width: 180 }}
+          >
+            {choices.map((field) => <MenuItem key={field.name} value={field.name}>{field.name}</MenuItem>)}
+          </TextField>
+          <Button size="small" onClick={() => setEditingId('')}>Done</Button>
+          <Button size="small" color="inherit" onClick={() => update({ ...rules, distinct: rules.distinct.filter((item) => item.id !== rule.id) })}>Remove</Button>
+        </Stack>
+      ) : (
+        <RuleSummary
+          key={rule.id}
+          text={distinctText(rule)}
+          onEdit={() => setEditingId(rule.id)}
+          onRemove={() => update({ ...rules, distinct: rules.distinct.filter((item) => item.id !== rule.id) })}
+        />
+      )))}
+      <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: 'wrap' }}>
+        <Button size="small" variant="outlined" color="inherit" disabled={choices.length === 0} onClick={addFieldset}>
+          Add field values
+        </Button>
+        <Button size="small" variant="outlined" color="inherit" disabled={choices.length < 2} onClick={addDistinct}>
+          Add fields that must differ
+        </Button>
+      </Stack>
+    </Stack>
+  )
+}
+
+function RuleSummary({ text, onEdit, onRemove }) {
+  return (
+    <Stack direction="row" spacing={0.5} sx={{ alignItems: 'center', minWidth: 0 }}>
+      <Chip size="small" variant="outlined" label={text} sx={{ height: 'auto', py: 0.25, '& .MuiChip-label': { whiteSpace: 'normal' } }} />
+      {onEdit && (
+        <IconButton size="small" aria-label={`Edit ${text}`} onClick={onEdit} sx={{ color: 'text.secondary' }}>
+          <EditOutlinedIcon fontSize="inherit" />
+        </IconButton>
+      )}
+      {onRemove && (
+        <IconButton size="small" aria-label={`Remove ${text}`} onClick={onRemove} sx={{ color: 'text.secondary' }}>
+          <CloseIcon fontSize="inherit" />
+        </IconButton>
+      )}
+    </Stack>
+  )
+}
+
+function ExclusiveMark({ name, groups }) {
+  const peers = exclusivePeers(name, groups)
+  if (peers.length === 0) return null
+  const title = `Cannot be set together with ${peers.join(', ')}`
+  return <Chip size="small" variant="outlined" label="exclusive" title={title} sx={{ height: 20, fontSize: 11 }} />
+}
+
+function exclusivePeers(name, groups) {
+  const peers = []
+  for (const group of groups || []) {
+    if (!group.includes(name)) continue
+    for (const item of group) {
+      if (item !== name && !peers.includes(item)) peers.push(item)
+    }
+  }
+  return peers
+}
+
+function exclusiveText(group) {
+  return `${group.join(' and ')} cannot both be set`
+}
+
+function FieldsetEditor({ rule, choices, onChange, onDone, onRemove }) {
+  return (
+    <Stack spacing={0.75} sx={{ border: 1, borderColor: 'divider', borderRadius: 1, p: 1 }}>
+      <Stack direction="row" spacing={1} sx={{ alignItems: 'center' }}>
+        <Typography variant="body2" sx={{ flex: 1 }}>Skip when these values all match</Typography>
+        <Button size="small" onClick={onDone}>Done</Button>
+        <Button size="small" color="inherit" onClick={onRemove}>Remove</Button>
+      </Stack>
+      {Object.entries(rule.values).map(([name, raw]) => (
+        <Stack key={name} direction="row" spacing={0.75} useFlexGap sx={{ alignItems: 'center', flexWrap: 'wrap' }}>
+          <TextField
+            select
+            size="small"
+            label="Field"
+            value={name}
+            onChange={(event) => onChange(retargetFieldset(rule, name, event.target.value, choices))}
+            sx={{ width: 180 }}
+          >
+            {choices.map((field) => <MenuItem key={field.name} value={field.name}>{field.name}</MenuItem>)}
+          </TextField>
+          <ExclusionValue
+            field={choices.find((field) => field.name === name)}
+            value={raw}
+            onChange={(next) => onChange({ ...rule, values: { ...rule.values, [name]: next } })}
+          />
+          <IconButton size="small" aria-label={`Remove ${name}`} onClick={() => onChange(dropFieldsetValue(rule, name))} sx={{ color: 'text.secondary' }}>
+            <CloseIcon fontSize="small" />
+          </IconButton>
+        </Stack>
+      ))}
+      <Button
+        size="small"
+        disabled={choices.every((field) => Object.prototype.hasOwnProperty.call(rule.values, field.name))}
+        onClick={() => onChange(addFieldsetValue(rule, choices))}
+        sx={{ alignSelf: 'flex-start' }}
+      >
+        Add field
+      </Button>
+    </Stack>
+  )
+}
+
+function fieldsetText(rule) {
+  const pairs = Object.entries(rule.values).map(([name, raw]) => `${name} = ${raw === '' ? 'blank' : raw}`)
+  return pairs.length ? pairs.join(' and ') : 'Skip when no fields are set'
+}
+
+function distinctText(rule) {
+  const [left, right] = rule.fields
+  return `${left || 'field'} ≠ ${right || 'field'}`
+}
+
+function ExclusionValue({ field, value, onChange }) {
+  const options = [...new Set((field?.values || []).map((item) => valueText(item)))]
+  if (options.length === 0) {
+    return <TextField size="small" label="Value" value={value} onChange={(event) => onChange(event.target.value)} sx={{ width: 160 }} />
+  }
+  const current = options.includes(value) ? value : value
+  return (
+    <TextField select size="small" label="Value" value={current} onChange={(event) => onChange(event.target.value)} sx={{ width: 160 }}>
+      {(options.includes(current) ? options : [current, ...options]).map((option) => (
+        <MenuItem key={option} value={option}>{option}</MenuItem>
+      ))}
+    </TextField>
+  )
+}
+
+function newFieldset(choices) {
+  const field = choices[0]
+  return { id: ruleId(), values: field ? { [field.name]: '' } : {} }
+}
+
+function addFieldsetValue(rule, choices) {
+  const field = choices.find((item) => !Object.prototype.hasOwnProperty.call(rule.values, item.name))
+  if (!field) return rule
+  return { ...rule, values: { ...rule.values, [field.name]: '' } }
+}
+
+function dropFieldsetValue(rule, name) {
+  const values = { ...rule.values }
+  delete values[name]
+  return { ...rule, values }
+}
+
+function retargetFieldset(rule, from, to, choices) {
+  if (from === to || Object.prototype.hasOwnProperty.call(rule.values, to)) return rule
+  const values = {}
+  for (const [name, raw] of Object.entries(rule.values)) {
+    if (name === from) values[to] = fieldValueText(choices.find((field) => field.name === to), raw)
+    else values[name] = raw
+  }
+  return { ...rule, values }
+}
+
+function newDistinct(choices) {
+  return { id: ruleId(), fields: [choices[0]?.name || '', choices[1]?.name || ''] }
+}
+
+function fieldValueText(field, fallback = '') {
+  if (!field) return fallback
+  if (field.values?.length) return valueText(field.values[0])
+  if (field.sample !== undefined && field.sample !== '') return valueText(field.sample)
+  return ''
+}
+
+function ruleId() {
+  return globalThis.crypto?.randomUUID?.() || `rule-${Date.now()}-${Math.random().toString(16).slice(2)}`
+}
+
 function downloadJson(filename, data) {
   downloadText(filename, `${JSON.stringify(data, null, 2)}\n`, 'application/json')
 }
@@ -1940,12 +2412,27 @@ function statusTone(code) {
 }
 
 function ResponsePreview({ result, open }) {
+  const summary = responseSummary(result)
+  return (
+    <Stack spacing={0.5} sx={{ alignItems: 'flex-start' }}>
+      <Stack direction="row" spacing={0.75} sx={{ alignItems: 'center', minWidth: 0 }}>
+        {summary ? (
+          <Typography variant="body2" color="text.secondary" sx={{ minWidth: 0 }}>{summary}</Typography>
+        ) : result.text ? (
+          <Typography variant="caption" color="text.secondary">JSON</Typography>
+        ) : null}
+        {hasRecordList(result) && <RecordsTableButton result={result} />}
+      </Stack>
+      {open && <ResponseBody result={result} />}
+    </Stack>
+  )
+}
+
+function ResponseBody({ result }) {
   if (result.pages && result.pages.length > 1) {
-    const headline = String(result.text || '').split('\n')[0]
     return (
       <Stack spacing={0.75}>
-        <Typography variant="body2" color="text.secondary">{headline}</Typography>
-        {open && result.pages.map((page) => (
+        {result.pages.map((page) => (
           <Box key={`${page.label}-${page.status}`} sx={{ border: 1, borderColor: 'divider', borderRadius: 1, overflow: 'hidden' }}>
             <Typography variant="caption" sx={{ display: 'block', px: 1.25, py: 0.4, bgcolor: '#f8fafc', color: 'text.secondary', fontWeight: 700 }}>
               {page.label} · HTTP {page.status} · {page.count} records
@@ -1956,7 +2443,150 @@ function ResponsePreview({ result, open }) {
       </Stack>
     )
   }
-  return <PayloadText text={result.text} open={open} />
+  return <PayloadText text={result.text} open />
+}
+
+function responseSummary(result) {
+  if (result.pages?.length > 1) return String(result.text || '').split('\n')[0]
+  const count = Array.isArray(result.records) ? result.records.length : 0
+  if (count > 0) return `${count} ${count === 1 ? 'record' : 'records'}`
+  return ''
+}
+
+function hasRecordList(result) {
+  if (Array.isArray(result?.records) && result.records.length > 0) return true
+  return Array.isArray(result?.pages) && result.pages.some((page) => page.count > 0)
+}
+
+function RecordsTableButton({ result }) {
+  const [open, setOpen] = useState(false)
+  return (
+    <>
+      <Button
+        size="small"
+        variant="outlined"
+        onClick={(event) => {
+          event.stopPropagation()
+          setOpen(true)
+        }}
+        sx={{ minWidth: 0, px: 0.75, py: 0, fontSize: 11, lineHeight: 1.7, textTransform: 'none', flexShrink: 0 }}
+      >
+        Table
+      </Button>
+      {open && (
+        <Dialog open onClose={() => setOpen(false)} maxWidth="xl" fullWidth>
+          <RecordsDialog result={result} onClose={() => setOpen(false)} />
+        </Dialog>
+      )}
+    </>
+  )
+}
+
+function RecordsDialog({ result, onClose }) {
+  const records = useMemo(() => collectRecords(result) || [], [result])
+  const columns = useMemo(() => recordColumns(records), [records])
+  const pages = [...new Set(records.map((record) => record.page).filter(Boolean))]
+  const showPage = pages.length > 1
+  return (
+    <>
+      <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+        <Box sx={{ flex: 1 }}>{records.length} records</Box>
+        <Button onClick={onClose}>Close</Button>
+      </DialogTitle>
+      <DialogContent dividers sx={{ p: 0 }}>
+        <Box sx={{ overflow: 'auto', maxHeight: '70vh' }}>
+          <Table size="small" stickyHeader>
+            <TableHead>
+              <TableRow>
+                {showPage && <TableCell>Page</TableCell>}
+                {columns.map((column) => (
+                  <TableCell key={column} sx={{ whiteSpace: 'nowrap', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12 }}>
+                    {column}
+                  </TableCell>
+                ))}
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {records.map((record, index) => {
+                const flat = flattenRecord(record.value)
+                return (
+                  <TableRow key={`${record.page}-${index}`} hover>
+                    {showPage && <TableCell sx={{ whiteSpace: 'nowrap', color: 'text.secondary' }}>{record.page}</TableCell>}
+                    {columns.map((column) => (
+                      <TableCell key={column} sx={{ whiteSpace: 'nowrap', fontSize: 12.5 }}>{cellText(flat[column])}</TableCell>
+                    ))}
+                  </TableRow>
+                )
+              })}
+            </TableBody>
+          </Table>
+        </Box>
+      </DialogContent>
+    </>
+  )
+}
+
+const LIST_KEYS = ['content', 'items', 'data', 'results', 'records']
+
+function collectRecords(result) {
+  if (Array.isArray(result?.records) && result.records.length) return result.records
+  const pages = Array.isArray(result?.pages) && result.pages.length ? result.pages : [{ label: '', text: result?.text }]
+  const records = []
+  for (const page of pages) {
+    const items = listItems(parseJson(page?.text))
+    if (!items) continue
+    for (const value of items) {
+      if (value && typeof value === 'object' && !Array.isArray(value)) records.push({ page: page.label || '', value })
+    }
+  }
+  return records.length ? records : null
+}
+
+function listItems(body) {
+  if (Array.isArray(body)) return body
+  if (!body || typeof body !== 'object') return null
+  for (const key of LIST_KEYS) {
+    if (Array.isArray(body[key])) return body[key]
+  }
+  return null
+}
+
+function recordColumns(records) {
+  const columns = []
+  const seen = new Set()
+  for (const record of records) {
+    for (const key of Object.keys(flattenRecord(record.value))) {
+      if (seen.has(key)) continue
+      seen.add(key)
+      columns.push(key)
+    }
+  }
+  return columns
+}
+
+function flattenRecord(value, prefix = '', into = {}) {
+  if (Array.isArray(value) || value == null || typeof value !== 'object') {
+    into[prefix || 'value'] = value
+    return into
+  }
+  const keys = Object.keys(value)
+  if (keys.length === 0) {
+    into[prefix || 'value'] = value
+    return into
+  }
+  for (const key of keys) {
+    const path = prefix ? `${prefix}.${key}` : key
+    const child = value[key]
+    if (child && typeof child === 'object' && !Array.isArray(child)) flattenRecord(child, path, into)
+    else into[path] = child
+  }
+  return into
+}
+
+function cellText(value) {
+  if (value == null) return ''
+  if (typeof value === 'object') return JSON.stringify(value)
+  return String(value)
 }
 
 function PayloadText({ text, open }) {
@@ -2035,7 +2665,7 @@ function PaginationHelp({ pagination }) {
 const PAGINATION_RULES = [
   {
     title: 'Cursor',
-    detail: 'Parameters named cursor, nextCursor, pageToken, nextPageToken, continuationToken, after, or startingAfter. The next request sends the cursor returned in the response until that value is empty.',
+    detail: 'The request uses size and a cursor such as nextCursor. The response returns that cursor again, plus size or totalSize. The next request sends the same size and the returned cursor until the cursor is empty, the page is shorter than size, or the fetched count reaches totalSize.',
   },
   {
     title: 'Page',
@@ -2056,7 +2686,9 @@ function paginationSummary(pagination) {
     return 'This operation has no recognized pagination parameter, so each check sends one request.'
   }
   if (pagination.style === 'cursor') {
-    return `This operation is treated as cursor pagination via ${pagination.request.cursor}.`
+    const size = pagination.request.size ? ` and ${pagination.request.size}` : ''
+    const total = pagination.response.total ? `, until ${pagination.response.total} is reached` : ''
+    return `This operation is treated as cursor pagination via ${pagination.request.cursor}${size}${total}.`
   }
   if (pagination.style === 'offset') {
     return `This operation is treated as offset pagination via ${pagination.request.offset}${pagination.request.size ? ` and ${pagination.request.size}` : ''}.`
@@ -2068,34 +2700,67 @@ function paginationSummary(pagination) {
   return `This operation is treated as page pagination${names ? ` via ${names}` : ''}.`
 }
 
+function defaultEditorField(field, resolved) {
+  if (textCombinationField(field)) return { ...resolved, values: [] }
+  if (!resolved.enum) return resolved
+  return { ...resolved, values: (resolved.values || []).filter((value) => value != null && !isOmitted(value)) }
+}
+
 function fieldTypeLabel(field) {
   if (field.enum) return 'enum'
   if (field.format) return `${field.type} / ${field.format}`
   return field.type
 }
 
-function BoundaryChoices({ field, sample, onToggle }) {
-  const choices = boundaryChoices(field)
-  if (choices.length === 0) {
-    const shown = sample === '' || sample == null ? 'empty' : valueText(sample)
-    return <Typography variant="caption" color="text.secondary">Default {shown}</Typography>
+function CompactDefault({ field, onChange }) {
+  if (field.type === 'boolean' || (field.values.length > 0 && field.type !== 'number' && field.type !== 'integer')) {
+    const options = (field.values.length > 0 ? field.values : [false, true]).filter((option) => option != null && typeof option !== 'symbol')
+    return (
+      <TextField select size="small" fullWidth value={String(field.sample ?? '')} onChange={(event) => onChange(parseOption(event.target.value, options))}>
+        {options.map((option) => (
+          <MenuItem key={String(option)} value={String(option)}>{String(option)}</MenuItem>
+        ))}
+      </TextField>
+    )
   }
   return (
-    <Stack direction="row" spacing={0.25} useFlexGap sx={{ flexWrap: 'wrap', alignItems: 'center' }}>
-      {choices.map((choice) => (
-        <FormControlLabel
-          key={choice.id}
-          sx={{ mr: 0.75 }}
-          control={(
-            <Checkbox
-              size="small"
-              checked={field.boundary?.[choice.id] !== false}
-              onChange={(event) => onToggle(choice.id, event.target.checked)}
-            />
-          )}
-          label={<Typography variant="caption">{choice.label}</Typography>}
-        />
-      ))}
+    <TextField
+      size="small"
+      fullWidth
+      placeholder={temporalPlaceholder(field.format) || 'Default'}
+      value={field.sample ?? ''}
+      onChange={(event) => onChange(coerceSample(field, event.target.value))}
+      slotProps={{ htmlInput: { 'aria-label': 'Default' } }}
+    />
+  )
+}
+
+function IndividualChoices({ field, onToggle }) {
+  const choices = individualChoices(field)
+  if (choices.length === 0) {
+    return <Typography variant="caption" color="text.secondary">Default only</Typography>
+  }
+  return (
+    <Stack direction="row" spacing={0.5} useFlexGap sx={{ flexWrap: 'wrap', alignItems: 'center' }}>
+      {choices.map((choice) => {
+        const on = individualIncluded(field, choice)
+        return (
+          <Chip
+            key={choice.id}
+            size="small"
+            label={choice.label}
+            variant="outlined"
+            onClick={() => onToggle(choice.id, !on)}
+            sx={{
+              height: 22,
+              borderColor: on ? 'primary.main' : 'divider',
+              bgcolor: on ? 'rgba(15, 39, 68, 0.06)' : 'transparent',
+              color: on ? 'primary.main' : 'text.secondary',
+              '& .MuiChip-label': { px: 0.75, fontSize: 12, fontWeight: on ? 650 : 500 },
+            }}
+          />
+        )
+      })}
     </Stack>
   )
 }
@@ -2108,8 +2773,132 @@ function constraintLabels(field) {
   if (constraints.minLength) labels.push(`minLen ${constraints.minLength}`)
   if (constraints.maxLength) labels.push(`maxLen ${constraints.maxLength}`)
   if (constraints.pattern) labels.push(constraints.pattern)
-  if (field.values.length > 0 && field.type !== 'boolean') labels.push(`${field.values.length} values`)
+  if (field.enum) {
+    const count = (field.values || []).filter((value) => value != null && !isOmitted(value)).length
+    if (count > 0) labels.push(`${count} values`)
+  }
   return labels
+}
+
+function loopLabel(value) {
+  if (isOmitted(value)) return 'Omit'
+  if (value == null) return 'Null'
+  return valueText(value)
+}
+
+function enumMemberOptions(field) {
+  const source = Array.isArray(field.members) && field.members.length > 0
+    ? field.members
+    : (field.values || []).filter((value) => !isOmitted(value))
+  const options = []
+  let sawNull = false
+  for (const value of source) {
+    if (value == null) {
+      if (sawNull) continue
+      sawNull = true
+      options.push(null)
+      continue
+    }
+    if (!options.some((item) => item === value)) options.push(value)
+  }
+  return options
+}
+
+function CombinationDefault({ field, onChange }) {
+  if (field.enum) {
+    const options = enumMemberOptions(field)
+    const current = options.some((option) => option == null ? field.sample == null : option === field.sample) ? field.sample : ''
+    const selected = current == null ? '@null' : String(current)
+    return (
+      <TextField
+        select
+        size="small"
+        fullWidth
+        value={selected}
+        onChange={(event) => {
+          const raw = event.target.value
+          onChange(raw === '@null' ? null : parseOption(raw, options.filter((option) => option != null)))
+        }}
+        slotProps={{ select: { 'aria-label': 'Default' } }}
+      >
+        {selected === '' && <MenuItem value="">None</MenuItem>}
+        {options.map((option) => {
+          const value = option == null ? '@null' : String(option)
+          return <MenuItem key={value} value={value}>{loopLabel(option)}</MenuItem>
+        })}
+      </TextField>
+    )
+  }
+  if (field.type === 'boolean') {
+    const options = (field.values?.length > 0 ? field.values : [false, true]).filter((option) => option != null && typeof option !== 'symbol')
+    return (
+      <TextField select size="small" fullWidth value={String(field.sample)} onChange={(event) => onChange(parseOption(event.target.value, options))} slotProps={{ select: { 'aria-label': 'Default' } }}>
+        {options.map((option) => (
+          <MenuItem key={String(option)} value={String(option)}>{String(option)}</MenuItem>
+        ))}
+      </TextField>
+    )
+  }
+  return (
+    <TextField
+      size="small"
+      fullWidth
+      placeholder={temporalPlaceholder(field.format) || 'Default'}
+      value={field.sample ?? ''}
+      onChange={(event) => onChange(coerceSample(field, event.target.value))}
+      slotProps={{ htmlInput: { 'aria-label': 'Default' } }}
+    />
+  )
+}
+
+function CombinationValuesEditor({ field, values, onChange }) {
+  const [draft, setDraft] = useState('')
+  const typed = values.filter((item) => item !== '@null' && item !== '@omit')
+  const next = draft.trim()
+  const taken = new Set([String(field.sample ?? '').trim(), ...typed])
+  const add = () => {
+    if (!next || next === '@null' || next === '@omit' || taken.has(next)) return
+    onChange([...values, next])
+    setDraft('')
+  }
+  const toggle = (token) => onChange(values.includes(token) ? values.filter((item) => item !== token) : [...values, token])
+  const choiceSx = (on) => ({
+    height: 22,
+    borderColor: on ? 'primary.main' : 'divider',
+    bgcolor: on ? 'rgba(15, 39, 68, 0.06)' : 'transparent',
+    color: on ? 'primary.main' : 'text.secondary',
+    '& .MuiChip-label': { px: 0.75, fontSize: 12, fontWeight: on ? 650 : 500 },
+  })
+  return (
+    <Box sx={{ display: 'contents' }}>
+      {typed.map((value) => (
+        <Chip key={value} size="small" label={value} onDelete={() => onChange(values.filter((item) => item !== value))} />
+      ))}
+      {!field.required && (
+        <>
+          <Chip size="small" variant="outlined" label="Null" onClick={() => toggle('@null')} sx={choiceSx(values.includes('@null'))} />
+          <Chip size="small" variant="outlined" label="Omit" onClick={() => toggle('@omit')} sx={choiceSx(values.includes('@omit'))} />
+        </>
+      )}
+      <TextField
+        size="small"
+        placeholder="Another value"
+        value={draft}
+        onChange={(event) => setDraft(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter') {
+            event.preventDefault()
+            add()
+          }
+        }}
+        slotProps={{ htmlInput: { 'aria-label': 'Another value' } }}
+        sx={{ width: 160, flexShrink: 0 }}
+      />
+      <Button size="small" variant="outlined" onClick={add} disabled={!next || taken.has(next)} sx={{ flexShrink: 0, px: 1 }}>
+        Add
+      </Button>
+    </Box>
+  )
 }
 
 function SampleEditor({ field, onChange }) {
@@ -2322,7 +3111,80 @@ function truncate(text) {
   return oneLine.length > 180 ? `${oneLine.slice(0, 180)}…` : oneLine
 }
 
-async function executeCheck(baseUrl, operation, item, hooks) {
+function specThroughProxy(specUrl, apiBase) {
+  let path = String(specUrl || '').trim()
+  if (path.startsWith('/backend')) path = `/api${path.slice('/backend'.length)}`
+  try {
+    const absolute = new URL(path)
+    return {
+      path: `/api${absolute.pathname}${absolute.search}`,
+      base: String(apiBase || '').trim() || absolute.origin,
+    }
+  } catch {
+    if (!(path.startsWith('/api/') || path === '/api')) {
+      path = `/api${path.startsWith('/') ? path : `/${path}`}`
+    }
+    return { path, base: String(apiBase || '').trim() }
+  }
+}
+
+function hiddenByObject(field, resolvedFields) {
+  const parts = field.name.split('.')
+  for (let length = 1; length < parts.length; length += 1) {
+    const parent = resolvedFields.find((item) => item.object && item.name === parts.slice(0, length).join('.'))
+    if (parent && objectChoice(parent.sample) !== 'fields') return true
+  }
+  return false
+}
+
+function customAncestorClosed(name, fields, active, defaults, operation) {
+  const parts = name.split('.')
+  for (let length = 1; length < parts.length; length += 1) {
+    const parentName = parts.slice(0, length).join('.')
+    const parent = fields.find((item) => item.object && item.name === parentName)
+    if (!parent) continue
+    if ((active.omit || []).includes(parentName)) return true
+    const hasValue = Object.prototype.hasOwnProperty.call(active.request || {}, parentName)
+    const raw = hasValue ? active.request[parentName] : effectiveSample(parent, operation.id, defaults)
+    if (objectChoice(raw) !== 'fields') return true
+  }
+  return false
+}
+
+function proxiedApiUrl(apiBase, pathOrUrl) {
+  const fallback = new URL(joinUrl('/api', pathOrUrl || '/'), 'http://tester.local')
+  try {
+    const absolute = new URL(pathOrUrl, window.location.origin)
+    if (absolute.origin === window.location.origin) return absolute
+    const base = new URL(apiBase)
+    if (absolute.origin === base.origin) {
+      return new URL(joinUrl('/api', `${absolute.pathname}${absolute.search}`), window.location.origin)
+    }
+  } catch {
+    return new URL(fallback.pathname + fallback.search, window.location.origin)
+  }
+  return new URL(joinUrl('/api', pathOrUrl), window.location.origin)
+}
+
+function ObjectChoice({ value, onChange }) {
+  return (
+    <ToggleButtonGroup
+      exclusive
+      size="small"
+      value={value === 'null' || value === 'empty' ? value : 'fields'}
+      onChange={(_event, next) => {
+        if (next) onChange(next)
+      }}
+      sx={{ '& .MuiToggleButton-root': { py: 0.15, px: 0.9, textTransform: 'none', fontSize: 12, lineHeight: 1.6 } }}
+    >
+      <ToggleButton value="fields">Fields</ToggleButton>
+      <ToggleButton value="null">Null</ToggleButton>
+      <ToggleButton value="empty">Empty</ToggleButton>
+    </ToggleButtonGroup>
+  )
+}
+
+async function executeCheck(apiBase, idpBase, operation, item, hooks) {
   const sent = {
     ...item,
     body: evaluateDynamics(item.body),
@@ -2345,7 +3207,7 @@ async function executeCheck(baseUrl, operation, item, hooks) {
       return null
     }
     if (oauthMode(hooks.oauth) === 'on') hooks.onActivity('requesting access token')
-    const response = await callOperation(baseUrl, operation, { ...sent, query }, url, hooks.headers, hooks.oauth)
+    const response = await callOperation(apiBase, idpBase, operation, { ...sent, query }, url, hooks.headers, hooks.oauth)
     if (!first) {
       first = response
     }
@@ -2355,6 +3217,7 @@ async function executeCheck(baseUrl, operation, item, hooks) {
     reports.push({
       status: response.status,
       count: items.length,
+      items,
       text: response.text,
       label: stepLabel(pagination, reports.length, pageIndex, query),
       pageIndex,
@@ -2371,12 +3234,16 @@ async function executeCheck(baseUrl, operation, item, hooks) {
     url = step.url || null
   }
   if (!first) return null
+  const records = reports.flatMap((report) => (report.items || [])
+    .filter((value) => value && typeof value === 'object' && !Array.isArray(value))
+    .map((value) => ({ page: report.label, value })))
   if (reports.length <= 1) {
-    return { ...first, request }
+    return { ...first, request, ...(records.length ? { records } : {}) }
   }
   return {
     ...describeFetched(reports),
     request,
+    ...(records.length ? { records } : {}),
     pages: reports.map((report) => ({
       label: report.label,
       status: report.status,
@@ -2417,35 +3284,36 @@ function requestHeaders(defaults) {
   return headers
 }
 
-async function callOperation(baseUrl, operation, item, urlOverride, extraHeaders, oauth) {
+async function callOperation(apiBase, idpBase, operation, item, urlOverride, extraHeaders, oauth) {
+  if (!String(apiBase || '').trim()) {
+    return { status: 0, text: 'Enter the backend base URL.', link: null }
+  }
   let url
   if (urlOverride) {
-    url = new URL(urlOverride, window.location.origin)
+    url = proxiedApiUrl(apiBase, urlOverride)
   } else {
     let path = operation.path
     for (const [name, value] of Object.entries(item.path)) {
       path = path.replace(`{${name}}`, encodeURIComponent(value))
     }
-    url = new URL(joinUrl(baseUrl, path), window.location.origin)
+    url = new URL(joinUrl('/api', path), window.location.origin)
     for (const [name, value] of Object.entries(item.query)) {
+      if (isOmitted(value)) continue
       url.searchParams.set(name, String(value))
     }
   }
-  const headers = { 'Content-Type': 'application/json', Accept: 'application/json', ...(extraHeaders || {}) }
+  const headers = { 'Content-Type': 'application/json', Accept: 'application/json', 'x-tester-base': apiBase, ...(extraHeaders || {}) }
   try {
     if (oauthMode(oauth) === 'on') {
       for (const key of Object.keys(headers)) {
         if (key.toLowerCase() === 'authorization') delete headers[key]
       }
-      headers.Authorization = `Bearer ${await accessTokenFor(oauth)}`
+      headers.Authorization = `Bearer ${await accessTokenFor(oauth, idpBase)}`
     } else if (oauthMode(oauth) === 'incomplete') {
-      return { status: 0, text: 'Fill the token URL, client ID, and key for this client before running checks.', link: null }
+      return { status: 0, text: 'Fill the token path, client ID, and key for this client before running checks.', link: null }
     }
     const method = operation.method
     const body = method === 'GET' || method === 'DELETE' ? undefined : JSON.stringify(item.body)
-    if (shouldUseCa(url, oauth)) {
-      return fetchWithCa(url, { method, headers, body, ca: oauth.caCert })
-    }
     const response = await fetch(url, { method, headers, body })
     return { status: response.status, text: await response.text(), link: response.headers.get('link') }
   } catch (error) {

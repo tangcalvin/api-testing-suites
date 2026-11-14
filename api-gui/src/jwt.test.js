@@ -1,12 +1,27 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { decodeJwtPayload, oauthMode, signClientAssertion } from './jwt.js'
+import { decodeJwtPayload, derivedAudience, oauthMode, relativeTokenPath, signClientAssertion, tokenTarget } from './jwt.js'
 
 test('oauth runs only when the client has a token URL, client id, and key', () => {
   assert.equal(oauthMode({}), 'off')
   assert.equal(oauthMode({ clientId: 'orders-a' }), 'off')
   assert.equal(oauthMode({ tokenUrl: 'https://auth.example/token', clientId: 'orders-a' }), 'incomplete')
   assert.equal(oauthMode({ tokenUrl: 'https://auth.example/token', clientId: 'orders-a', privateKey: 'secret' }), 'on')
+})
+
+test('token requests use the /idp proxy and the real audience', () => {
+  assert.deepEqual(tokenTarget('/oauth/token', 'https://login.example/realms/a'), {
+    requestPath: '/idp/oauth/token',
+    base: 'https://login.example/realms/a',
+    audience: 'https://login.example/realms/a/oauth/token',
+  })
+  assert.equal(tokenTarget('https://login.example/oauth/token', '').base, 'https://login.example')
+  assert.equal(tokenTarget('https://login.example/oauth/token', 'https://idp.internal').audience, 'https://idp.internal/oauth/token')
+  assert.equal(tokenTarget('', '').error.includes('OAuth base URL'), true)
+  assert.equal(relativeTokenPath('https://login.example/oauth/token?realm=a'), '/oauth/token?realm=a')
+  assert.equal(relativeTokenPath('/oauth/token'), '/oauth/token')
+  assert.equal(derivedAudience('/oauth/token', 'https://idp.example'), 'https://idp.example/oauth/token')
+  assert.equal(derivedAudience('oauth/token', 'https://idp.example/'), 'https://idp.example/oauth/token')
 })
 
 test('signs a client assertion with HS256', async () => {

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { buildBoundaryCases, buildCases, buildCustomCases, buildErrorCases, caseCount, detectPagination, judge, listOperations, parseSpecText, planContinuation, responseChecks, responseViews, specGaps, viewsWithStatuses } from './spec.js'
+import { OMIT, individualChoices, buildIndividualCases, buildCases, buildCustomCases, buildErrorCases, caseCount, detectPagination, judge, listOperations, operationGroups, parseSpecText, planContinuation, responseChecks, responseViews, scalarCombinationField, specGaps, textCombinationField, viewsWithStatuses, withTextCombinationValues } from './spec.js'
 
 const SPEC = `
 openapi: 3.1.0
@@ -141,6 +141,27 @@ paths:
                   total: { type: integer }
 `
 
+test('operations are grouped by the OpenAPI tag', () => {
+  const operations = listOperations(parseSpecText(`
+openapi: 3.1.0
+tags:
+  - name: Orders
+  - name: Customers
+paths:
+  /api/customers:
+    get:
+      tags: [Customers]
+      summary: List customers
+  /api/orders:
+    post:
+      tags: [Orders]
+      summary: Create an order
+`))
+  assert.deepEqual(operations.map((operation) => operation.tag), ['Orders', 'Customers'])
+  assert.deepEqual(operationGroups(operations).map((group) => group.tag), ['Orders', 'Customers'])
+  assert.equal(operationGroups(operations)[1].operations[0].summary, 'List customers')
+})
+
 test('pagination follows the parameter style declared by the spec', () => {
   const operations = Object.fromEntries(listOperations(parseSpecText(PAGED)).map((operation) => [operation.path, operation]))
 
@@ -162,6 +183,49 @@ test('pagination follows the parameter style declared by the spec', () => {
     { status: 200, count: 1 }, { cursor: 'abc', status: 200, count: 0 },
   ])
   assert.equal(cursorDone, null)
+
+  const products = listOperations(parseSpecText(`
+openapi: 3.1.0
+paths:
+  /api/products:
+    get:
+      parameters:
+        - name: size
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100 }
+        - name: nextCursor
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  content: { type: array, items: { type: object } }
+                  size: { type: integer }
+                  totalSize: { type: integer }
+                  nextCursor: { type: string, nullable: true }
+`))[0]
+  assert.equal(products.pagination.style, 'cursor')
+  assert.equal(products.pagination.request.size, 'size')
+  assert.equal(products.pagination.request.cursor, 'nextCursor')
+  assert.deepEqual(products.pagination.response.total, ['totalSize'])
+  assert.deepEqual(products.pagination.response.size, ['size'])
+  const next = planContinuation(products.pagination, { size: 2 }, {
+    content: [{ id: 1 }, { id: 2 }], size: 2, totalSize: 3, nextCursor: '2',
+  }, [{ status: 200, count: 2 }])
+  assert.equal(next.query.size, 2)
+  assert.equal(next.query.nextCursor, '2')
+  const shortPage = planContinuation(products.pagination, { size: 2, nextCursor: '2' }, {
+    content: [{ id: 3 }], size: 2, totalSize: 3, nextCursor: null,
+  }, [{ count: 2 }, { cursor: '2', count: 1 }])
+  assert.equal(shortPage, null)
+  const filled = planContinuation(products.pagination, { size: 2 }, {
+    content: [{ id: 1 }, { id: 2 }], size: 2, totalSize: 2, nextCursor: '2',
+  }, [{ count: 2 }])
+  assert.equal(filled, null)
 
   assert.equal(operations['/feed'].pagination.style, 'offset')
   const offset = planContinuation(operations['/feed'].pagination, { limit: 2 }, { results: [{ id: 1 }, { id: 2 }], total: 5 }, [{ offset: 0, status: 200, count: 2 }])
@@ -190,7 +254,8 @@ paths:
                     city: { type: string, example: Hong Kong, maxLength: 80 }
                     postalCode: { type: string, example: "999077", maxLength: 12 }
 `))[0].fields
-  assert.deepEqual(fields.map((field) => field.name), ['deliveryAddress.line1', 'deliveryAddress.city', 'deliveryAddress.postalCode'])
+  assert.deepEqual(fields.map((field) => field.name), ['deliveryAddress', 'deliveryAddress.line1', 'deliveryAddress.city', 'deliveryAddress.postalCode'])
+  assert.equal(fields[0].object, true)
   assert.equal(fields.every((field) => field.required), true)
   assert.deepEqual(buildCases(fields)[0].body, {
     deliveryAddress: { line1: '1 Harbour Road', city: 'Hong Kong', postalCode: '999077' },
@@ -202,6 +267,52 @@ paths:
     responseChecks([{ status: '201', fields: [{ name: 'deliveryAddress.line1', type: 'string' }, { name: 'deliveryAddress', type: 'object' }] }], new Set(fields.map((field) => field.name))),
     { '201': { 'deliveryAddress.line1': '@{deliveryAddress.line1}' } },
   )
+})
+
+test('a third level object can be sent as fields, null, or an empty object', () => {
+  const fields = listOperations(parseSpecText(`
+openapi: 3.1.0
+paths:
+  /api/orders:
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                deliveryAddress:
+                  type: object
+                  properties:
+                    line1: { type: string, example: "1 Harbour Road" }
+                    region:
+                      oneOf:
+                        - type: object
+                          properties:
+                            code: { type: string, example: HK }
+                            district:
+                              type: object
+                              properties:
+                                name: { type: string, example: Central }
+                        - type: 'null'
+`))[0].fields
+  assert.deepEqual(fields.map((field) => field.name), [
+    'deliveryAddress',
+    'deliveryAddress.line1',
+    'deliveryAddress.region',
+    'deliveryAddress.region.code',
+    'deliveryAddress.region.district',
+    'deliveryAddress.region.district.name',
+  ])
+  const filled = buildCustomCases(fields, [{ name: 'Filled', request: {}, omit: [], expect: {} }])[0]
+  assert.equal(filled.body.deliveryAddress.region.district.name, 'Central')
+  const nulled = buildCustomCases(fields, [{ name: 'Null region', request: { 'deliveryAddress.region': '@null' }, omit: [], expect: {} }])[0]
+  assert.equal(nulled.body.deliveryAddress.region, null)
+  assert.equal(nulled.body.deliveryAddress.line1, '1 Harbour Road')
+  const empty = buildCustomCases(fields, [{ name: 'Empty address', request: { deliveryAddress: '@empty' }, omit: [], expect: {} }])[0]
+  assert.deepEqual(empty.body, { deliveryAddress: {} })
+  const omitted = buildCustomCases(fields, [{ name: 'Omit address', request: {}, omit: ['deliveryAddress'], expect: {} }])[0]
+  assert.deepEqual(omitted.body, {})
 })
 
 test('response schema lists nested fields for each status', () => {
@@ -266,6 +377,158 @@ test('an added status uses the documented fields of the same kind', () => {
   assert.equal(withError.find((view) => view.status === '401').fields[0].name, 'exceptions')
   const withSuccess = viewsWithStatuses(views, ['201'])
   assert.equal(withSuccess.find((view) => view.status === '201').fields[0].name, 'id')
+})
+
+test('text fields cross the sample with extra combination values', () => {
+  const field = (name, extra) => ({
+    name,
+    location: 'query',
+    type: 'string',
+    object: false,
+    enum: false,
+    format: '',
+    required: false,
+    values: [],
+    vary: false,
+    sample: '',
+    ...extra,
+  })
+  const fields = withTextCombinationValues([
+    field('customerName'),
+    field('orderedFrom', { format: 'date-time', sample: '2020-01-15T10:15:30Z' }),
+    field('size', { type: 'integer', sample: 20 }),
+  ], { customerName: ['Ada', 'Ada', ''] }, {})
+  assert.equal(textCombinationField(fields.find((item) => item.name === 'customerName')), true)
+  assert.equal(textCombinationField(fields.find((item) => item.name === 'orderedFrom')), false)
+  assert.equal(textCombinationField(fields.find((item) => item.name === 'size')), false)
+  const customer = fields.find((item) => item.name === 'customerName')
+  assert.equal(customer.vary, true)
+  assert.deepEqual(customer.values, ['', 'Ada'])
+  const cases = buildCases(fields)
+  assert.deepEqual(cases.map((item) => item.label), ['customerName=blank', 'customerName=Ada'])
+  assert.deepEqual(cases[0].query, { size: 20 })
+  assert.deepEqual(cases[1].query, { customerName: 'Ada', size: 20 })
+  assert.equal(cases[1].query.orderedFrom, undefined)
+
+  const held = withTextCombinationValues([
+    field('notes', { location: 'body', sample: 'Leave at reception', textVary: false }),
+  ], { notes: ['${desk}', 'Leave at reception'] }, { desk: 'Call first' })
+  assert.equal(held[0].vary, false)
+  assert.deepEqual(held[0].values, ['Leave at reception', 'Call first'])
+  assert.equal(buildCases(held).length, 1)
+  assert.equal(buildCases(held)[0].body.notes, 'Leave at reception')
+})
+
+test('string and number combinations add other values, and optional fields can add null and omit', () => {
+  const field = (name, extra) => ({
+    name,
+    location: 'body',
+    type: 'string',
+    object: false,
+    enum: false,
+    format: '',
+    required: false,
+    values: [],
+    vary: false,
+    sample: '',
+    ...extra,
+  })
+  const fields = withTextCombinationValues([
+    field('notes', { sample: 'Leave' }),
+    field('quantity', { type: 'integer', sample: 2 }),
+    field('orderNumber', { sample: 'AB', required: true }),
+    field('customerName'),
+  ], {
+    notes: ['Ada', '@null', '@omit', 'Leave'],
+    quantity: ['5', '@null', '2'],
+    orderNumber: ['ZZ', '@omit', '@null'],
+    customerName: ['@omit'],
+  }, {})
+  const notes = fields.find((item) => item.name === 'notes')
+  assert.equal(scalarCombinationField(notes), true)
+  assert.deepEqual(notes.values, ['Leave', 'Ada', null, OMIT])
+  assert.deepEqual(fields.find((item) => item.name === 'quantity').values, [2, 5, null])
+  assert.deepEqual(fields.find((item) => item.name === 'orderNumber').values, ['AB', 'ZZ'])
+  assert.deepEqual(fields.find((item) => item.name === 'customerName').values, [])
+  const cases = buildCases(fields)
+  const omitted = cases.find((item) => item.varied.notes === OMIT && item.varied.quantity === 2)
+  assert.equal(omitted.body.notes, undefined)
+  assert.equal(omitted.body.quantity, 2)
+  assert.equal(omitted.body.orderNumber, 'AB')
+  const cleared = cases.find((item) => item.varied.notes === null && item.varied.quantity === null)
+  assert.equal(cleared.body.notes, null)
+  assert.equal(cleared.body.quantity, null)
+})
+
+test('an enum that already contains null lists that null once', () => {
+  const fields = listOperations(parseSpecText(`
+openapi: 3.1.0
+paths:
+  /api/orders:
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                status:
+                  type: string
+                  enum: [null, DRAFT, null, DRAFT]
+                priority:
+                  type: string
+                  enum: [null, LOW]
+              required: [priority]
+`))[0].fields
+  const status = fields.find((item) => item.name === 'status')
+  assert.deepEqual(status.members, [null, 'DRAFT'])
+  assert.deepEqual(status.values, [null, 'DRAFT', OMIT])
+  const priority = fields.find((item) => item.name === 'priority')
+  assert.deepEqual(priority.members, [null, 'LOW'])
+  assert.deepEqual(priority.values, [null, 'LOW'])
+  assert.deepEqual(buildCases([status]).map((item) => item.label), ['status=null', 'status=DRAFT', 'status=omit'])
+})
+
+test('list combinations do not send saved query filters that are not being varied', () => {
+  const field = (name, extra) => ({ name, location: 'query', type: 'string', object: false, required: false, values: [], vary: false, sample: '', ...extra })
+  const cases = buildCases([
+    field('status', { values: ['DRAFT', 'CONFIRMED'], vary: true, sample: 'DRAFT' }),
+    field('deliveryTo', { sample: '2026-11-13' }),
+    field('discountMin', { type: 'number', sample: 1 }),
+    field('orderNumber', { sample: '1' }),
+    field('size', { type: 'integer', sample: 20 }),
+  ])
+  assert.equal(cases.length, 2)
+  assert.deepEqual(cases[0].query, { status: 'DRAFT', size: 20 })
+  assert.equal(cases[0].query.deliveryTo, undefined)
+  assert.equal(cases[0].query.discountMin, undefined)
+  assert.equal(cases[0].query.orderNumber, undefined)
+})
+
+test('an omitted query value is left off the request', () => {
+  const fields = listOperations(parseSpecText(`
+openapi: 3.1.0
+paths:
+  /api/orders:
+    get:
+      parameters:
+        - name: status
+          in: query
+          schema: { type: string, enum: [DRAFT, CONFIRMED] }
+        - name: priority
+          in: query
+          schema: { type: string, enum: [LOW, HIGH] }
+        - name: currency
+          in: query
+          schema: { type: string, enum: [HKD, USD] }
+`))[0].fields
+  const currency = fields.find((field) => field.name === 'currency')
+  currency.values = ['HKD', Symbol('omit'), 'Symbol(omit)']
+  const cases = buildCases(fields.map((field) => field.name === 'status' || field.name === 'priority' ? { ...field, vary: false, values: [] } : field))
+  assert.deepEqual(cases.map((item) => item.label), ['currency=HKD', 'currency=omit', 'currency=omit'])
+  assert.deepEqual(cases[1].query, {})
+  assert.deepEqual(cases[2].query, {})
+  assert.equal(cases[0].query.currency, 'HKD')
 })
 
 test('optional enum fields also try null and omit', () => {
@@ -336,6 +599,55 @@ test('builds the cartesian product of enum fields and keeps other fields fixed',
   assert.equal(body.notes, undefined)
 })
 
+test('combination exclusions skip field values, equal fields, and mutually exclusive groups', () => {
+  const field = (name, values, sample = values[0]) => ({
+    name, location: 'body', type: 'string', object: false, values, vary: true, sample, required: false,
+  })
+  const fields = [
+    field('status', ['DRAFT', 'CANCELLED']),
+    field('fromAccount', ['100', '200']),
+    field('toAccount', ['100', '200'], '200'),
+  ]
+  const cases = buildCases(fields, {
+    fieldsets: [{ values: { status: 'CANCELLED', fromAccount: '100' } }],
+    distinct: [{ fields: ['fromAccount', 'toAccount'] }],
+  })
+  assert.deepEqual(cases.map((item) => item.varied), [
+    { status: 'DRAFT', fromAccount: '100', toAccount: '200' },
+    { status: 'DRAFT', fromAccount: '200', toAccount: '100' },
+    { status: 'CANCELLED', fromAccount: '200', toAccount: '100' },
+  ])
+
+  const operation = listOperations(parseSpecText(`
+openapi: 3.1.0
+paths:
+  /api/orders:
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OrderRequest"
+components:
+  schemas:
+    OrderRequest:
+      type: object
+      x-mutually-exclusive:
+        - [couponCode, promotionCode]
+      properties:
+        couponCode: { type: string, example: SAVE10 }
+        promotionCode: { type: string, example: SPRING }
+`))[0]
+  assert.deepEqual(operation.exclusive, [['couponCode', 'promotionCode']])
+  const exclusiveFields = operation.fields.map((item) => (
+    item.name === 'promotionCode' ? { ...item, vary: true, values: ['SPRING', OMIT] } : item
+  ))
+  const kept = buildCases(exclusiveFields, { exclusive: operation.exclusive })
+  assert.equal(kept.length, 1)
+  assert.equal(kept[0].body.couponCode, 'SAVE10')
+  assert.equal(kept[0].body.promotionCode, undefined)
+})
+
 const BOUNDED = `
 openapi: 3.1.0
 paths:
@@ -378,24 +690,45 @@ paths:
                   enum: [DRAFT, CONFIRMED]
 `
 
-test('boundary cases use inclusive schema edges', () => {
+test('individual cases vary one field and keep the other defaults', () => {
   const fields = listOperations(parseSpecText(BOUNDED))[0].fields
-  const cases = buildBoundaryCases(fields)
+  const cases = buildIndividualCases(fields)
   const byLabel = Object.fromEntries(cases.map((item) => [item.label, item]))
 
   assert.equal(byLabel['quantity at minimum 1'].body.quantity, 1)
   assert.equal(byLabel['quantity at minimum 1'].body.taxRate, 0.08)
   assert.equal(byLabel['quantity at minimum 1'].body.customerEmail, 'ada@example.com')
   assert.equal(byLabel['quantity at minimum 1'].body.notes, 'Leave at reception')
+  assert.equal(byLabel['quantity at minimum 1'].body.status, 'DRAFT')
   assert.equal(byLabel['taxRate at minimum 0'].body.taxRate, 0)
   assert.equal(byLabel['taxRate at maximum 1'].body.taxRate, 1)
   assert.equal(byLabel['orderNumber at length 4'].body.orderNumber, 'AAAA')
+  assert.equal(byLabel['orderNumber leading space'].body.orderNumber, ' AB')
+  assert.equal(byLabel['orderNumber trailing space'].body.orderNumber, 'AB ')
+  assert.equal(byLabel['orderNumber both spaces'].body.orderNumber, ' AB ')
   assert.equal(byLabel['countryCode pattern AA'].body.countryCode, 'AA')
+  assert.equal(byLabel['countryCode pattern ZZ'].body.countryCode, 'ZZ')
+  assert.equal(byLabel['status=DRAFT'], undefined)
+  assert.equal(byLabel['status=CONFIRMED'].body.status, 'CONFIRMED')
+  assert.equal(byLabel['status=CONFIRMED'].body.quantity, 2)
+  assert.equal(byLabel['status=null'].body.status, null)
+  assert.equal(byLabel['status=omit'].body.status, undefined)
+  assert.equal(byLabel['status=omit'].body.quantity, 2)
+  assert.equal(byLabel['notes leading space'].body.notes, ' Leave at reception')
+  assert.equal(byLabel['notes trailing space'].body.notes, 'Leave at reception ')
+  assert.equal(byLabel['notes both spaces'].body.notes, ' Leave at reception ')
+  assert.equal(byLabel['notes=null'].body.notes, null)
+  assert.equal(byLabel['notes=omit'].body.notes, undefined)
+  assert.equal(byLabel['notes=omit'].body.orderNumber, 'AB')
+  assert.equal(byLabel['notes=null'].body.orderNumber, 'AB')
   assert.equal(byLabel['quantity at minimum 1'].expect.outcome, 'accepted')
+  assert.equal(individualChoices(fields.find((field) => field.name === 'customerEmail')).length, 0)
+  assert.equal(individualChoices(fields.find((field) => field.name === 'orderNumber')).some((choice) => choice.id === 'null'), false)
+  assert.equal(individualChoices(fields.find((field) => field.name === 'orderNumber')).some((choice) => choice.id === 'omit'), false)
 
   const quantity = fields.find((field) => field.name === 'quantity')
-  quantity.boundary = { min: false }
-  assert.equal(buildBoundaryCases(fields).some((item) => item.label === 'quantity at minimum 1'), false)
+  quantity.individual = { min: false }
+  assert.equal(buildIndividualCases(fields).some((item) => item.label === 'quantity at minimum 1'), false)
 })
 
 test('error cases break one constraint and expect that field to be rejected', () => {
@@ -493,13 +826,28 @@ test('list filters reject a bad date format and use the published page bounds', 
   assert.equal(isolated.query.orderedFrom, undefined)
 
   delivery.sample = '2020-01-15T10:15:30Z'
-  const byLabel = Object.fromEntries(buildBoundaryCases(fields).map((item) => [item.label, item]))
+  const byLabel = Object.fromEntries(buildIndividualCases(fields).map((item) => [item.label, item]))
   assert.equal(byLabel['page at minimum 0'].query.page, 0)
   assert.equal(byLabel['page at minimum 0'].query.orderedFrom, '2020-01-15T10:15:30Z')
   assert.equal(byLabel['size at minimum 1'].query.size, 1)
   assert.equal(byLabel['size at minimum 1'].query.orderedFrom, '2020-01-15T10:15:30Z')
   assert.equal(byLabel['size at maximum 100'].query.size, 100)
-  assert.equal(Object.keys(byLabel).length, 3)
+  assert.equal(byLabel['status=DRAFT'].query.status, 'DRAFT')
+  assert.equal(byLabel['status=CONFIRMED'].query.status, 'CONFIRMED')
+  assert.equal(byLabel['status=null'].query.status, '')
+  assert.equal(byLabel['status=omit'], undefined)
+  assert.equal(byLabel['status=DRAFT'].query.orderedFrom, '2020-01-15T10:15:30Z')
+  assert.equal(byLabel['orderedFrom=null'].query.orderedFrom, '')
+
+  fields.find((item) => item.name === 'status').sample = 'DRAFT'
+  fields.find((item) => item.name === 'page').sample = 0
+  const shifted = buildIndividualCases(fields)
+  assert.equal(shifted.some((item) => item.label === 'status=DRAFT'), false)
+  assert.equal(shifted.some((item) => item.label === 'page at minimum 0'), false)
+  assert.equal(shifted.some((item) => item.label === 'status=CONFIRMED'), true)
+  const omitted = shifted.find((item) => item.label === 'status=omit')
+  assert.equal(omitted.query.status, undefined)
+  assert.equal(omitted.query.orderedFrom, '2020-01-15T10:15:30Z')
 })
 
 test('a body timestamp still rejects a value later than the field allows', () => {
@@ -514,12 +862,16 @@ test('a saved client reports operations and fields the spec no longer has', () =
   const profiles = [{
     name: 'Harbour',
     defaults: { global: { missingGlobal: 'x', status: 'DRAFT' }, operations: { 'GET /api/orders': { status: '' }, 'POST /api/orders': { quantity: 1 } } },
-    cases: { operations: { 'GET /api/orders': [{ request: { gone: '1' }, omit: [] }] } },
+    cases: {
+      operations: { 'GET /api/orders': [{ request: { gone: '1' }, omit: [] }] },
+      values: { 'GET /api/orders': { missingValue: ['A'] } },
+    },
   }]
   assert.deepEqual(specGaps(operations, profiles), [
     'Harbour defaults POST /api/orders',
     'Harbour global missingGlobal',
     'Harbour case GET /api/orders gone',
+    'Harbour value GET /api/orders missingValue',
   ])
 })
 
@@ -593,6 +945,26 @@ test('response expectations compare a sent request field and a typed value', () 
     { request: { body: { orderedAt: '2020-01-15T10:15:30+08:00' }, query: {}, path: {} }, expectations: { '201': { orderedAt: '@{orderedAt}' } } },
   )
   assert.equal(zoned.passed, true)
+
+  const trimmed = judge(
+    { outcome: 'accepted' },
+    201,
+    '{"orderNumber":"AB","notes":null}',
+    {
+      request: { body: { orderNumber: ' AB ', notes: '   ' }, query: {}, path: {} },
+      expectations: { '201': { orderNumber: '@{orderNumber}', notes: '@{notes}' } },
+    },
+  )
+  assert.equal(trimmed.passed, true)
+
+  const kept = judge(
+    { outcome: 'accepted' },
+    201,
+    '{"orderNumber":" AB "}',
+    { request: { body: { orderNumber: ' AB ' }, query: {}, path: {} }, expectations: { '201': { orderNumber: '@{orderNumber}' } } },
+  )
+  assert.equal(kept.passed, false)
+  assert.match(kept.detail, /orderNumber expected AB/)
 })
 
 test('custom cases send request overrides and match response fields', () => {

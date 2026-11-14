@@ -3,6 +3,7 @@ package com.philomath.api.store;
 import com.philomath.api.dto.CurrencyCode;
 import com.philomath.api.dto.DeliveryAddress;
 import com.philomath.api.dto.Order;
+import com.philomath.api.dto.Region;
 import com.philomath.api.dto.OrderRequest;
 import com.philomath.api.dto.OrderStatus;
 import com.philomath.api.dto.Priority;
@@ -77,6 +78,12 @@ public class OrderEntity {
     @Column(nullable = false, length = 20)
     private String warehouseCode;
 
+    @Column(length = 20)
+    private String couponCode;
+
+    @Column(length = 20)
+    private String promotionCode;
+
     @Column(length = 120)
     private String deliveryLine1;
 
@@ -86,6 +93,12 @@ public class OrderEntity {
     @Column(length = 12)
     private String deliveryPostalCode;
 
+    @Column(length = 12)
+    private String deliveryRegionCode;
+
+    @Column(length = 80)
+    private String deliveryRegionName;
+
     public static OrderEntity from(OrderRequest request) {
         OrderEntity entity = new OrderEntity();
         entity.apply(request);
@@ -93,26 +106,31 @@ public class OrderEntity {
     }
 
     public void apply(OrderRequest request) {
-        orderNumber = request.orderNumber();
+        orderNumber = Text.trim(request.orderNumber());
         status = request.status();
         priority = request.priority();
-        customerName = request.customerName();
-        customerEmail = request.customerEmail();
+        customerName = Text.trim(request.customerName());
+        customerEmail = Text.trim(request.customerEmail());
         quantity = request.quantity();
         unitPrice = request.unitPrice();
         taxRate = request.taxRate();
         currency = request.currency();
         discountAmount = request.discountAmount();
-        countryCode = request.countryCode();
+        countryCode = Text.trim(request.countryCode());
         orderedAt = request.orderedAt();
         requestedDeliveryDate = request.requestedDeliveryDate();
-        notes = request.notes();
+        notes = Text.trim(request.notes());
         giftWrap = request.giftWrap();
-        warehouseCode = request.warehouseCode();
+        warehouseCode = Text.trim(request.warehouseCode());
+        couponCode = Text.trim(request.couponCode());
+        promotionCode = Text.trim(request.promotionCode());
         DeliveryAddress address = request.deliveryAddress();
-        deliveryLine1 = address == null ? null : address.line1();
-        deliveryCity = address == null ? null : address.city();
-        deliveryPostalCode = address == null ? null : address.postalCode();
+        deliveryLine1 = address == null ? null : Text.trim(address.line1());
+        deliveryCity = address == null ? null : Text.trim(address.city());
+        deliveryPostalCode = address == null ? null : Text.trim(address.postalCode());
+        Region region = address == null ? null : address.region();
+        deliveryRegionCode = region == null ? null : Text.trim(region.code());
+        deliveryRegionName = region == null ? null : Text.trim(region.name());
     }
 
     public Order toRecord() {
@@ -134,15 +152,21 @@ public class OrderEntity {
                 notes,
                 giftWrap,
                 warehouseCode,
+                couponCode,
+                promotionCode,
                 deliveryAddress()
         );
     }
 
     private DeliveryAddress deliveryAddress() {
-        if (deliveryLine1 == null && deliveryCity == null && deliveryPostalCode == null) {
+        if (deliveryLine1 == null && deliveryCity == null && deliveryPostalCode == null
+                && deliveryRegionCode == null && deliveryRegionName == null) {
             return null;
         }
-        return new DeliveryAddress(deliveryLine1, deliveryCity, deliveryPostalCode);
+        Region region = deliveryRegionCode == null && deliveryRegionName == null
+                ? null
+                : new Region(deliveryRegionCode, deliveryRegionName);
+        return new DeliveryAddress(deliveryLine1, deliveryCity, deliveryPostalCode, region);
     }
 
     public Long getId() {
