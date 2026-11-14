@@ -297,12 +297,67 @@ export function withTextCombinationValues(fields, saved, variables) {
   })
 }
 
-export function casesFor(mode, fields, customCases = [], exclusions = {}) {
+export function applyErrorRowToGroup(rows, cases, source) {
+  const listed = rows && typeof rows === 'object' ? rows : {}
+  const sourceKey = errorCheckKey(source)
+  const saved = listed[sourceKey]
+  if (!saved || !source?.group) return listed
+  const next = { ...listed }
+  for (const item of cases || []) {
+    if (!item || item.group !== source.group) continue
+    const key = errorCheckKey(item)
+    if (key === sourceKey) continue
+    const current = next[key] || {}
+    const values = { ...(current.values || {}), ...(saved.values || {}) }
+    const status = saved.status || current.status
+    const stored = {}
+    if (status) stored.status = status
+    if (Object.keys(values).length > 0) stored.values = values
+    if (stored.status || stored.values) next[key] = stored
+  }
+  return next
+}
+
+export function errorCheckKey(item) {
+  return `${item?.group || ''}:${item?.label || ''}`
+}
+
+export function errorColumnDefault(item, column) {
+  if (column === 'exceptions[].code' || column === 'code') return item?.expect?.code || ''
+  return ''
+}
+
+export function applyErrorOverrides(cases, saved = {}) {
+  const columns = Array.isArray(saved.columns) ? saved.columns : ['exceptions[].code']
+  const rows = saved.rows && typeof saved.rows === 'object' ? saved.rows : {}
+  return (cases || []).map((item) => {
+    if (!item || item.group === 'custom') return item
+    const row = rows[errorCheckKey(item)] || {}
+    const values = {}
+    for (const column of columns) {
+      const typed = row.values && Object.prototype.hasOwnProperty.call(row.values, column)
+        ? row.values[column]
+        : errorColumnDefault(item, column)
+      if (String(typed ?? '').trim()) values[column] = String(typed)
+    }
+    const expect = { ...item.expect }
+    const subject = expect.field || ''
+    delete expect.field
+    delete expect.code
+    delete expect.message
+    if (subject) expect.subject = subject
+    if (row.status) expect.status = Number(row.status) || expect.status
+    if (Object.keys(values).length > 0) expect.values = values
+    return { ...item, expect }
+  })
+}
+
+export function casesFor(mode, fields, customCases = [], exclusions = {}, errorCases = []) {
   if (mode === 'individual' || mode === 'boundary') {
     return buildIndividualCases(fields)
   }
   if (mode === 'error') {
-    return buildErrorCases(fields)
+    return [...buildErrorCases(fields), ...buildCustomErrorCases(fields, errorCases)]
   }
   if (mode === 'custom') {
     return buildCustomCases(fields, customCases)
@@ -471,13 +526,28 @@ export function buildIndividualCases(fields) {
 export function buildErrorCases(input) {
   const fields = input.map((field) => (field.object ? { ...field, sample: '' } : field))
   const cases = []
+  if (fields.some((field) => field.location === 'body')) {
+    const assembled = assemble(fields, {})
+    cases.push({
+      kind: 'error',
+      group: 'malformed',
+      label: 'Malformed JSON',
+      expect: { outcome: 'error', status: 400, field: 'body', code: 'MalformedJson' },
+      varied: { body: '(malformed)' },
+      body: {},
+      rawBody: '{',
+      query: {},
+      path: assembled.path,
+    })
+  }
   const required = fields.filter((field) => field.required && field.location === 'body')
   if (required.length > 0) {
     const overrides = Object.fromEntries(required.map((field) => [field.name, OMIT]))
     cases.push({
       kind: 'error',
+      group: 'missing',
       label: 'omit every required field',
-      expect: { outcome: 'error', minCount: Math.min(required.length, 2) },
+      expect: { outcome: 'error', status: 400, minCount: Math.min(required.length, 2) },
       varied: { body: '(required fields omitted)' },
       ...assemble(fields, overrides),
     })
@@ -485,41 +555,119 @@ export function buildErrorCases(input) {
 
   for (const field of fields) {
     if (field.required && field.location !== 'path') {
-      cases.push(single(fields, field, OMIT, 'error', `omit ${field.name}`, { field: field.name }))
+      cases.push(errorCase(fields, field, OMIT, `omit ${field.name}`, { field: field.name, code: missingCode(field) }, 'missing'))
     }
-    if (field.values.length > 0 && field.type !== 'boolean') {
-      cases.push(single(fields, field, '__INVALID__', 'error', `${field.name} is not an allowed value`, { field: field.name }))
+    if (field.required && field.location === 'body' && !nullIsAllowed(field)) {
+      cases.push(errorCase(fields, field, null, `${field.name} is null`, { field: field.name, code: 'NotNull' }, 'disallowed'))
+    }
+    if (field.enum && (field.values || []).some((value) => value != null && !isOmitted(value))) {
+      const code = field.location === 'body' ? 'InvalidEnum' : 'InvalidFormat'
+      cases.push(errorCase(fields, field, '__INVALID__', `${field.name} is not an allowed value`, { field: field.name, code }, 'disallowed'))
     }
     if (field.format === 'email') {
-      cases.push(single(fields, field, 'not-an-email', 'error', `${field.name} is not an email`, { field: field.name }))
+      cases.push(errorCase(fields, field, 'not-an-email', `${field.name} is not an email`, { field: field.name, code: 'Email' }, 'disallowed'))
     }
     if (field.constraints.pattern) {
-      cases.push(single(fields, field, invalidPattern(field), 'error', `${field.name} does not match its pattern`, { field: field.name }))
+      cases.push(errorCase(fields, field, invalidPattern(field), `${field.name} does not match its pattern`, { field: field.name, code: 'Pattern' }, 'disallowed'))
     }
     const limits = numericLimits(field)
     if (limits.below != null) {
-      cases.push(single(fields, field, limits.below, 'error', `${field.name} below minimum`, { field: field.name }))
+      cases.push(errorCase(fields, field, limits.below, `${field.name} below minimum`, { field: field.name, code: 'Min' }, 'disallowed'))
     }
     if (limits.above != null) {
-      cases.push(single(fields, field, limits.above, 'error', `${field.name} above maximum`, { field: field.name }))
+      cases.push(errorCase(fields, field, limits.above, `${field.name} above maximum`, { field: field.name, code: 'Max' }, 'disallowed'))
     }
     if (field.constraints.maxLength != null && field.constraints.maxLength > 0 && !field.constraints.pattern && field.format !== 'email') {
       const value = 'A'.repeat(field.constraints.maxLength + 1)
-      cases.push(single(fields, field, value, 'error', `${field.name} longer than ${field.constraints.maxLength}`, { field: field.name }))
+      cases.push(errorCase(fields, field, value, `${field.name} longer than ${field.constraints.maxLength}`, { field: field.name, code: 'Size' }, 'disallowed'))
     }
     const temporal = invalidTemporal(field)
     if (temporal) {
-      cases.push(single(fields, field, temporal.value, 'error', `${field.name} ${temporal.label}`, { field: field.name }))
+      cases.push(errorCase(fields, field, temporal.value, `${field.name} ${temporal.label}`, { field: field.name, code: temporal.code }, 'disallowed'))
     }
     const format = invalidFormat(field)
     if (format) {
-      cases.push(single(fields, field, format.value, 'error', `${field.name} ${format.label}`, { field: field.name }))
+      cases.push(errorCase(fields, field, format.value, `${field.name} ${format.label}`, { field: field.name, code: 'InvalidFormat' }, 'type'))
+    }
+    if ((field.type === 'integer' || field.type === 'number') && field.location !== 'path') {
+      const label = field.type === 'integer' ? 'is not an integer' : 'is not a number'
+      cases.push(errorCase(fields, field, 'abc', `${field.name} ${label}`, { field: field.name, code: 'InvalidFormat' }, 'type'))
+    }
+    if (field.type === 'boolean') {
+      cases.push(errorCase(fields, field, 'yes', `${field.name} is not a boolean`, { field: field.name, code: 'InvalidFormat' }, 'type'))
     }
     if (field.location === 'path' && field.type === 'integer') {
-      cases.push(single(fields, field, 'abc', 'error', `${field.name} is not an integer`, { field: field.name }))
+      cases.push(errorCase(fields, field, 'abc', `${field.name} is not an integer`, { field: field.name, code: 'InvalidFormat' }, 'type'))
     }
   }
   return cases
+}
+
+function nullIsAllowed(field) {
+  return (field.members || field.values || []).some((value) => value == null && !isOmitted(value))
+}
+
+function missingCode(field) {
+  if (field.type === 'string' && !field.enum && field.format !== 'date' && field.format !== 'date-time') return 'NotBlank'
+  return 'NotNull'
+}
+
+function errorCase(fields, field, value, label, expect, group) {
+  return { ...single(fields, field, value, 'error', label, { status: 400, ...expect }), group }
+}
+
+export function buildCustomErrorCases(fields, cases) {
+  return (cases || []).map((item, index) => {
+    const name = String(item.name || '').trim() || `Custom error ${index + 1}`
+    const status = Number(item.status) || 400
+    const code = String(item.code || '').trim()
+    const fieldName = String(item.field || '').trim()
+    const message = String(item.message || '').trim()
+    const values = {}
+    if (item.values && typeof item.values === 'object' && !Array.isArray(item.values)) {
+      for (const [path, raw] of Object.entries(item.values)) {
+        if (typeof raw === 'string' && raw.trim()) values[path] = raw
+      }
+    }
+    if (Object.keys(values).length === 0) {
+      if (code) values['exceptions[].code'] = code
+      if (message) values['exceptions[].message'] = message
+    }
+    const expect = {
+      outcome: 'error',
+      status,
+      ...(fieldName ? { subject: fieldName } : {}),
+      ...(Object.keys(values).length > 0 ? { values } : {}),
+      ...(code ? { code } : {}),
+      ...(message ? { message } : {}),
+    }
+    if (fieldName === 'body') {
+      const assembled = assemble(fields, {})
+      return {
+        kind: 'error',
+        group: 'custom',
+        label: name,
+        expect,
+        varied: { body: '(custom)' },
+        body: {},
+        rawBody: item.value == null ? '' : String(item.value),
+        query: {},
+        path: assembled.path,
+      }
+    }
+    const field = fields.find((candidate) => candidate.name === fieldName)
+    if (!field) {
+      return {
+        kind: 'error',
+        group: 'custom',
+        label: name,
+        expect,
+        varied: {},
+        ...assemble(fields, {}),
+      }
+    }
+    return { ...single(fields, field, item.omit ? OMIT : item.value, 'error', name, expect), group: 'custom' }
+  })
 }
 
 const ARRAY_ITEM_SCALARS = new Set(['string', 'integer', 'number', 'boolean', 'enum'])
@@ -590,8 +738,8 @@ export function responseChecks(views, requestNames, overridesByStatus = {}) {
 }
 
 export function judge(expect, status, text, context = {}) {
-  const statusVerdict = judgeOutcome(expect, status, text)
-  const valueVerdict = judgeExpectedValues(context, status, text)
+  const statusVerdict = judgeOutcome(expect, status, text, context)
+  const valueVerdict = judgeExpectedValues(customExpectationContext(expect, context), status, text)
   if (!valueVerdict) return statusVerdict
   if (statusVerdict.passed && valueVerdict.passed) {
     return { passed: true, detail: valueVerdict.checked ? 'Response matched' : statusVerdict.detail }
@@ -602,7 +750,7 @@ export function judge(expect, status, text, context = {}) {
   return { passed: false, detail: reasons.join('; ') }
 }
 
-function judgeOutcome(expect, status, text) {
+function judgeOutcome(expect, status, text, context = {}) {
   if (!expect || expect.outcome === 'success') {
     const passed = status >= 200 && status < 300
     return { passed, detail: passed ? 'Accepted' : `Expected a success status, received ${status || 'no response'}` }
@@ -615,7 +763,7 @@ function judgeOutcome(expect, status, text) {
     }
   }
   if (expect.outcome === 'custom') {
-    return judgeCustom(expect, status, text)
+    return judgeCustom(expect, status, text, context)
   }
   let parsed = null
   try {
@@ -624,19 +772,103 @@ function judgeOutcome(expect, status, text) {
     parsed = null
   }
   const exceptions = parsed && Array.isArray(parsed.exceptions) ? parsed.exceptions : []
-  const fieldMatched = !expect.field || exceptions.some((item) => item && item.field === expect.field)
+  const expectedStatus = Number(expect.status) || 400
+  if (expect.values && typeof expect.values === 'object') {
+    if (status !== expectedStatus) {
+      return { passed: false, detail: `Expected ${expectedStatus}, received ${status || 'no response'}` }
+    }
+    const compared = matchResponseValues(parsed, expect.values, expect.subject || '', context)
+    if (!compared.ok) return { passed: false, detail: compared.detail }
+    if (expect.minCount && exceptions.length < expect.minCount) {
+      return { passed: false, detail: `Expected at least ${expect.minCount} field errors` }
+    }
+    return { passed: true, detail: 'Response matched' }
+  }
+  const template = String(expect.message || '').trim()
+  const fieldInMessage = template.includes('@{field}') || (expect.field && template.includes(`@{${expect.field}}`))
+  let templateText = ''
+  let templateFailed = false
+  if (template) {
+    const resolved = resolveErrorMessage(template, expect.field || '', context.request, context.variables)
+    if (resolved.skip || !String(resolved.value ?? '').trim()) templateFailed = true
+    else templateText = String(resolved.value)
+  }
+  const named = Boolean(expect.field || expect.code || template)
+  const matched = exceptions.filter((item) => {
+    if (!item || typeof item !== 'object') return false
+    if (expect.code && item.code !== expect.code) return false
+    if (template) {
+      if (templateFailed || !String(item.message || '').includes(templateText)) return false
+      if (!fieldInMessage && expect.field && item.field !== expect.field) return false
+      return true
+    }
+    if (expect.field && item.field !== expect.field) return false
+    return named
+  })
+  const listed = !named || matched.length > 0
   const countMatched = !expect.minCount || exceptions.length >= expect.minCount
-  const passed = status === 400 && fieldMatched && countMatched
+  const passed = status === expectedStatus && !templateFailed && listed && countMatched
   if (passed) {
-    return { passed, detail: expect.field ? `${expect.field} listed in exceptions` : `${exceptions.length} field errors` }
+    if (template) return { passed, detail: 'Exception message matched' }
+    const code = expect.code ? ` ${expect.code}` : ''
+    return { passed, detail: expect.field ? `${expect.field}${code} listed in exceptions` : `${exceptions.length} field errors` }
   }
-  if (status !== 400) {
-    return { passed: false, detail: `Expected 400, received ${status || 'no response'}` }
+  if (status !== expectedStatus) {
+    return { passed: false, detail: `Expected ${expectedStatus}, received ${status || 'no response'}` }
   }
-  if (!fieldMatched) {
-    return { passed: false, detail: `400 response did not list ${expect.field}` }
+  if (templateFailed) {
+    return { passed: false, detail: 'Message template could not be filled' }
+  }
+  if (!listed) {
+    if (template) return { passed: false, detail: `${expectedStatus} response did not match the message` }
+    const name = `${expect.field || 'the field'}${expect.code ? ` ${expect.code}` : ''}`
+    return { passed: false, detail: `${expectedStatus} response did not list ${name}` }
   }
   return { passed: false, detail: `Expected at least ${expect.minCount} field errors` }
+}
+
+function resolveErrorMessage(template, fieldName, request, variables) {
+  const withField = String(template).replaceAll('@{field}', fieldName || '')
+  return resolveRequestTemplate(withField, request, variables)
+}
+
+function matchResponseValues(parsed, values, subject, context) {
+  const groups = new Map()
+  const scalars = []
+  for (const [path, raw] of Object.entries(values || {})) {
+    if (!String(raw ?? '').trim()) continue
+    const resolved = resolveErrorMessage(raw, subject, context.request, context.variables)
+    if (resolved.skip || !String(resolved.value ?? '').trim()) {
+      return { ok: false, detail: 'Expected value could not be filled' }
+    }
+    const expected = String(resolved.value)
+    const nested = String(path).match(/^(.*)\[\]\.(.+)$/)
+    if (nested) {
+      const list = groups.get(nested[1]) || []
+      list.push([nested[2], expected])
+      groups.set(nested[1], list)
+      continue
+    }
+    scalars.push([path, expected])
+  }
+  if (scalars.length === 0 && groups.size === 0) return { ok: true }
+  if (!parsed || typeof parsed !== 'object') return { ok: false, detail: 'Response was not JSON' }
+  for (const [path, expected] of scalars) {
+    const found = valueAt(parsed, path)
+    if (!found.present || String(found.value) !== expected) {
+      return { ok: false, detail: `${path} expected ${expected}` }
+    }
+  }
+  for (const [prefix, props] of groups) {
+    const found = valueAt(parsed, prefix)
+    const items = found.present && Array.isArray(found.value) ? found.value : []
+    const hit = items.some((item) => item && typeof item === 'object' && props.every(([name, expected]) => String(item[name] ?? '') === expected))
+    if (!hit) {
+      const detail = props.map(([name, expected]) => `${prefix}[].${name} expected ${expected}`).join(', ')
+      return { ok: false, detail }
+    }
+  }
+  return { ok: true }
 }
 
 function judgeExpectedValues(context, status, text) {
@@ -1025,16 +1257,83 @@ export function readJsonPath(value, path) {
   return current
 }
 
-function judgeCustom(expect, status) {
+function hasCustomFieldChecks(expect) {
+  return customFieldChecks(expect).length > 0
+}
+
+function customExpectationContext(expect, context) {
+  if (expect?.outcome !== 'custom' || !hasCustomFieldChecks(expect)) return context
+  const specified = new Set(customFieldChecks(expect).map((field) => String(field.path).trim()))
+  const expectations = {}
+  for (const [status, fields] of Object.entries(context?.expectations || {})) {
+    const kept = {}
+    for (const [path, value] of Object.entries(fields || {})) {
+      if (!specified.has(path)) kept[path] = value
+    }
+    if (Object.keys(kept).length > 0) expectations[status] = kept
+  }
+  return { ...context, expectations }
+}
+
+function customFieldChecks(expect) {
+  return (expect?.fields || []).filter((field) => {
+    if (!field || !String(field.path || '').trim()) return false
+    return String(field.equals ?? '').trim() !== '' || field.ordered
+  })
+}
+
+function judgeCustom(expect, status, text, context = {}) {
   const wanted = expect.status ? Number(expect.status) : null
   const passed = wanted ? status === wanted : status >= 200 && status < 300
-  if (passed) {
-    return { passed, detail: wanted ? `HTTP ${wanted}` : 'Accepted' }
+  if (!passed) {
+    return {
+      passed: false,
+      detail: wanted ? `Expected HTTP ${wanted}, received ${status || 'no response'}` : `Expected a success status, received ${status || 'no response'}`,
+    }
   }
-  return {
-    passed: false,
-    detail: wanted ? `Expected HTTP ${wanted}, received ${status || 'no response'}` : `Expected a success status, received ${status || 'no response'}`,
+  const fields = customFieldChecks(expect)
+  if (fields.length === 0) {
+    return { passed: true, detail: wanted ? `HTTP ${wanted}` : 'Accepted' }
   }
+  const compared = matchCustomFields(text, fields, context)
+  if (!compared.ok) return { passed: false, detail: compared.detail }
+  return { passed: true, detail: 'Response matched' }
+}
+
+function matchCustomFields(text, fields, context) {
+  let parsed = null
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    parsed = null
+  }
+  if (!parsed || typeof parsed !== 'object') return { ok: false, detail: 'Response was not JSON' }
+  const grouped = {}
+  const rest = []
+  for (const field of fields) {
+    const path = String(field.path).trim()
+    const nested = path.match(/^(.*)\[\]\.(.+)$/)
+    if (nested && nested[1] === 'exceptions') grouped[path] = String(field.equals ?? '')
+    else rest.push(field)
+  }
+  if (Object.keys(grouped).length > 0) {
+    const compared = matchResponseValues(parsed, grouped, '', context)
+    if (!compared.ok) return compared
+  }
+  for (const field of rest) {
+    const path = String(field.path).trim()
+    const resolved = resolveRequestTemplate(String(field.equals ?? ''), context.request, context.variables)
+    if (resolved.skip) return { ok: false, detail: 'Expected value could not be filled' }
+    const compared = comparePath(parsed, path, resolved.value, Boolean(field.ordered))
+    if (compared.skip || compared.ok) continue
+    return {
+      ok: false,
+      detail: compared.detail
+        ? `${path} ${compared.detail}`
+        : `${path} expected ${describeExpected(resolved.value)}, got ${describeActual(compared.actual)}`,
+    }
+  }
+  return { ok: true }
 }
 
 function describeActual(actual) {
@@ -1115,6 +1414,15 @@ export function joinUrl(base, path) {
 
 function normalizeName(name) {
   return String(name || '').toLowerCase().replace(/[_-]/g, '')
+}
+
+export function responsesForMode(views, mode) {
+  const listed = Array.isArray(views) ? views : []
+  if (mode === 'error') return listed.filter((view) => /^[45]/.test(String(view.status)))
+  if (mode === 'combination' || mode === 'individual' || mode === 'boundary') {
+    return listed.filter((view) => /^2/.test(String(view.status)))
+  }
+  return listed
 }
 
 export function viewsWithStatuses(views, codes) {
@@ -1603,12 +1911,12 @@ function invalidTemporal(field) {
   }
   if (futureAllowed) {
     return field.format === 'date'
-      ? { value: '1990-01-01', label: 'is earlier than allowed' }
-      : { value: '1990-01-01T00:00:00Z', label: 'is earlier than allowed' }
+      ? { value: '1990-01-01', label: 'is earlier than allowed', code: 'Future' }
+      : { value: '1990-01-01T00:00:00Z', label: 'is earlier than allowed', code: 'Future' }
   }
   return field.format === 'date'
-    ? { value: '2099-12-01', label: 'is later than allowed' }
-    : { value: '2099-12-01T00:00:00Z', label: 'is later than allowed' }
+    ? { value: '2099-12-01', label: 'is later than allowed', code: 'Past' }
+    : { value: '2099-12-01T00:00:00Z', label: 'is later than allowed', code: 'Past' }
 }
 
 function numberOrNull(value) {

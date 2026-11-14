@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { OMIT, individualChoices, buildIndividualCases, buildCases, buildCustomCases, buildErrorCases, caseCount, detectPagination, judge, listOperations, operationGroups, parseSpecText, planContinuation, responseChecks, responseViews, scalarCombinationField, specGaps, textCombinationField, viewsWithStatuses, withTextCombinationValues } from './spec.js'
+import { OMIT, individualChoices, buildIndividualCases, applyErrorOverrides, applyErrorRowToGroup, buildCases, buildCustomCases, buildCustomErrorCases, buildErrorCases, caseCount, detectPagination, judge, listOperations, operationGroups, parseSpecText, planContinuation, responseChecks, responseViews, responsesForMode, scalarCombinationField, specGaps, textCombinationField, viewsWithStatuses, withTextCombinationValues } from './spec.js'
 
 const SPEC = `
 openapi: 3.1.0
@@ -379,6 +379,19 @@ test('an added status uses the documented fields of the same kind', () => {
   assert.equal(withSuccess.find((view) => view.status === '201').fields[0].name, 'id')
 })
 
+test('combination and individual keep success schemas and error keeps the error schemas', () => {
+  const views = [
+    { status: '200', fields: [{ name: 'id' }] },
+    { status: '201', fields: [{ name: 'id' }] },
+    { status: '400', fields: [{ name: 'exceptions[].code' }] },
+    { status: '404', fields: [{ name: 'exceptions[].code' }] },
+  ]
+  assert.deepEqual(responsesForMode(views, 'combination').map((view) => view.status), ['200', '201'])
+  assert.deepEqual(responsesForMode(views, 'individual').map((view) => view.status), ['200', '201'])
+  assert.deepEqual(responsesForMode(views, 'error').map((view) => view.status), ['400', '404'])
+  assert.deepEqual(responsesForMode(views, 'custom').map((view) => view.status), ['200', '201', '400', '404'])
+})
+
 test('text fields cross the sample with extra combination values', () => {
   const field = (name, extra) => ({
     name,
@@ -753,9 +766,58 @@ test('error cases break one constraint and expect that field to be rejected', ()
 
   const omitted = cases.find((item) => item.label === 'omit quantity')
   assert.equal(omitted.body.quantity, undefined)
+  assert.equal(omitted.group, 'missing')
+  assert.equal(omitted.expect.code, 'NotNull')
+  const quantityNull = cases.find((item) => item.label === 'quantity is null')
+  assert.equal(quantityNull.group, 'disallowed')
+  assert.equal(quantityNull.body.quantity, null)
+  assert.equal(quantityNull.expect.code, 'NotNull')
+  assert.equal(quantityNull.body.customerEmail, 'ada@example.com')
+  const emailNull = cases.find((item) => item.label === 'customerEmail is null')
+  assert.equal(emailNull.body.customerEmail, null)
+  assert.equal(emailNull.expect.code, 'NotNull')
+  assert.equal(cases.find((item) => item.label === 'notes is null'), undefined)
+  assert.equal(cases.find((item) => item.label === 'status is null'), undefined)
   assert.equal(judge(omitted.expect, 400, JSON.stringify({ exceptions: [{ field: 'quantity', code: 'NotNull' }] })).passed, true)
+  assert.equal(judge(omitted.expect, 400, JSON.stringify({ exceptions: [{ field: 'quantity', code: 'NotBlank' }] })).passed, false)
   assert.equal(judge(below.expect, 200, '{}').passed, false)
   assert.equal(judge({ outcome: 'accepted' }, 404, '').detail, 'Validation accepted (404)')
+  const malformed = cases.find((item) => item.label === 'Malformed JSON')
+  assert.equal(malformed.group, 'malformed')
+  assert.equal(malformed.rawBody, '{')
+  assert.equal(malformed.expect.code, 'MalformedJson')
+  assert.equal(cases.find((item) => item.label === 'quantity below minimum').expect.code, 'Min')
+  assert.equal(cases.find((item) => item.label === 'customerEmail is not an email').group, 'disallowed')
+  assert.equal(cases.find((item) => item.label === 'orderNumber longer than 4').expect.code, 'Size')
+
+  const nullable = buildErrorCases([{
+    name: 'status', location: 'body', type: 'string', required: true, enum: true, object: false,
+    members: [null, 'DRAFT'], values: [null, 'DRAFT'], sample: 'DRAFT', constraints: {},
+  }])
+  assert.equal(nullable.find((item) => item.label === 'status is null'), undefined)
+
+  const objectCases = buildErrorCases([
+    { name: 'deliveryAddress', location: 'body', type: 'object', object: true, required: true, sample: '', values: [], constraints: {} },
+    { name: 'deliveryAddress.line1', location: 'body', type: 'string', required: true, sample: '1 Road', values: [], constraints: {} },
+  ])
+  assert.equal(objectCases.find((item) => item.label === 'deliveryAddress is null').body.deliveryAddress, null)
+  assert.equal(objectCases.find((item) => item.label === 'deliveryAddress.line1 is null').body.deliveryAddress.line1, null)
+})
+
+test('an expected value can be copied to the rest of its category', () => {
+  const rows = [
+    { group: 'disallowed', label: 'quantity is null', expect: { code: 'NotNull' } },
+    { group: 'disallowed', label: 'customerEmail is null', expect: { code: 'NotNull' } },
+    { group: 'missing', label: 'omit quantity', expect: { code: 'NotNull' } },
+  ]
+  const saved = {
+    'disallowed:quantity is null': { values: { 'exceptions[].message': '@{field} is null' } },
+    'disallowed:customerEmail is null': { values: { 'exceptions[].code': 'Size' } },
+  }
+  const next = applyErrorRowToGroup(saved, rows, rows[0])
+  assert.equal(next['disallowed:customerEmail is null'].values['exceptions[].message'], '@{field} is null')
+  assert.equal(next['disallowed:customerEmail is null'].values['exceptions[].code'], 'Size')
+  assert.equal(next['missing:omit quantity'], undefined)
 })
 
 const LIST_BOUNDS = `
@@ -807,12 +869,67 @@ paths:
                   example: 2020-01-15T10:15:30Z
 `
 
+test('an error message template finds the selected field inside the exception text', () => {
+  const embedded = { outcome: 'error', status: 400, field: 'orderNumber', code: 'Size', message: '@{field} is too long' }
+  const body = JSON.stringify({ exceptions: [{ field: 'body', code: 'Size', message: 'orderNumber is too long' }] })
+  assert.equal(judge(embedded, 400, body).passed, true)
+  const property = { outcome: 'error', status: 400, field: 'orderNumber', code: 'Size', message: 'is too long' }
+  assert.equal(judge(property, 400, body).passed, false)
+  const aligned = JSON.stringify({ exceptions: [{ field: 'orderNumber', code: 'Size', message: 'is too long' }] })
+  assert.equal(judge(property, 400, aligned).passed, true)
+  const sent = judge(
+    { outcome: 'error', status: 400, field: 'orderNumber', message: 'rejected @{orderNumber}' },
+    400,
+    JSON.stringify({ exceptions: [{ field: 'note', code: 'Size', message: 'rejected ABC' }] }),
+    { request: { body: { orderNumber: 'ABC' } } },
+  )
+  assert.equal(sent.passed, true)
+  const [overridden] = applyErrorOverrides([{
+    group: 'disallowed',
+    label: 'status is not an allowed value',
+    expect: { outcome: 'error', status: 400, field: 'status', code: 'InvalidFormat' },
+  }], {
+    columns: ['exceptions[].code', 'exceptions[].message'],
+    rows: { 'disallowed:status is not an allowed value': { status: '422', values: { 'exceptions[].message': '@{field} is not allowed' } } },
+  })
+  assert.equal(overridden.expect.status, 422)
+  assert.equal(overridden.expect.subject, 'status')
+  assert.equal(overridden.expect.field, undefined)
+  assert.equal(overridden.expect.values['exceptions[].code'], 'InvalidFormat')
+  assert.equal(overridden.expect.values['exceptions[].message'], '@{field} is not allowed')
+  const matched = judge(overridden.expect, 422, JSON.stringify({
+    exceptions: [{ field: 'other', code: 'InvalidFormat', message: 'status is not allowed' }],
+  }))
+  assert.equal(matched.passed, true)
+  const split = judge(overridden.expect, 422, JSON.stringify({
+    exceptions: [
+      { field: 'other', code: 'InvalidFormat', message: 'nope' },
+      { field: 'status', code: 'Size', message: 'status is not allowed' },
+    ],
+  }))
+  assert.equal(split.passed, false)
+})
+
+test('a custom error sends one value and expects its status and code', () => {
+  const fields = listOperations(parseSpecText(BOUNDED))[0].fields
+  const [item] = buildCustomErrorCases(fields, [{ name: 'Unknown status', status: '409', field: 'status', code: 'Conflict', value: 'NOPE' }])
+  assert.equal(item.group, 'custom')
+  assert.equal(item.body.status, 'NOPE')
+  assert.equal(item.expect.status, 409)
+  assert.equal(item.expect.values['exceptions[].code'], 'Conflict')
+  assert.equal(item.expect.field, undefined)
+  assert.equal(judge(item.expect, 409, JSON.stringify({ exceptions: [{ field: 'status', code: 'Conflict' }] })).passed, true)
+  assert.equal(judge(item.expect, 400, JSON.stringify({ exceptions: [{ field: 'status', code: 'Conflict' }] })).passed, false)
+})
+
 test('list filters reject a bad date format and use the published page bounds', () => {
   const fields = listOperations(parseSpecText(LIST_BOUNDS))[0].fields
   const errors = buildErrorCases(fields).map((item) => item.label)
 
   assert.ok(errors.includes('status is not an allowed value'))
   assert.ok(errors.includes('orderedFrom is not a timestamp'))
+  assert.equal(buildErrorCases(fields).find((item) => item.label === 'orderedFrom is not a timestamp').group, 'type')
+  assert.equal(buildErrorCases(fields).find((item) => item.label === 'orderedFrom is not a timestamp').expect.code, 'InvalidFormat')
   assert.ok(errors.includes('deliveryFrom is not a date'))
   assert.ok(errors.includes('page below minimum'))
   assert.ok(errors.includes('size below minimum'))
@@ -1015,6 +1132,84 @@ test('custom cases send request overrides and match response fields', () => {
   )
   assert.equal(missingOne.passed, false)
   assert.match(missingOne.detail, /exceptions expected/)
+})
+
+test('a custom case checks its own error code and returned content', () => {
+  const created = judge(
+    {
+      outcome: 'custom',
+      status: '201',
+      fields: [
+        { path: 'orderNumber', equals: '@{orderNumber}' },
+        { path: 'status', equals: 'CONFIRMED' },
+        { path: 'content', equals: '' },
+      ],
+    },
+    201,
+    '{"orderNumber":"ORD-1","status":"CONFIRMED"}',
+    {
+      request: { body: { orderNumber: 'ORD-1', status: 'CONFIRMED' }, query: {}, path: {} },
+      expectations: { '201': { orderNumber: 'SHOULD-NOT-APPLY' } },
+    },
+  )
+  assert.equal(created.passed, true)
+  assert.equal(created.detail, 'Response matched')
+
+  const echoed = judge(
+    { outcome: 'custom', status: '201', fields: [{ path: 'status', equals: 'CONFIRMED' }] },
+    201,
+    '{"orderNumber":"ORD-1","customerEmail":"ada@example.com","status":"CONFIRMED"}',
+    {
+      request: { body: { orderNumber: 'ORD-1', status: 'CONFIRMED' }, query: {}, path: {} },
+      expectations: { '201': { orderNumber: '@{orderNumber}', customerEmail: '@{customerEmail}', status: '@{status}' } },
+    },
+  )
+  assert.equal(echoed.passed, true)
+
+  const different = judge(
+    { outcome: 'custom', status: '201', fields: [{ path: 'status', equals: 'CONFIRMED' }] },
+    201,
+    '{"orderNumber":"OTHER","status":"CONFIRMED"}',
+    {
+      request: { body: { orderNumber: 'ORD-1', status: 'CONFIRMED' }, query: {}, path: {} },
+      expectations: { '201': { orderNumber: '@{orderNumber}' } },
+    },
+  )
+  assert.equal(different.passed, false)
+  assert.match(different.detail, /orderNumber expected ORD-1/)
+
+  const wrongContent = judge(
+    { outcome: 'custom', status: '201', fields: [{ path: 'status', equals: 'CONFIRMED' }] },
+    201,
+    '{"status":"DRAFT"}',
+  )
+  assert.equal(wrongContent.passed, false)
+  assert.match(wrongContent.detail, /status expected CONFIRMED/)
+
+  const rejected = {
+    outcome: 'custom',
+    status: '400',
+    fields: [
+      { path: 'exceptions[].field', equals: 'customerEmail' },
+      { path: 'exceptions[].code', equals: 'NotBlank' },
+    ],
+  }
+  const same = judge(rejected, 400, '{"exceptions":[{"field":"customerEmail","code":"NotBlank","message":"must not be blank"}]}')
+  assert.equal(same.passed, true)
+  const split = judge(rejected, 400, '{"exceptions":[{"field":"customerEmail","code":"Size"},{"field":"notes","code":"NotBlank"}]}')
+  assert.equal(split.passed, false)
+  assert.match(split.detail, /exceptions\[\]/)
+
+  const listed = judge(
+    {
+      outcome: 'custom',
+      status: '200',
+      fields: [{ path: 'content', equals: '[{"orderNumber":"ORD-1"}]', ordered: true }],
+    },
+    200,
+    '{"content":[{"orderNumber":"ORD-1","status":"DRAFT"}]}',
+  )
+  assert.equal(listed.passed, true)
 })
 
 test('an array of objects matches each listed object', () => {

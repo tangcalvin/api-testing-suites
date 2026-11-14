@@ -28,6 +28,7 @@ import {
   List,
   ListItemButton,
   ListItemText,
+  ListSubheader,
   MenuItem,
   Paper,
   Popover,
@@ -49,6 +50,10 @@ import {
   caseCount,
   isOmitted,
   casesFor,
+  applyErrorOverrides,
+  applyErrorRowToGroup,
+  errorCheckKey,
+  errorColumnDefault,
   createPacer,
   defaultResponseExpected,
   isArrayOfObjects,
@@ -72,9 +77,8 @@ import {
   serverUrl,
   specGaps,
   scalarCombinationField,
-  textCombinationField,
   valueText,
-  viewsWithStatuses,
+  responsesForMode,
   withTextCombinationValues,
 } from './openapi/spec'
 import {
@@ -143,13 +147,13 @@ const MODES = [
   },
   {
     id: 'error',
-    label: 'Schema errors',
-    detail: 'Breaks one schema constraint at a time, and also omits every required field together. A check passes when the status is 400 and exceptions lists that field.',
+    label: 'Error',
+    detail: 'Sends requests that should be rejected. A required field sent as null is a disallowed value. Choose the HTTP status, then add a column for each response field you want to compare. Use for all copies the values you set on one row to the rest of that category.',
   },
   {
     id: 'custom',
     label: 'Custom',
-    detail: 'Runs the cases saved for this operation. Blank request fields use the defaults. A check passes on the HTTP status, and when the response schema values for that status match.',
+    detail: 'Runs the cases saved for this operation. Blank request fields use the defaults. A check passes on the HTTP status. A response field with an expected value uses that value. Any other field is compared with the same request field when that value was sent.',
   },
 ]
 
@@ -215,13 +219,19 @@ export default function App() {
   }, [activeMode, customCases.values, defaults, fields, selected])
   const operationCases = selected ? customCases.operations[selected.id] : undefined
   const operationExclusions = selected ? customCases.exclusions?.[selected.id] : undefined
-  const planned = useMemo(
+  const operationErrorCases = selected ? customCases.errors?.[selected.id] : undefined
+  const operationErrorChecks = selected ? customCases.checks?.[selected.id] : undefined
+  const builtCases = useMemo(
     () => (selected ? casesFor(activeMode, resolvedFields, resolveCases(operationCases || [], defaults.variables), {
       fieldsets: operationExclusions?.fieldsets || [],
       distinct: operationExclusions?.distinct || [],
       exclusive: selected.exclusive || [],
-    }) : []),
-    [activeMode, defaults.variables, operationCases, operationExclusions, resolvedFields, selected],
+    }, operationErrorCases || []) : []),
+    [activeMode, defaults.variables, operationCases, operationErrorCases, operationExclusions, resolvedFields, selected],
+  )
+  const planned = useMemo(
+    () => applyErrorOverrides(builtCases, operationErrorChecks || {}),
+    [builtCases, operationErrorChecks],
   )
   const skippedCombinations = activeMode === 'combination' && selected
     ? Math.max(0, caseCount(resolvedFields) - planned.length)
@@ -605,33 +615,6 @@ export default function App() {
     })
   }
 
-  function addResponseStatus(operationId, status) {
-    setDefaults((current) => {
-      const extraStatuses = { ...(current.extraStatuses || {}) }
-      const codes = new Set(extraStatuses[operationId] || [])
-      codes.add(status)
-      extraStatuses[operationId] = [...codes]
-      return { ...current, extraStatuses }
-    })
-  }
-
-  function removeResponseStatus(operationId, status) {
-    setDefaults((current) => {
-      const extraStatuses = { ...(current.extraStatuses || {}) }
-      const codes = (extraStatuses[operationId] || []).filter((code) => code !== status)
-      if (codes.length === 0) delete extraStatuses[operationId]
-      else extraStatuses[operationId] = codes
-      const responses = { ...(current.responses || {}) }
-      if (responses[operationId]) {
-        const operation = { ...responses[operationId] }
-        delete operation[status]
-        if (Object.keys(operation).length === 0) delete responses[operationId]
-        else responses[operationId] = operation
-      }
-      return { ...current, extraStatuses, responses }
-    })
-  }
-
   function writeObject(field, mode) {
     const globalMode = objectChoice(defaults.global?.[field.name])
     if (mode === 'fields' && globalMode === 'fields') {
@@ -670,6 +653,27 @@ export default function App() {
         operations[operationId] = list
       }
       return { ...current, operations }
+    })
+  }
+
+  function writeErrorCases(operationId, list) {
+    setCustomCases((current) => {
+      const errors = { ...(current.errors || {}) }
+      if (list.length === 0) delete errors[operationId]
+      else errors[operationId] = list
+      return { ...current, errors }
+    })
+  }
+
+  function writeErrorChecks(operationId, next) {
+    setCustomCases((current) => {
+      const checks = { ...(current.checks || {}) }
+      const columns = Array.isArray(next?.columns) ? next.columns : ['exceptions[].code']
+      const rows = next?.rows && typeof next.rows === 'object' ? next.rows : {}
+      const untouched = columns.length === 1 && columns[0] === 'exceptions[].code' && Object.keys(rows).length === 0
+      if (untouched) delete checks[operationId]
+      else checks[operationId] = { columns, rows }
+      return { ...current, checks }
     })
   }
 
@@ -767,7 +771,7 @@ export default function App() {
       const bodyText = item.expect?.outcome === 'custom' && response.pages?.[0] ? response.pages[0].text : response.text
       const verdict = judge(item.expect, response.status, bodyText, {
         request: response.request || { body: item.body, query: item.query, path: item.path },
-        expectations: responseChecks(viewsWithStatuses(selected.responses, defaults.extraStatuses?.[selected.id]), new Set(fields.map((field) => field.name)), defaults.responses?.[selected.id]),
+        expectations: responseChecks(responsesForMode(selected.responses, activeMode), new Set(fields.map((field) => field.name)), defaults.responses?.[selected.id]),
         variables: defaults.variables,
         pages: response.pages,
       })
@@ -967,13 +971,11 @@ export default function App() {
                 </Stack>
 
                 <ResponseSchema
-                  key={selected.id}
-                  responses={viewsWithStatuses(selected.responses, defaults.extraStatuses?.[selected.id])}
+                  key={`${selected.id}-${activeMode}`}
+                  responses={responsesForMode(selected.responses, activeMode)}
                   requestNames={new Set(fields.map((field) => field.name))}
                   expected={defaults.responses?.[selected.id] || {}}
                   onExpected={(status, name, raw) => writeResponseExpected(selected.id, status, name, raw)}
-                  onAddStatus={(status) => addResponseStatus(selected.id, status)}
-                  onRemoveStatus={(status) => removeResponseStatus(selected.id, status)}
                 />
 
                 <Stack spacing={1}>
@@ -1003,28 +1005,40 @@ export default function App() {
                     fields={fields}
                     defaults={defaults}
                     exclusive={selected.exclusive || []}
+                    responses={selected.responses || []}
                     cases={operationCases || []}
                     onChange={(list) => writeCases(selected.id, list)}
                     onExport={() => downloadJson('custom-cases.json', casesDocument(customCases))}
                     onImport={(file) => importLibrary(file, 'cases')}
                   />
+                ) : activeMode === 'error' ? (
+                  <ErrorCases
+                    fields={resolvedFields}
+                    responses={responsesForMode(selected.responses, 'error')}
+                    cases={builtCases.filter((item) => item.group !== 'custom')}
+                    checks={operationErrorChecks || {}}
+                    onChecks={(next) => writeErrorChecks(selected.id, next)}
+                    custom={operationErrorCases || []}
+                    onChange={(list) => writeErrorCases(selected.id, list)}
+                  />
                 ) : (
                 <Box sx={{ overflow: 'auto', maxHeight: 'min(440px, calc(100vh - 420px))', border: 1, borderColor: 'divider', borderRadius: 1 }}>
-                  <Table size="small" stickyHeader sx={{ tableLayout: 'fixed', width: '100%', minWidth: activeMode === 'combination' ? 1080 : undefined }}>
+                  <Table size="small" stickyHeader sx={{ tableLayout: 'fixed', width: '100%' }}>
                     <TableHead>
                       {activeMode === 'individual' ? (
                         <TableRow>
-                          <TableCell sx={{ width: 176 }}>Field</TableCell>
-                          <TableCell sx={{ width: 268 }}>Default</TableCell>
+                          <TableCell sx={{ width: 210 }}>Field</TableCell>
+                          <TableCell sx={{ width: 240 }}>Default</TableCell>
                           <TableCell>Try</TableCell>
                         </TableRow>
                       ) : (
                         <TableRow>
                           <TableCell sx={{ width: 48 }}>Vary</TableCell>
-                          <TableCell sx={{ width: 220 }}>Field</TableCell>
-                          <TableCell sx={{ width: 76 }}>Type</TableCell>
-                          <TableCell sx={{ width: 120 }}>Constraints</TableCell>
-                          <TableCell>{activeMode === 'combination' ? 'Default' : 'Sample'}</TableCell>
+                          <TableCell sx={{ width: activeMode === 'combination' ? 210 : 220 }}>Field</TableCell>
+                          {activeMode !== 'combination' && <TableCell sx={{ width: 76 }}>Type</TableCell>}
+                          {activeMode !== 'combination' && <TableCell sx={{ width: 120 }}>Constraints</TableCell>}
+                          <TableCell sx={{ width: activeMode === 'combination' ? 240 : undefined }}>{activeMode === 'combination' ? 'Default' : 'Sample'}</TableCell>
+                          {activeMode === 'combination' && <TableCell>Values</TableCell>}
                         </TableRow>
                       )}
                     </TableHead>
@@ -1034,36 +1048,25 @@ export default function App() {
                         if (hiddenByObject(field, resolvedFields)) return null
                         const source = sampleSource(field, selected.id, defaults)
                         const depth = field.name.split('.').length - 1
-                        const leaf = field.name.split('.').pop()
                         const individualField = { ...resolved, individual: field.individual }
                         const toggleIndividual = (id, checked) => updateField(field.name, { individual: { ...(field.individual || {}), [id]: checked } })
                         if (activeMode === 'individual') {
                           return (
                             <TableRow key={`${field.location}-${field.name}`} hover>
-                              <TableCell sx={{ py: 0.5 }}>
-                                <Stack direction="row" spacing={0.5} useFlexGap sx={{ alignItems: 'center', flexWrap: 'wrap', pl: depth * 1.5 }}>
-                                  <Typography variant="body2" sx={{ fontWeight: field.object ? 700 : 650 }}>{leaf}</Typography>
-                                  {depth === 0 && <ToneChip label={field.location} tone={LOCATION_TONE[field.location]} />}
-                                  {field.required && <Typography variant="caption" color="text.secondary">required</Typography>}
-                                  {source === 'global' && <Typography variant="caption" color="text.secondary">global</Typography>}
-                                  <ExclusiveMark name={field.name} groups={selected.exclusive} />
-                                </Stack>
+                              <TableCell>
+                                <FieldSummary field={field} depth={depth} exclusive={selected.exclusive} />
                               </TableCell>
-                              <TableCell sx={{ py: 0.5 }}>
-                                <Box sx={{ display: 'grid', gridTemplateColumns: field.object ? 'auto auto' : '180px auto', columnGap: 0.75, alignItems: 'center' }}>
-                                  {field.object ? (
-                                    <ObjectChoice value={objectChoice(resolved.sample)} onChange={(next) => writeObject(field, next)} />
-                                  ) : (
-                                    <CompactDefault field={defaultEditorField(field, resolved)} onChange={(sample) => writeEndpoint(field, sample)} />
-                                  )}
-                                  {source === 'endpoint' ? (
-                                    <Button size="small" onClick={() => writeEndpoint(field, '', true)} sx={{ minWidth: 0, px: 0.75, whiteSpace: 'nowrap', color: 'text.secondary' }}>
-                                      Inherit
-                                    </Button>
-                                  ) : <Box />}
-                                </Box>
+                              <TableCell>
+                                <DefaultValue
+                                  field={field}
+                                  resolved={resolved}
+                                  source={source}
+                                  onChange={(sample) => writeEndpoint(field, sample)}
+                                  onInherit={() => writeEndpoint(field, '', true)}
+                                  onObject={(next) => writeObject(field, next)}
+                                />
                               </TableCell>
-                              <TableCell sx={{ py: 0.5 }}>
+                              <TableCell>
                                 <IndividualChoices field={individualField} onToggle={toggleIndividual} />
                               </TableCell>
                             </TableRow>
@@ -1086,62 +1089,48 @@ export default function App() {
                             />
                           </TableCell>
                           <TableCell>
-                            <Stack direction="row" spacing={0.75} useFlexGap sx={{ alignItems: 'center', flexWrap: 'wrap', pl: depth * 1.5 }}>
-                              <Typography variant="body2" sx={{ fontWeight: field.object ? 700 : 650 }}>{leaf}</Typography>
-                              {depth === 0 && <ToneChip label={field.location} tone={LOCATION_TONE[field.location]} />}
-                              {field.required && <Chip label="required" size="small" variant="outlined" />}
-                              <ExclusiveMark name={field.name} groups={selected.exclusive} />
-                            </Stack>
+                            <FieldSummary field={field} depth={depth} exclusive={selected.exclusive} />
                           </TableCell>
-                          <TableCell sx={{ color: 'text.secondary' }}>
-                            {fieldTypeLabel(field)}
-                          </TableCell>
-                          <TableCell>
-                            <Stack direction="row" spacing={0.5} useFlexGap sx={{ flexWrap: 'wrap' }}>
-                              {constraintLabels(field).map((label) => (
-                                <Chip key={label} label={label} size="small" variant="outlined" sx={{ fontWeight: 500 }} />
-                              ))}
-                            </Stack>
-                          </TableCell>
-                          <TableCell>
-                            {field.object ? (
-                              <ObjectChoice value={objectChoice(resolved.sample)} onChange={(next) => writeObject(field, next)} />
-                            ) : activeMode === 'combination' && field.enum && resolved.vary ? (
+                          {activeMode !== 'combination' && (
+                            <TableCell sx={{ color: 'text.secondary' }}>
+                              {fieldTypeLabel(field)}
+                            </TableCell>
+                          )}
+                          {activeMode !== 'combination' && (
+                            <TableCell>
                               <Stack direction="row" spacing={0.5} useFlexGap sx={{ flexWrap: 'wrap' }}>
-                                {resolved.values.map((value, index) => <Chip key={`${valueText(value)}-${index}`} label={loopLabel(value)} size="small" />)}
+                                {constraintLabels(field).map((label) => (
+                                  <Chip key={label} label={label} size="small" variant="outlined" sx={{ fontWeight: 500 }} />
+                                ))}
                               </Stack>
-                            ) : (
-                              <Box>
-                                <Stack direction="row" spacing={0.75} useFlexGap sx={{ alignItems: 'center', flexWrap: activeMode === 'combination' ? 'nowrap' : 'wrap' }}>
-                                  <Box sx={{ width: activeMode === 'combination' ? 180 : 'auto', flex: activeMode === 'combination' ? '0 0 180px' : '1 1 180px', minWidth: 0 }}>
-                                    {activeMode === 'combination' ? (
-                                      <CombinationDefault field={resolved} onChange={(sample) => writeEndpoint(field, sample)} />
-                                    ) : (
-                                      <SampleEditor field={defaultEditorField(field, resolved)} onChange={(sample) => writeEndpoint(field, sample)} />
-                                    )}
-                                  </Box>
-                                  {source === 'endpoint' && (
-                                    <Button size="small" onClick={() => writeEndpoint(field, '', true)} sx={{ flexShrink: 0, px: 0.75, whiteSpace: 'nowrap', color: 'text.secondary' }}>
-                                      Inherit
-                                    </Button>
-                                  )}
-                                  {activeMode === 'combination' && scalarCombinationField(field) && (
-                                    <CombinationValuesEditor
-                                      field={resolved}
-                                      values={customCases.values?.[selected.id]?.[field.name] || []}
-                                      onChange={(list) => writeCombinationValues(selected.id, field.name, list)}
-                                    />
-                                  )}
-                                </Stack>
-                                {source === 'global' && <Typography variant="caption" color="text.secondary">Global default</Typography>}
-                                {source === 'endpoint' && (
-                                  <Typography variant="caption" color="text.secondary">
-                                    {resolved.sample === '' ? 'This endpoint sends nothing' : 'This endpoint'}
-                                  </Typography>
-                                )}
-                              </Box>
-                            )}
+                            </TableCell>
+                          )}
+                          <TableCell>
+                            <DefaultValue
+                              field={field}
+                              resolved={resolved}
+                              source={source}
+                              hidden={field.enum && resolved.vary}
+                              onChange={(sample) => writeEndpoint(field, sample)}
+                              onInherit={() => writeEndpoint(field, '', true)}
+                              onObject={(next) => writeObject(field, next)}
+                            />
                           </TableCell>
+                          {activeMode === 'combination' && (
+                            <TableCell>
+                              {field.enum && resolved.vary ? (
+                                <Stack direction="row" spacing={0.5} useFlexGap sx={{ flexWrap: 'wrap', alignItems: 'center' }}>
+                                  {resolved.values.map((value, index) => <Chip key={`${valueText(value)}-${index}`} label={loopLabel(value)} size="small" />)}
+                                </Stack>
+                              ) : scalarCombinationField(field) ? (
+                                <CombinationValuesEditor
+                                  field={resolved}
+                                  values={customCases.values?.[selected.id]?.[field.name] || []}
+                                  onChange={(list) => writeCombinationValues(selected.id, field.name, list)}
+                                />
+                              ) : null}
+                            </TableCell>
+                          )}
                         </TableRow>
                         )
                       })}
@@ -1410,19 +1399,11 @@ function ToneChip({ label, tone, wide = false }) {
   )
 }
 
-function ResponseSchema({ responses, requestNames, expected, onExpected, onAddStatus, onRemoveStatus }) {
-  const preferred = responses.find((item) => item.status === '200') || responses.find((item) => item.status.startsWith('2')) || responses[0]
+function ResponseSchema({ responses, requestNames, expected, onExpected }) {
+  const preferred = responses.find((item) => item.status === '200') || responses.find((item) => String(item.status).startsWith('2')) || responses[0]
   const [open, setOpen] = useState(false)
   const [status, setStatus] = useState(preferred ? preferred.status : '')
-  const [draft, setDraft] = useState('')
   const current = responses.find((item) => item.status === status) || preferred
-  function addStatus() {
-    if (!/^\d{3}$/.test(draft) || responses.some((item) => item.status === draft)) return
-    onAddStatus(draft)
-    setStatus(draft)
-    setOpen(true)
-    setDraft('')
-  }
   return (
     <Box>
       <Stack direction="row" spacing={0.75} useFlexGap sx={{ alignItems: 'center', flexWrap: 'wrap', minHeight: 32 }}>
@@ -1436,79 +1417,39 @@ function ResponseSchema({ responses, requestNames, expected, onExpected, onAddSt
         >
           Response schema
         </Button>
+        {responses.length === 0 && (
+          <Typography variant="caption" color="text.secondary">None for this category.</Typography>
+        )}
         {responses.map((item) => {
           const tone = statusTone(item.status)
           const selectedStatus = current && item.status === current.status
           return (
-            <Stack key={item.status} direction="row" spacing={0} sx={{ alignItems: 'center' }}>
-              <Box
-                component="button"
-                type="button"
-                onClick={() => {
-                  setStatus(item.status)
-                  setOpen(true)
-                }}
-                sx={{
-                  border: 1,
-                  borderColor: open && selectedStatus ? tone.fg : 'transparent',
-                  bgcolor: tone.bg,
-                  color: tone.fg,
-                  borderRadius: item.added ? '4px 0 0 4px' : 1,
-                  px: 0.75,
-                  py: 0.1,
-                  font: 'inherit',
-                  fontSize: 12,
-                  fontWeight: 700,
-                  cursor: 'pointer',
-                }}
-              >
-                {item.status}
-              </Box>
-              {item.added && (
-                <Box
-                  component="button"
-                  type="button"
-                  aria-label={`Remove ${item.status}`}
-                  onClick={() => {
-                    onRemoveStatus(item.status)
-                    if (item.status === status) setStatus(preferred ? preferred.status : '')
-                  }}
-                  sx={{
-                    border: 1,
-                    borderLeft: 0,
-                    borderColor: open && selectedStatus ? tone.fg : 'transparent',
-                    bgcolor: tone.bg,
-                    color: tone.fg,
-                    borderRadius: '0 4px 4px 0',
-                    px: 0.4,
-                    py: 0.1,
-                    font: 'inherit',
-                    fontSize: 12,
-                    fontWeight: 700,
-                    cursor: 'pointer',
-                    lineHeight: 1.4,
-                  }}
-                >
-                  ×
-                </Box>
-              )}
-            </Stack>
+            <Box
+              key={item.status}
+              component="button"
+              type="button"
+              onClick={() => {
+                setStatus(item.status)
+                setOpen(true)
+              }}
+              sx={{
+                border: 1,
+                borderColor: open && selectedStatus ? tone.fg : 'transparent',
+                bgcolor: tone.bg,
+                color: tone.fg,
+                borderRadius: 1,
+                px: 0.75,
+                py: 0.1,
+                font: 'inherit',
+                fontSize: 12,
+                fontWeight: 700,
+                cursor: 'pointer',
+              }}
+            >
+              {item.status}
+            </Box>
           )
         })}
-        <TextField
-          size="small"
-          placeholder="404"
-          value={draft}
-          onChange={(event) => setDraft(event.target.value.replace(/\D/g, '').slice(0, 3))}
-          onKeyDown={(event) => {
-            if (event.key === 'Enter') addStatus()
-          }}
-          slotProps={{ htmlInput: { 'aria-label': 'Add HTTP status', inputMode: 'numeric' } }}
-          sx={{ width: 72, '& input': { py: 0.4, fontSize: 12.5 } }}
-        />
-        <Button size="small" disabled={draft.length !== 3 || responses.some((item) => item.status === draft)} onClick={addStatus}>
-          Add
-        </Button>
         {!open && current?.description && (
           <Typography variant="caption" color="text.secondary" noWrap sx={{ flex: 1, minWidth: 80 }}>
             {current.description}
@@ -1627,7 +1568,432 @@ function ResponseSchema({ responses, requestNames, expected, onExpected, onAddSt
   )
 }
 
-function CustomCases({ operation, fields, defaults, exclusive = [], cases, onChange, onExport, onImport }) {
+const ERROR_STATUSES = ['400', '401', '403', '404', '409', '415', '422', '429', '500']
+const DEFAULT_ERROR_COLUMN = 'exceptions[].code'
+
+function errorStatusOptions(current) {
+  const statuses = [...ERROR_STATUSES]
+  const value = String(current || '')
+  if (value && !statuses.includes(value)) statuses.unshift(value)
+  return statuses
+}
+
+function errorResponseFields(views) {
+  const names = []
+  for (const view of views || []) {
+    if (/^2/.test(String(view.status))) continue
+    for (const field of view.fields || []) {
+      if (!field?.name || names.includes(field.name)) continue
+      const type = String(field.type || '')
+      if (type === 'object' || type.startsWith('array')) continue
+      names.push(field.name)
+    }
+  }
+  for (const name of ['status', 'exceptions[].field', 'exceptions[].code', 'exceptions[].message']) {
+    if (!names.includes(name)) names.push(name)
+  }
+  return names
+}
+
+function nextErrorColumn(columns, fields) {
+  const preferred = ['exceptions[].code', 'exceptions[].message', 'exceptions[].field', 'status']
+  return [...preferred, ...fields].find((name) => name && !columns.includes(name)) || ''
+}
+
+function customResponseFields(views) {
+  const content = []
+  const error = []
+  const objectArrays = new Set()
+  const seen = new Set()
+  const add = (list, field) => {
+    if (!field?.name || seen.has(field.name)) return
+    const type = String(field.type || '')
+    if (type === 'object') return
+    if (type.startsWith('array')) {
+      if (!isArrayOfObjects(field)) return
+      objectArrays.add(field.name)
+    }
+    seen.add(field.name)
+    list.push(field.name)
+  }
+  for (const view of views || []) {
+    const list = /^[45]/.test(String(view.status)) ? error : content
+    for (const field of view.fields || []) add(list, field)
+  }
+  for (const name of ['exceptions[].field', 'exceptions[].code', 'exceptions[].message', 'status']) {
+    if (seen.has(name)) continue
+    seen.add(name)
+    error.push(name)
+  }
+  return { content, error, objectArrays }
+}
+
+function nextCustomField(used, content, error, status) {
+  const preferred = /^[45]/.test(String(status)) ? [...error, ...content] : [...content, ...error]
+  return preferred.find((name) => name && !used.has(name)) || ''
+}
+
+function ErrorCases({ fields, responses, cases, checks, onChecks, custom, onChange }) {
+  const responseFields = errorResponseFields(responses)
+  const columns = Array.isArray(checks.columns) ? checks.columns : [DEFAULT_ERROR_COLUMN]
+  const rows = checks.rows && typeof checks.rows === 'object' ? checks.rows : {}
+  const groups = [
+    ['malformed', 'Malformed JSON', 'The body cannot be read.'],
+    ['missing', 'Missing fields', 'A required field is left out. Text expects NotBlank. Other fields expect NotNull.'],
+    ['disallowed', 'Disallowed value', 'A required field is null, or the value is outside the enum, pattern, length, or numeric range. Null expects NotNull.'],
+    ['type', 'Invalid data type', 'A number, boolean, date, or timestamp is sent in the wrong form.'],
+  ]
+  const publish = (nextColumns, nextRows) => onChecks({ columns: nextColumns, rows: nextRows })
+  const changeColumn = (index, name) => {
+    const previous = columns[index]
+    if (!name || name === previous || columns.includes(name)) return
+    const nextColumns = columns.map((column, columnIndex) => (columnIndex === index ? name : column))
+    const nextRows = {}
+    for (const [key, row] of Object.entries(rows)) {
+      const values = { ...(row.values || {}) }
+      if (Object.prototype.hasOwnProperty.call(values, previous)) {
+        values[name] = values[previous]
+        delete values[previous]
+      }
+      nextRows[key] = { ...row, values }
+    }
+    publish(nextColumns, nextRows)
+  }
+  const addColumn = () => {
+    const name = nextErrorColumn(columns, responseFields)
+    if (name) publish([...columns, name], rows)
+  }
+  const removeColumn = (index) => {
+    const name = columns[index]
+    const nextRows = {}
+    for (const [key, row] of Object.entries(rows)) {
+      const values = { ...(row.values || {}) }
+      delete values[name]
+      const next = { ...row, values }
+      if (next.status || Object.keys(values).length > 0) nextRows[key] = next
+    }
+    publish(columns.filter((_, columnIndex) => columnIndex !== index), nextRows)
+  }
+  const commit = (row, patch) => {
+    const key = errorCheckKey(row)
+    const saved = rows[key] || {}
+    const status = patch.status ?? (saved.status || String(row.expect?.status || 400))
+    const values = { ...(saved.values || {}) }
+    if (patch.column) values[patch.column] = patch.value
+    const baseline = String(row.expect?.status || 400)
+    const stored = {}
+    for (const column of columns) {
+      const value = Object.prototype.hasOwnProperty.call(values, column) ? values[column] : errorColumnDefault(row, column)
+      if (value !== errorColumnDefault(row, column)) stored[column] = value
+    }
+    const nextRows = { ...rows }
+    if (status !== baseline || Object.keys(stored).length > 0) nextRows[key] = { ...(status !== baseline ? { status } : {}), values: stored }
+    else delete nextRows[key]
+    publish(columns, nextRows)
+  }
+  const applyCategory = (row) => publish(columns, applyErrorRowToGroup(rows, cases, row))
+  return (
+    <Stack spacing={2}>
+      <Typography variant="caption" color="text.secondary">
+        Choose the HTTP status. Each other column is a response field: select it in the header, and type the expected value in the row. Use for all copies the values set on that row to every other check in the category. @{'{field}'} is the field this check sends, and @{'{name}'} is a value sent on the request.
+      </Typography>
+      {groups.map(([id, title, detail]) => {
+        const groupRows = cases.filter((item) => item.group === id)
+        return (
+          <Box key={id}>
+            <Typography variant="subtitle2">{title}</Typography>
+            <Typography variant="caption" color="text.secondary">{detail}</Typography>
+            {groupRows.length === 0 ? (
+              <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>No checks for this operation.</Typography>
+            ) : (
+              <ErrorTable
+                rows={groupRows}
+                columns={columns}
+                saved={rows}
+                responseFields={responseFields}
+                onColumn={changeColumn}
+                onAdd={addColumn}
+                onRemove={removeColumn}
+                onCommit={commit}
+                onApply={applyCategory}
+              />
+            )}
+          </Box>
+        )
+      })}
+      <CustomErrorEditor fields={fields} columns={columns} cases={custom} onChange={onChange} />
+    </Stack>
+  )
+}
+
+function ErrorTable({ rows, columns, saved, responseFields, onColumn, onAdd, onRemove, onCommit, onApply }) {
+  const unused = nextErrorColumn(columns, responseFields)
+  return (
+    <Box sx={{ overflow: 'auto' }}>
+      <Table size="small" sx={{ mt: 0.5 }}>
+        <TableHead>
+          <TableRow>
+            <TableCell>Check</TableCell>
+            <TableCell sx={{ width: 108 }}>Status</TableCell>
+            {columns.map((column, index) => (
+              <TableCell key={`${column}-${index}`} sx={{ minWidth: 180 }}>
+                <Stack direction="row" spacing={0.5} sx={{ alignItems: 'center' }}>
+                  <TextField select size="small" value={column} onChange={(event) => onColumn(index, event.target.value)} sx={{ minWidth: 160, flex: 1 }}>
+                    {responseFields.map((name) => (
+                      <MenuItem key={name} value={name} disabled={columns.includes(name) && name !== column}>{name}</MenuItem>
+                    ))}
+                  </TextField>
+                  <IconButton size="small" aria-label="Remove column" onClick={() => onRemove(index)}>
+                    <CloseIcon fontSize="small" />
+                  </IconButton>
+                </Stack>
+              </TableCell>
+            ))}
+            <TableCell sx={{ width: 118 }}>
+              <Button size="small" onClick={onAdd} disabled={!unused}>Add</Button>
+            </TableCell>
+          </TableRow>
+        </TableHead>
+        <TableBody>
+          {rows.map((row) => {
+            const key = errorCheckKey(row)
+            const rowSaved = saved[key] || {}
+            const status = rowSaved.status || String(row.expect?.status || 400)
+            return (
+              <TableRow key={key}>
+                <TableCell>
+                  <Typography variant="body2">{row.label}</Typography>
+                </TableCell>
+                <TableCell>
+                  <TextField select size="small" value={status} onChange={(event) => onCommit(row, { status: event.target.value })} sx={{ width: 96 }}>
+                    {errorStatusOptions(status).map((code) => <MenuItem key={code} value={code}>{code}</MenuItem>)}
+                  </TextField>
+                </TableCell>
+                {columns.map((column) => {
+                  const values = rowSaved.values || {}
+                  const value = Object.prototype.hasOwnProperty.call(values, column) ? values[column] : errorColumnDefault(row, column)
+                  return (
+                    <TableCell key={column}>
+                      <TextField
+                        size="small"
+                        placeholder="Expected"
+                        value={value}
+                        onChange={(event) => onCommit(row, { column, value: event.target.value })}
+                        sx={{ width: '100%', minWidth: 120 }}
+                      />
+                    </TableCell>
+                  )
+                })}
+                <TableCell>
+                  <Button
+                    size="small"
+                    color="inherit"
+                    disabled={!rowSaved.status && Object.keys(rowSaved.values || {}).length === 0}
+                    onClick={() => onApply(row)}
+                    sx={{ minWidth: 0, px: 0.5, whiteSpace: 'nowrap' }}
+                  >
+                    Use for all
+                  </Button>
+                </TableCell>
+              </TableRow>
+            )
+          })}
+        </TableBody>
+      </Table>
+    </Box>
+  )
+}
+
+function customExpected(item, column) {
+  if (item.values && Object.prototype.hasOwnProperty.call(item.values, column)) return item.values[column]
+  if (column === 'exceptions[].code') return item.code || ''
+  if (column === 'exceptions[].message') return item.message || ''
+  return ''
+}
+
+function CustomErrorEditor({ fields, columns, cases, onChange }) {
+  const [draft, setDraft] = useState({ name: '', status: '400', field: 'body', value: '', omit: false })
+  const names = []
+  for (const field of fields || []) {
+    if (field?.name && !names.includes(field.name)) names.push(field.name)
+  }
+  if (!names.includes('body')) names.push('body')
+  const updateCase = (id, patch) => onChange(cases.map((item) => (item.id === id ? { ...item, ...patch } : item)))
+  const updateValue = (item, column, value) => {
+    const values = { ...(item.values || {}) }
+    if (column === 'exceptions[].code' && !item.values && item.code) values['exceptions[].code'] = item.code
+    if (column === 'exceptions[].message' && !item.values && item.message) values['exceptions[].message'] = item.message
+    values[column] = value
+    updateCase(item.id, { values, code: '', message: '' })
+  }
+  const add = () => {
+    const name = draft.name.trim() || 'Custom error'
+    onChange([...cases, {
+      id: globalThis.crypto?.randomUUID?.() || `error-${Date.now()}`,
+      name,
+      status: String(draft.status || '400'),
+      field: draft.field,
+      code: '',
+      message: '',
+      values: {},
+      value: draft.value,
+      omit: draft.field !== 'body' && draft.field !== '' && draft.omit,
+    }])
+    setDraft({ name: '', status: '400', field: draft.field, value: '', omit: false })
+  }
+  return (
+    <Box>
+      <Typography variant="subtitle2">Custom</Typography>
+      <Typography variant="caption" color="text.secondary">The send field is the request field this check changes. Expected values go in the response columns.</Typography>
+      {cases.length > 0 && (
+        <Box sx={{ overflow: 'auto' }}>
+          <Table size="small" sx={{ mt: 0.5 }}>
+            <TableHead>
+              <TableRow>
+                <TableCell>Check</TableCell>
+                <TableCell sx={{ width: 108 }}>Status</TableCell>
+                {columns.map((column) => <TableCell key={column}>{column}</TableCell>)}
+                <TableCell sx={{ width: 48 }} />
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {cases.map((item) => (
+                <TableRow key={item.id}>
+                  <TableCell>
+                    <Typography variant="body2">{item.name}</Typography>
+                    <Typography variant="caption" color="text.secondary">{item.omit ? `${item.field} omitted` : item.field || 'body'}</Typography>
+                  </TableCell>
+                  <TableCell>
+                    <TextField select size="small" value={item.status || '400'} onChange={(event) => updateCase(item.id, { status: event.target.value })} sx={{ width: 96 }}>
+                      {errorStatusOptions(item.status).map((code) => <MenuItem key={code} value={code}>{code}</MenuItem>)}
+                    </TextField>
+                  </TableCell>
+                  {columns.map((column) => (
+                    <TableCell key={column}>
+                      <TextField size="small" placeholder="Expected" value={customExpected(item, column)} onChange={(event) => updateValue(item, column, event.target.value)} sx={{ width: '100%', minWidth: 120 }} />
+                    </TableCell>
+                  ))}
+                  <TableCell>
+                    <Button size="small" color="inherit" onClick={() => onChange(cases.filter((candidate) => candidate.id !== item.id))} sx={{ minWidth: 0, px: 0.5 }}>
+                      Remove
+                    </Button>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </Box>
+      )}
+      <Stack direction={{ xs: 'column', md: 'row' }} spacing={1} useFlexGap sx={{ alignItems: { md: 'center' }, flexWrap: 'wrap', mt: 1 }}>
+        <TextField size="small" label="Name" value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} sx={{ width: 150 }} />
+        <TextField select size="small" label="Status" value={draft.status} onChange={(event) => setDraft({ ...draft, status: event.target.value })} sx={{ width: 110 }}>
+          {errorStatusOptions(draft.status).map((code) => <MenuItem key={code} value={code}>{code}</MenuItem>)}
+        </TextField>
+        <TextField select size="small" label="Send field" value={draft.field} onChange={(event) => setDraft({ ...draft, field: event.target.value, omit: false })} sx={{ width: 170 }}>
+          <MenuItem value="">Any</MenuItem>
+          {names.map((name) => <MenuItem key={name} value={name}>{name}</MenuItem>)}
+        </TextField>
+        <TextField size="small" label={draft.field === 'body' ? 'Body text' : 'Value'} value={draft.value} disabled={draft.omit && draft.field !== 'body'} onChange={(event) => setDraft({ ...draft, value: event.target.value })} sx={{ width: 160 }} />
+        {draft.field !== 'body' && draft.field !== '' && (
+          <FormControlLabel
+            control={<Checkbox size="small" checked={draft.omit} onChange={(event) => setDraft({ ...draft, omit: event.target.checked })} />}
+            label="Omit"
+          />
+        )}
+        <Button size="small" variant="outlined" onClick={add}>Add</Button>
+      </Stack>
+    </Box>
+  )
+}
+
+function CustomExpected({ responses, status, fields, onChange }) {
+  const { content, error, objectArrays } = customResponseFields(responses)
+  const used = new Set(fields.map((field) => field.path))
+  const next = nextCustomField(used, content, error, status)
+  const write = (index, patch) => onChange(fields.map((field, fieldIndex) => (fieldIndex === index ? { ...field, ...patch } : field)))
+  const optionsFor = (current) => {
+    const known = new Set([...content, ...error])
+    const extra = current && !known.has(current) ? [current] : []
+    return { content: [...extra.filter((name) => !error.includes(name) && !content.includes(name)), ...content], error }
+  }
+  return (
+    <Box>
+      <Typography variant="subtitle2">Expected response</Typography>
+      <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 0.75 }}>
+        Add a field from the error, such as exceptions[].code, or from the content that comes back. {'@{name}'} is the value sent for that request field. Several exceptions[] fields must match the same exception. A field you leave out is compared with the same request field when that value was sent.
+      </Typography>
+      {fields.length > 0 && (
+        <Box sx={{ overflow: 'auto', border: 1, borderColor: 'divider', borderRadius: 1 }}>
+          <Table size="small">
+            <TableHead>
+              <TableRow>
+                <TableCell sx={{ width: 220 }}>Response field</TableCell>
+                <TableCell>Expected</TableCell>
+                <TableCell sx={{ width: 72 }} />
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {fields.map((field, index) => {
+                const options = optionsFor(field.path)
+                const objectArray = objectArrays.has(field.path)
+                const arrayError = objectArray ? parseObjectArray(field.equals)?.error : ''
+                return (
+                  <TableRow key={`${field.path}-${index}`}>
+                    <TableCell>
+                      <TextField select size="small" value={field.path} onChange={(event) => write(index, { path: event.target.value })} sx={{ width: '100%', minWidth: 180 }}>
+                        {options.content.length > 0 && <ListSubheader>Returned content</ListSubheader>}
+                        {options.content.map((name) => (
+                          <MenuItem key={name} value={name} disabled={used.has(name) && name !== field.path}>{name}</MenuItem>
+                        ))}
+                        {options.error.length > 0 && <ListSubheader>Error</ListSubheader>}
+                        {options.error.map((name) => (
+                          <MenuItem key={name} value={name} disabled={used.has(name) && name !== field.path}>{name}</MenuItem>
+                        ))}
+                      </TextField>
+                    </TableCell>
+                    <TableCell>
+                      <Stack spacing={0.25}>
+                        <TextField
+                          size="small"
+                          fullWidth
+                          multiline={objectArray}
+                          minRows={objectArray ? 2 : undefined}
+                          placeholder={objectArray ? '[{"field":"quantity"}]' : '@{name}'}
+                          value={field.equals || ''}
+                          error={Boolean(arrayError)}
+                          helperText={arrayError || undefined}
+                          onChange={(event) => write(index, { equals: event.target.value })}
+                          sx={{ '& input, & textarea': { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12.5 } }}
+                        />
+                        {objectArray && (
+                          <FormControlLabel
+                            control={<Checkbox size="small" checked={Boolean(field.ordered)} onChange={(event) => write(index, { ordered: event.target.checked || undefined })} />}
+                            label="In sequence"
+                            sx={{ ml: 0, mr: 0, '& .MuiFormControlLabel-label': { fontSize: 12.5 } }}
+                          />
+                        )}
+                      </Stack>
+                    </TableCell>
+                    <TableCell>
+                      <Button size="small" color="inherit" onClick={() => onChange(fields.filter((_, fieldIndex) => fieldIndex !== index))} sx={{ minWidth: 0, px: 0.5 }}>
+                        Remove
+                      </Button>
+                    </TableCell>
+                  </TableRow>
+                )
+              })}
+            </TableBody>
+          </Table>
+        </Box>
+      )}
+      <Button size="small" sx={{ mt: 0.75 }} disabled={!next} onClick={() => onChange([...fields, { path: next, equals: '' }])}>
+        Add field
+      </Button>
+    </Box>
+  )
+}
+
+function CustomCases({ operation, fields, defaults, exclusive = [], responses = [], cases, onChange, onExport, onImport }) {
   const [activeId, setActiveId] = useState(cases[0]?.id || '')
   const active = cases.find((item) => item.id === activeId) || cases[0] || null
 
@@ -1763,9 +2129,12 @@ function CustomCases({ operation, fields, defaults, exclusive = [], cases, onCha
                 </Table>
               </Box>
             </Box>
-            <Typography variant="caption" color="text.secondary">
-              The response schema above supplies the expected values for the status this case receives.
-            </Typography>
+            <CustomExpected
+              responses={responses}
+              status={active.expect?.status || ''}
+              fields={active.expect?.fields || []}
+              onChange={(next) => update({ expect: { ...active.expect, fields: next } })}
+            />
           </Stack>
         </Box>
       )}
@@ -2700,38 +3069,53 @@ function paginationSummary(pagination) {
   return `This operation is treated as page pagination${names ? ` via ${names}` : ''}.`
 }
 
-function defaultEditorField(field, resolved) {
-  if (textCombinationField(field)) return { ...resolved, values: [] }
-  if (!resolved.enum) return resolved
-  return { ...resolved, values: (resolved.values || []).filter((value) => value != null && !isOmitted(value)) }
-}
-
 function fieldTypeLabel(field) {
   if (field.enum) return 'enum'
   if (field.format) return `${field.type} / ${field.format}`
   return field.type
 }
 
-function CompactDefault({ field, onChange }) {
-  if (field.type === 'boolean' || (field.values.length > 0 && field.type !== 'number' && field.type !== 'integer')) {
-    const options = (field.values.length > 0 ? field.values : [false, true]).filter((option) => option != null && typeof option !== 'symbol')
-    return (
-      <TextField select size="small" fullWidth value={String(field.sample ?? '')} onChange={(event) => onChange(parseOption(event.target.value, options))}>
-        {options.map((option) => (
-          <MenuItem key={String(option)} value={String(option)}>{String(option)}</MenuItem>
-        ))}
-      </TextField>
-    )
-  }
+function FieldSummary({ field, depth, exclusive }) {
+  const leaf = field.name.split('.').pop()
   return (
-    <TextField
-      size="small"
-      fullWidth
-      placeholder={temporalPlaceholder(field.format) || 'Default'}
-      value={field.sample ?? ''}
-      onChange={(event) => onChange(coerceSample(field, event.target.value))}
-      slotProps={{ htmlInput: { 'aria-label': 'Default' } }}
-    />
+    <Stack spacing={0.5} sx={{ pl: depth * 1.5 }}>
+      <Stack direction="row" spacing={0.75} useFlexGap sx={{ alignItems: 'center', flexWrap: 'wrap' }}>
+        <Typography variant="body2" sx={{ fontWeight: field.object ? 700 : 650 }}>{leaf}</Typography>
+        {depth === 0 && <ToneChip label={field.location} tone={LOCATION_TONE[field.location]} />}
+        {field.required && <Chip label="required" size="small" variant="outlined" />}
+        <ExclusiveMark name={field.name} groups={exclusive} />
+      </Stack>
+      <Stack direction="row" spacing={0.5} useFlexGap sx={{ alignItems: 'center', flexWrap: 'wrap' }}>
+        <Typography variant="caption" color="text.secondary">{fieldTypeLabel(field)}</Typography>
+        {constraintLabels(field).map((label) => (
+          <Chip key={label} label={label} size="small" variant="outlined" sx={{ fontWeight: 500 }} />
+        ))}
+      </Stack>
+    </Stack>
+  )
+}
+
+function DefaultValue({ field, resolved, source, hidden = false, onChange, onInherit, onObject }) {
+  if (field.object) {
+    return <ObjectChoice value={objectChoice(resolved.sample)} onChange={onObject} />
+  }
+  if (hidden) return null
+  return (
+    <Box>
+      <CombinationDefault field={resolved} onChange={onChange} />
+      {(source === 'global' || source === 'endpoint') && (
+        <Stack direction="row" spacing={0.5} sx={{ alignItems: 'center', mt: 0.25 }}>
+          {source === 'endpoint' && (
+            <Button size="small" onClick={onInherit} sx={{ minWidth: 0, px: 0.5, py: 0, color: 'text.secondary' }}>
+              Inherit
+            </Button>
+          )}
+          <Typography variant="caption" color="text.secondary">
+            {source === 'global' ? 'Global default' : resolved.sample === '' ? 'This endpoint sends nothing' : 'This endpoint'}
+          </Typography>
+        </Stack>
+      )}
+    </Box>
   )
 }
 
@@ -2870,7 +3254,7 @@ function CombinationValuesEditor({ field, values, onChange }) {
     '& .MuiChip-label': { px: 0.75, fontSize: 12, fontWeight: on ? 650 : 500 },
   })
   return (
-    <Box sx={{ display: 'contents' }}>
+    <Stack direction="row" spacing={0.75} useFlexGap sx={{ flexWrap: 'wrap', alignItems: 'center' }}>
       {typed.map((value) => (
         <Chip key={value} size="small" label={value} onDelete={() => onChange(values.filter((item) => item !== value))} />
       ))}
@@ -2892,34 +3276,12 @@ function CombinationValuesEditor({ field, values, onChange }) {
           }
         }}
         slotProps={{ htmlInput: { 'aria-label': 'Another value' } }}
-        sx={{ width: 160, flexShrink: 0 }}
+        sx={{ width: '100%', maxWidth: 180, flex: '1 1 120px' }}
       />
       <Button size="small" variant="outlined" onClick={add} disabled={!next || taken.has(next)} sx={{ flexShrink: 0, px: 1 }}>
         Add
       </Button>
-    </Box>
-  )
-}
-
-function SampleEditor({ field, onChange }) {
-  if (field.type === 'boolean' || (field.values.length > 0 && field.type !== 'number' && field.type !== 'integer')) {
-    const options = (field.values.length > 0 ? field.values : [false, true]).filter((option) => option != null && typeof option !== 'symbol')
-    return (
-      <TextField select size="small" fullWidth value={String(field.sample)} onChange={(event) => onChange(parseOption(event.target.value, options))}>
-        {options.map((option) => (
-          <MenuItem key={String(option)} value={String(option)}>{String(option)}</MenuItem>
-        ))}
-      </TextField>
-    )
-  }
-  return (
-    <TypedValue
-      value={field.sample ?? ''}
-      kinds={valueKinds(field)}
-      format={field.format}
-      placeholder={temporalPlaceholder(field.format)}
-      onChange={(raw) => onChange(coerceSample(field, raw))}
-    />
+    </Stack>
   )
 }
 
@@ -3194,7 +3556,7 @@ async function executeCheck(apiBase, idpBase, operation, item, hooks) {
   const pagination = operation.pagination
   const followPages = sent.expect?.outcome !== 'error' && sent.expect?.outcome !== 'custom' && pagination
   let query = followPages ? firstPageQuery(pagination, sent.query) : { ...sent.query }
-  const request = { body: sent.body, query: { ...query }, path: sent.path }
+  const request = { body: sent.rawBody != null ? sent.rawBody : sent.body, query: { ...query }, path: sent.path }
   let url = null
   const reports = []
   let first = null
@@ -3313,7 +3675,11 @@ async function callOperation(apiBase, idpBase, operation, item, urlOverride, ext
       return { status: 0, text: 'Fill the token path, client ID, and key for this client before running checks.', link: null }
     }
     const method = operation.method
-    const body = method === 'GET' || method === 'DELETE' ? undefined : JSON.stringify(item.body)
+    const body = method === 'GET' || method === 'DELETE'
+      ? undefined
+      : item.rawBody != null
+        ? String(item.rawBody)
+        : JSON.stringify(item.body)
     const response = await fetch(url, { method, headers, body })
     return { status: response.status, text: await response.text(), link: response.headers.get('link') }
   } catch (error) {

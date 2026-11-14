@@ -83,6 +83,16 @@ test('defaults and custom cases import as separate files', () => {
   assert.deepEqual(withValues.values['POST /api/orders'].customerName, ['Grace', 'Ada'])
   assert.deepEqual(casesDocument(withValues).values['POST /api/orders'].customerName, ['Grace', 'Ada'])
   assert.equal(casesDocument(parseCases('{"kind":"cases","operations":{}}')).values, undefined)
+  assert.equal(casesDocument(parseCases('{"kind":"cases","operations":{}}')).checks, undefined)
+  const withChecks = parseCases(JSON.stringify({
+    kind: 'cases',
+    operations: {},
+    checks: { 'GET /api/orders': { columns: ['exceptions[].code', 'exceptions[].message'], rows: { 'disallowed:status is not an allowed value': { status: '422', values: { 'exceptions[].message': '@{field}' } } } } },
+    errors: { 'GET /api/orders': [{ name: 'Missing', status: '404', field: 'id', code: 'NotFound', message: 'no @{field}' }] },
+  }))
+  assert.equal(withChecks.checks['GET /api/orders'].rows['disallowed:status is not an allowed value'].status, '422')
+  assert.equal(withChecks.errors['GET /api/orders'][0].message, 'no @{field}')
+  assert.equal(casesDocument(withChecks).checks['GET /api/orders'].columns[1], 'exceptions[].message')
   assert.throws(() => parseCases('{"kind":"defaults","global":{}}'), /custom cases/)
   assert.deepEqual(defaults.variables, {})
 })

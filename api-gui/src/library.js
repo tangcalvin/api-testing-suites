@@ -14,7 +14,7 @@ export function emptyDefaults() {
 }
 
 export function emptyCases() {
-  return { operations: {}, exclusions: {}, values: {} }
+  return { operations: {}, exclusions: {}, values: {}, errors: {}, checks: {} }
 }
 
 export function loadStored(key, empty, parse) {
@@ -54,12 +54,16 @@ export function defaultsDocument(defaults) {
 export function casesDocument(cases) {
   const exclusions = cases.exclusions || {}
   const values = cases.values || {}
+  const errors = cases.errors || {}
+  const checks = cases.checks || {}
   return {
     version: 1,
     kind: 'cases',
     operations: cases.operations || {},
     ...(Object.keys(exclusions).length > 0 ? { exclusions } : {}),
     ...(Object.keys(values).length > 0 ? { values } : {}),
+    ...(Object.keys(errors).length > 0 ? { errors } : {}),
+    ...(Object.keys(checks).length > 0 ? { checks } : {}),
   }
 }
 
@@ -234,7 +238,83 @@ export function parseCases(value) {
     }
     operations[operationId] = list.map(normalizeCase).filter(Boolean)
   }
-  return { operations, exclusions: exclusionMaps(data.exclusions), values: combinationValueMaps(data.values) }
+  return {
+    operations,
+    exclusions: exclusionMaps(data.exclusions),
+    values: combinationValueMaps(data.values),
+    errors: errorMaps(data.errors),
+    checks: errorCheckMaps(data.checks),
+  }
+}
+
+function errorMaps(source) {
+  const errors = {}
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return errors
+  for (const [operationId, list] of Object.entries(source)) {
+    if (!Array.isArray(list)) continue
+    const next = list.map(normalizeErrorCase).filter(Boolean)
+    if (next.length > 0) errors[operationId] = next
+  }
+  return errors
+}
+
+function normalizeErrorCase(item) {
+  if (!item || typeof item !== 'object' || Array.isArray(item)) return null
+  const status = item.status === undefined || item.status === null ? '400' : String(item.status).trim()
+  return {
+    id: typeof item.id === 'string' && item.id ? item.id : newId(),
+    name: typeof item.name === 'string' && item.name.trim() ? item.name.trim() : 'Custom error',
+    status: status || '400',
+    field: typeof item.field === 'string' ? item.field.trim() : '',
+    code: typeof item.code === 'string' ? item.code.trim() : '',
+    message: typeof item.message === 'string' ? item.message : '',
+    values: errorValueMap(item.values),
+    value: item.value === undefined || item.value === null ? '' : String(item.value),
+    omit: Boolean(item.omit),
+  }
+}
+
+function errorValueMap(source) {
+  const values = {}
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return values
+  for (const [path, raw] of Object.entries(source)) {
+    if (typeof raw !== 'string') continue
+    values[path] = raw
+  }
+  return values
+}
+
+function errorCheckMaps(source) {
+  const checks = {}
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return checks
+  for (const [operationId, item] of Object.entries(source)) {
+    const saved = normalizeErrorChecks(item)
+    if (saved) checks[operationId] = saved
+  }
+  return checks
+}
+
+function normalizeErrorChecks(item) {
+  if (!item || typeof item !== 'object' || Array.isArray(item)) return null
+  const columns = Array.isArray(item.columns)
+    ? item.columns.map((column) => String(column || '').trim()).filter(Boolean)
+    : []
+  const rows = {}
+  const source = item.rows && typeof item.rows === 'object' && !Array.isArray(item.rows) ? item.rows : {}
+  for (const [key, row] of Object.entries(source)) {
+    const next = normalizeErrorRow(row)
+    if (next) rows[key] = next
+  }
+  if (columns.length === 0 && Object.keys(rows).length === 0 && !Array.isArray(item.columns)) return null
+  return { columns, rows }
+}
+
+function normalizeErrorRow(row) {
+  if (!row || typeof row !== 'object' || Array.isArray(row)) return null
+  const status = row.status === undefined || row.status === null ? '' : String(row.status).replace(/\D/g, '').slice(0, 3)
+  const values = errorValueMap(row.values)
+  if (!status && Object.keys(values).length === 0) return null
+  return { ...(status ? { status } : {}), values }
 }
 
 function combinationValueMaps(source) {
