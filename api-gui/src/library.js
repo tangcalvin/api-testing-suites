@@ -9,8 +9,17 @@ export const EXAMPLE_DEFAULTS_URL = '/examples/field-defaults.json'
 export const EXAMPLE_CASES_URL = '/examples/custom-cases.json'
 export const EXAMPLE_PROFILES_URL = '/examples/clients.yaml'
 
+export const DEFAULT_RATE = '30'
+
 export function emptyDefaults() {
-  return { variables: {}, global: {}, headers: {}, operations: {}, responses: {}, extraStatuses: {} }
+  return { variables: {}, global: {}, headers: {}, operations: {}, responses: {}, extraStatuses: {}, tps: DEFAULT_RATE }
+}
+
+export function storedRate(value) {
+  if (value == null || String(value).trim() === '') return DEFAULT_RATE
+  const rate = Number(String(value).trim())
+  if (!Number.isFinite(rate) || rate <= 0) return DEFAULT_RATE
+  return String(value).trim()
 }
 
 export function emptyCases() {
@@ -46,6 +55,7 @@ export function defaultsDocument(defaults) {
     global: defaults.global || {},
     headers: defaults.headers || {},
     operations: defaults.operations || {},
+    ...(storedRate(defaults.tps) !== DEFAULT_RATE ? { tps: storedRate(defaults.tps) } : {}),
     ...(Object.keys(defaults.responses || {}).length > 0 ? { responses: defaults.responses } : {}),
     ...(Object.keys(defaults.extraStatuses || {}).length > 0 ? { extraStatuses: defaults.extraStatuses } : {}),
   }
@@ -81,6 +91,7 @@ export function parseDefaults(value) {
     global: valueMap(data.global),
     headers: valueMap(data.headers),
     operations: operationMaps(data.operations),
+    tps: storedRate(data.tps),
     responses: responseMaps(data.responses),
     extraStatuses: statusLists(data.extraStatuses),
   }

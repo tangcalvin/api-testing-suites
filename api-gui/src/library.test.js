@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { readFileSync } from 'node:fs'
-import { acceptsTemporal, applyDefaults, casesDocument, clockToken, evaluateDynamics, formatClock, keptTemporal, parseCases, parseDefaults, parseProfiles, parseProfilesText, profileLabel, profilesDocument, profilesYaml, resolveCases, sampleSource, substitute, temporalDraftOk, uuidToken } from './library.js'
+import { acceptsTemporal, applyDefaults, casesDocument, clockToken, defaultsDocument, evaluateDynamics, formatClock, keptTemporal, parseCases, parseDefaults, parseProfiles, parseProfilesText, profileLabel, profilesDocument, profilesYaml, resolveCases, sampleSource, storedRate, substitute, temporalDraftOk, uuidToken } from './library.js'
 
 const orderNumber = { name: 'orderNumber', location: 'body', type: 'string', sample: 'Sample', values: [], constraints: {} }
 const queryNumber = { name: 'orderNumber', location: 'query', type: 'string', sample: '', values: [], constraints: {} }
@@ -36,6 +36,13 @@ test('defaults and custom cases import as separate files', () => {
   assert.equal(defaults.global.status, 'CONFIRMED')
   assert.equal(defaults.global.ignored, undefined)
   assert.equal(defaults.operations['POST /api/orders'].quantity, 9)
+  assert.equal(defaults.tps, '30')
+  assert.equal(defaultsDocument(defaults).tps, undefined)
+  const rated = parseDefaults(JSON.stringify({ kind: 'defaults', tps: '12' }))
+  assert.equal(rated.tps, '12')
+  assert.equal(defaultsDocument(rated).tps, '12')
+  assert.equal(storedRate('0'), '30')
+  assert.equal(storedRate(' 0.5 '), '0.5')
   assert.deepEqual(defaults.responses, {})
   const withResponses = parseDefaults(JSON.stringify({
     kind: 'defaults',

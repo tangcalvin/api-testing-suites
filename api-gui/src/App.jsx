@@ -113,6 +113,7 @@ import {
   evaluateDynamics,
   emptyCases,
   emptyDefaults,
+  storedRate,
   emptyOauth,
   hasSavedCases,
   hasSavedDefaults,
@@ -210,6 +211,7 @@ export default function App() {
   const [savedRuns, setSavedRuns] = useState([])
   const [savedRunName, setSavedRunName] = useState('')
   const [tps, setTps] = useState('30')
+  const pageRate = useRef({ id: '', touched: false })
   const [activity, setActivity] = useState('')
   const [running, setRunning] = useState(false)
   const [stopRequested, setStopRequested] = useState(false)
@@ -250,6 +252,15 @@ export default function App() {
     ? Math.max(0, caseCount(resolvedFields) - planned.length)
     : 0
   const savedRecordId = selected ? customCases.ids?.[selected.id] : undefined
+  useEffect(() => {
+    const id = `${activeId || ''}:${selectedId || ''}`
+    if (pageRate.current.id !== id) {
+      pageRate.current = { id, touched: false }
+      setTps(storedRate(defaults.tps))
+      return
+    }
+    if (!pageRate.current.touched) setTps(storedRate(defaults.tps))
+  }, [activeId, selectedId, defaults.tps])
   const preparation = useMemo(
     () => fixtureSteps(selected, operations, defaults, savedRecordId),
     [defaults, operations, selected, savedRecordId],
@@ -1332,7 +1343,10 @@ export default function App() {
                       type="number"
                       value={tps}
                       disabled={running}
-                      onChange={(event) => setTps(event.target.value)}
+                      onChange={(event) => {
+                        pageRate.current.touched = true
+                        setTps(event.target.value)
+                      }}
                       sx={{ width: { xs: '100%', sm: 170 } }}
                       slotProps={{ htmlInput: { min: 0.1, step: 1 } }}
                     />
@@ -1400,6 +1414,7 @@ export default function App() {
             onRemoveNamed={removeNamed}
             onAddNamed={addNamed}
             onOauth={updateOauth}
+            onRate={(value) => setDefaults((current) => ({ ...current, tps: value }))}
             onExport={() => downloadText('clients.yaml', profilesYaml(commitProfiles(), activeId), 'application/yaml')}
             onImport={(file) => importLibrary(file, 'defaults')}
             onImportProfiles={(file) => importLibrary(file, 'profiles')}
@@ -2359,6 +2374,14 @@ function CustomCases({ operation, fields, defaults, exclusive = [], responses = 
   )
 }
 
+const SETTING_SECTIONS = [
+  { id: 'client', label: 'Client' },
+  { id: 'variables', label: 'Variables' },
+  { id: 'defaults', label: 'Defaults' },
+  { id: 'headers', label: 'Headers' },
+  { id: 'token', label: 'Access token' },
+]
+
 function LibraryDialog({
   open,
   defaults,
@@ -2382,152 +2405,236 @@ function LibraryDialog({
   onRemoveNamed,
   onAddNamed,
   onOauth,
+  onRate,
   onExport,
   onImport,
   onImportProfiles,
   onDismissNotice,
 }) {
+  const [section, setSection] = useState('client')
+  useEffect(() => {
+    if (open) setSection('client')
+  }, [open])
+  const counts = {
+    variables: Object.keys(defaults.variables || {}).length,
+    defaults: Object.keys(defaults.global || {}).length,
+    headers: Object.keys(defaults.headers || {}).length,
+  }
+  const clientLabel = [profileName, oauth.clientId].map((item) => String(item || '').trim()).filter(Boolean).join(' · ')
   return (
     <Dialog
       open={open}
       onClose={onClose}
       fullWidth
       maxWidth="lg"
-      slotProps={{ paper: { sx: { height: 'min(820px, calc(100% - 48px))' } } }}
+      slotProps={{ paper: { sx: { height: 'min(760px, calc(100% - 48px))', display: 'flex', flexDirection: 'column' } } }}
     >
-      <DialogTitle sx={{ pb: 0.5 }}>Setting</DialogTitle>
-      <DialogContent sx={{ minHeight: 0, minWidth: 0 }}>
-        <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
-          Each client has its own variables, defaults, custom cases, and signing key. Switch clients from the menu in the top bar. Write ${'{'}name{'}'} for a variable. Date, timestamp, and UUID values are filled when the request is sent: ${'{'}today+1d{'}'}, ${'{'}now-2h{'}'}, ${'{'}uuid:12{'}'}.
-        </Typography>
-        <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ mb: 2, alignItems: { sm: 'center' } }}>
-          <TextField
-            label="Client name"
-            value={profileName}
-            placeholder={oauth.clientId || 'Uses the client ID when blank'}
-            onChange={(event) => onRenameProfile(event.target.value)}
-            fullWidth
-          />
-          <Button onClick={onAddProfile} sx={{ flexShrink: 0 }}>Add</Button>
-          <Button onClick={onDuplicateProfile} sx={{ flexShrink: 0 }}>Duplicate</Button>
-          <Button onClick={onRemoveProfile} disabled={profileCount < 2} sx={{ flexShrink: 0 }}>Remove</Button>
-        </Stack>
-        <NamedMap
-          title="Variables"
-          typed
-          entries={Object.entries(defaults.variables || {})}
-          addLabel="Add variable"
-          onAdd={onAddVariable}
-          onRename={onRenameVariable}
-          onValue={onWriteVariable}
-          onRemove={onRemoveVariable}
-        />
-        <NamedMap
-          title="Global defaults"
-          typed
-          hint="Used for every field with this name, on every operation. A date, timestamp, or UUID is generated for each request."
-          entries={Object.entries(defaults.global || {})}
-          addLabel="Add default"
-          onAdd={() => onAddNamed('global', 'field')}
-          onRename={(current, next) => onRenameNamed('global', current, next)}
-          onValue={(name, value) => onWriteNamed('global', name, value)}
-          onRemove={(name) => onRemoveNamed('global', name)}
-        />
-        <NamedMap
-          title="Request headers"
-          hint="Extra headers sent with every check. Authorization is replaced by the access token when this client has a token URL and key."
-          entries={Object.entries(defaults.headers || {})}
-          addLabel="Add header"
-          onAdd={() => onAddNamed('headers', 'Authorization')}
-          onRename={(current, next) => onRenameNamed('headers', current, next)}
-          onValue={(name, value) => onWriteNamed('headers', name, value)}
-          onRemove={(name) => onRemoveNamed('headers', name)}
-        />
-        <Typography variant="subtitle2" sx={{ mt: 2, mb: 0.5 }}>Access token</Typography>
-        <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
-          Before every HTTP request, the tester signs a client assertion with this key and requests an access token through /idp, then sends it as Authorization: Bearer. Token calls use /idp on this page and are forwarded to the OAuth base URL. The token path is the path on that server. Audience is the base URL plus that path. HTTPS certificate checks are skipped. Leave the token path blank to call the API without a token.
-        </Typography>
-        <TextField
-          label="OAuth base URL"
-          value={idpBase}
-          placeholder="https://idp.example"
-          onChange={(event) => {
-            const next = event.target.value
-            onIdpBase(next)
-            onOauth({ audience: derivedAudience(oauth.tokenUrl, next) })
-          }}
-          fullWidth
-          sx={{ mb: 1.25 }}
-        />
-        <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: '1fr 1fr' }, gap: 1.25 }}>
-          <TextField
-            label="Token path"
-            placeholder="/oauth/token"
-            value={relativeTokenPath(oauth.tokenUrl)}
-            onChange={(event) => {
-              const tokenUrl = relativeTokenPath(event.target.value)
-              onOauth({ tokenUrl, audience: derivedAudience(tokenUrl, idpBase) })
-            }}
-            fullWidth
-          />
-          <TextField label="Client ID" value={oauth.clientId} onChange={(event) => onOauth({ clientId: event.target.value })} fullWidth />
-          <TextField
-            label="Audience"
-            placeholder="OAuth base URL + token path"
-            value={oauth.audience || derivedAudience(oauth.tokenUrl, idpBase)}
-            onChange={(event) => onOauth({ audience: event.target.value })}
-            helperText="OAuth base URL + token path"
-            fullWidth
-          />
-          <TextField select label="Algorithm" value={oauth.algorithm} onChange={(event) => onOauth({ algorithm: event.target.value })}>
-            <MenuItem value="RS256">RS256</MenuItem>
-            <MenuItem value="ES256">ES256</MenuItem>
-            <MenuItem value="HS256">HS256</MenuItem>
-          </TextField>
-          <TextField label="Scope" value={oauth.scope} onChange={(event) => onOauth({ scope: event.target.value })} fullWidth />
-          <TextField label="Lifetime (seconds)" value={oauth.lifetime} onChange={(event) => onOauth({ lifetime: event.target.value })} fullWidth />
+      <DialogTitle sx={{ pb: 1.25, borderBottom: 1, borderColor: 'divider' }}>
+        <Typography variant="h6" sx={{ fontSize: 18, lineHeight: 1.3 }}>Setting</Typography>
+        <Typography variant="body2" color="text.secondary" noWrap>{clientLabel || 'Client'}</Typography>
+      </DialogTitle>
+      <DialogContent sx={{ p: 0, display: 'flex', flex: 1, minHeight: 0, overflow: 'hidden' }}>
+        <List dense disablePadding sx={{ width: { xs: '100%', sm: 196 }, flexShrink: 0, borderRight: { sm: 1 }, borderBottom: { xs: 1, sm: 0 }, borderColor: 'divider', py: 1, display: { xs: 'none', sm: 'block' }, bgcolor: '#f8fafc' }}>
+          {SETTING_SECTIONS.map((item) => (
+            <ListItemButton
+              key={item.id}
+              selected={section === item.id}
+              onClick={() => setSection(item.id)}
+              sx={{ mx: 1, borderRadius: 1, mb: 0.25, '&.Mui-selected': { bgcolor: '#e8eef8' } }}
+            >
+              <ListItemText primary={item.label} slotProps={{ primary: { variant: 'body2', sx: { fontWeight: section === item.id ? 700 : 500 } } }} />
+              {counts[item.id] != null && (
+                <Typography variant="caption" color="text.secondary">{counts[item.id]}</Typography>
+              )}
+            </ListItemButton>
+          ))}
+        </List>
+        <Box sx={{ flex: 1, minWidth: 0, overflow: 'auto', px: { xs: 2, sm: 3 }, py: 2.25 }}>
+          <Stack direction="row" spacing={0.75} sx={{ mb: 2, display: { sm: 'none' }, flexWrap: 'wrap' }}>
+            {SETTING_SECTIONS.map((item) => (
+              <Chip
+                key={item.id}
+                label={counts[item.id] != null ? `${item.label} ${counts[item.id]}` : item.label}
+                onClick={() => setSection(item.id)}
+                variant={section === item.id ? 'filled' : 'outlined'}
+                sx={section === item.id ? { bgcolor: '#e8eef8', fontWeight: 700 } : {}}
+              />
+            ))}
+          </Stack>
+          {notice && <Alert severity="info" sx={{ mb: 2 }} onClose={onDismissNotice}>{notice}</Alert>}
+          {section === 'client' && (
+            <SettingSection
+              title="Client"
+              hint="Name and request rate for this client. Switch clients from the menu in the top bar."
+            >
+              <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: 'minmax(0, 1fr) 200px' }, gap: 1.5 }}>
+                <TextField
+                  size="small"
+                  label="Client name"
+                  value={profileName}
+                  placeholder={oauth.clientId || 'Uses the client ID when blank'}
+                  onChange={(event) => onRenameProfile(event.target.value)}
+                  fullWidth
+                />
+                <TextField
+                  size="small"
+                  label="Requests / second"
+                  type="number"
+                  value={defaults.tps ?? '30'}
+                  onChange={(event) => onRate(event.target.value)}
+                  helperText="Each endpoint starts here."
+                  slotProps={{ htmlInput: { min: 0.1, step: 1 } }}
+                />
+              </Box>
+              <Stack direction="row" spacing={1} sx={{ mt: 2 }}>
+                <Button size="small" variant="outlined" onClick={onAddProfile}>Add</Button>
+                <Button size="small" variant="outlined" onClick={onDuplicateProfile}>Duplicate</Button>
+                <Button size="small" variant="outlined" color="inherit" onClick={onRemoveProfile} disabled={profileCount < 2}>Remove</Button>
+              </Stack>
+            </SettingSection>
+          )}
+          {section === 'variables' && (
+            <NamedMap
+              title="Variables"
+              typed
+              hint="Write ${name} in a default or expected value. ${today+1d}, ${now-2h}, and ${uuid:12} are filled when the request is sent."
+              entries={Object.entries(defaults.variables || {})}
+              addLabel="Add variable"
+              onAdd={onAddVariable}
+              onRename={onRenameVariable}
+              onValue={onWriteVariable}
+              onRemove={onRemoveVariable}
+            />
+          )}
+          {section === 'defaults' && (
+            <NamedMap
+              title="Defaults"
+              typed
+              hint="Used wherever that field name appears. A value saved on one endpoint replaces it."
+              entries={Object.entries(defaults.global || {})}
+              addLabel="Add default"
+              onAdd={() => onAddNamed('global', 'field')}
+              onRename={(current, next) => onRenameNamed('global', current, next)}
+              onValue={(name, value) => onWriteNamed('global', name, value)}
+              onRemove={(name) => onRemoveNamed('global', name)}
+            />
+          )}
+          {section === 'headers' && (
+            <NamedMap
+              title="Headers"
+              hint="Sent with every check. Authorization is replaced when this client requests an access token."
+              entries={Object.entries(defaults.headers || {})}
+              addLabel="Add header"
+              onAdd={() => onAddNamed('headers', 'Authorization')}
+              onRename={(current, next) => onRenameNamed('headers', current, next)}
+              onValue={(name, value) => onWriteNamed('headers', name, value)}
+              onRemove={(name) => onRemoveNamed('headers', name)}
+            />
+          )}
+          {section === 'token' && (
+            <SettingSection
+              title="Access token"
+              hint="Each request can send a bearer token from this OAuth server. Leave the token path blank to call the API without one."
+            >
+              <TextField
+                size="small"
+                label="OAuth base URL"
+                value={idpBase}
+                placeholder="https://idp.example"
+                onChange={(event) => {
+                  const next = event.target.value
+                  onIdpBase(next)
+                  onOauth({ audience: derivedAudience(oauth.tokenUrl, next) })
+                }}
+                fullWidth
+                sx={{ mb: 1.5 }}
+              />
+              <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: '1fr 1fr' }, gap: 1.5 }}>
+                <TextField
+                  size="small"
+                  label="Token path"
+                  placeholder="/oauth/token"
+                  value={relativeTokenPath(oauth.tokenUrl)}
+                  onChange={(event) => {
+                    const tokenUrl = relativeTokenPath(event.target.value)
+                    onOauth({ tokenUrl, audience: derivedAudience(tokenUrl, idpBase) })
+                  }}
+                  fullWidth
+                />
+                <TextField size="small" label="Client ID" value={oauth.clientId} onChange={(event) => onOauth({ clientId: event.target.value })} fullWidth />
+                <TextField
+                  size="small"
+                  label="Audience"
+                  placeholder="OAuth base URL + token path"
+                  value={oauth.audience || derivedAudience(oauth.tokenUrl, idpBase)}
+                  onChange={(event) => onOauth({ audience: event.target.value })}
+                  helperText="OAuth base URL + token path"
+                  fullWidth
+                />
+                <TextField size="small" select label="Algorithm" value={oauth.algorithm} onChange={(event) => onOauth({ algorithm: event.target.value })}>
+                  <MenuItem value="RS256">RS256</MenuItem>
+                  <MenuItem value="ES256">ES256</MenuItem>
+                  <MenuItem value="HS256">HS256</MenuItem>
+                </TextField>
+                <TextField size="small" label="Scope" value={oauth.scope} onChange={(event) => onOauth({ scope: event.target.value })} fullWidth />
+                <TextField size="small" label="Lifetime (seconds)" value={oauth.lifetime} onChange={(event) => onOauth({ lifetime: event.target.value })} fullWidth />
+              </Box>
+              <TextField
+                size="small"
+                label={oauth.algorithm === 'HS256' ? 'Shared secret' : 'Private key (PKCS#8 PEM)'}
+                value={oauth.privateKey}
+                onChange={(event) => onOauth({ privateKey: event.target.value })}
+                fullWidth
+                multiline
+                minRows={4}
+                sx={{ mt: 1.5, '& textarea': { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12 } }}
+              />
+            </SettingSection>
+          )}
         </Box>
-        <TextField
-          label={oauth.algorithm === 'HS256' ? 'Shared secret' : 'Private key (PKCS#8 PEM)'}
-          value={oauth.privateKey}
-          onChange={(event) => onOauth({ privateKey: event.target.value })}
-          fullWidth
-          multiline
-          minRows={4}
-          sx={{ mt: 1.25, '& textarea': { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12 } }}
-        />
-        {notice && <Alert severity="info" sx={{ mt: 1.5 }} onClose={onDismissNotice}>{notice}</Alert>}
       </DialogContent>
-      <DialogActions sx={{ px: 3, pb: 2, flexWrap: 'wrap', gap: 1 }}>
-        <ImportButton label="Import defaults" onFile={onImport} />
-        <ImportButton label="Import YAML" accept=".yaml,.yml,.json,application/json,text/yaml" onFile={onImportProfiles} />
-        <Button variant="outlined" startIcon={<FileDownloadOutlinedIcon />} onClick={onExport}>Export YAML</Button>
+      <DialogActions sx={{ px: 2.5, py: 1.5, borderTop: 1, borderColor: 'divider', justifyContent: 'space-between', flexWrap: 'wrap', gap: 1 }}>
+        <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: 'wrap' }}>
+          <ImportButton label="Import defaults" onFile={onImport} />
+          <ImportButton label="Import clients" accept=".yaml,.yml,.json,application/json,text/yaml" onFile={onImportProfiles} />
+          <Button size="small" variant="outlined" startIcon={<FileDownloadOutlinedIcon />} onClick={onExport}>Export</Button>
+        </Stack>
         <Button variant="contained" onClick={onClose}>Done</Button>
       </DialogActions>
     </Dialog>
   )
 }
 
+function SettingSection({ title, hint, children }) {
+  return (
+    <Box>
+      <Typography variant="subtitle1" sx={{ fontWeight: 700, lineHeight: 1.3 }}>{title}</Typography>
+      {hint && <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5, mb: 2 }}>{hint}</Typography>}
+      {children}
+    </Box>
+  )
+}
+
 function NamedMap({ title, hint, entries, addLabel, onAdd, onRename, onValue, onRemove, typed = false }) {
   return (
-    <Box sx={{ mb: 2 }}>
-      <Stack direction="row" spacing={1} sx={{ alignItems: 'center', mb: 0.75 }}>
-        <Box sx={{ flex: 1 }}>
-          <Typography variant="subtitle2">{title}</Typography>
-          {hint && <Typography variant="caption" color="text.secondary">{hint}</Typography>}
+    <Box>
+      <Stack direction="row" spacing={1} sx={{ alignItems: 'flex-start', mb: 1.5 }}>
+        <Box sx={{ flex: 1, minWidth: 0 }}>
+          <Typography variant="subtitle1" sx={{ fontWeight: 700, lineHeight: 1.3 }}>{title}</Typography>
+          {hint && <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>{hint}</Typography>}
         </Box>
-        <Button size="small" onClick={onAdd}>{addLabel}</Button>
+        <Button size="small" variant="outlined" onClick={onAdd} sx={{ flexShrink: 0 }}>{addLabel}</Button>
       </Stack>
-      <Box sx={{ overflow: 'auto', maxHeight: 280, minWidth: 0, border: 1, borderColor: 'divider', borderRadius: 1 }}>
+      <Box sx={{ minWidth: 0, border: 1, borderColor: 'divider', borderRadius: 1, overflow: 'auto' }}>
         {entries.length === 0 ? (
-          <Typography variant="body2" color="text.secondary" sx={{ px: 1.5, py: 1.25 }}>None yet.</Typography>
+          <Typography variant="body2" color="text.secondary" sx={{ px: 1.5, py: 1.5 }}>None yet.</Typography>
         ) : (
-          <Table size="small" stickyHeader sx={{ minWidth: typed ? 520 : 420 }}>
+          <Table size="small" sx={{ width: '100%' }}>
             <TableHead>
               <TableRow>
-                <TableCell sx={{ width: typed ? 168 : '36%' }}>Name</TableCell>
-                <TableCell>Value</TableCell>
-                <TableCell width={88} />
+                <TableCell sx={{ width: typed ? '34%' : '36%', bgcolor: '#f8fafc', color: 'text.secondary', fontWeight: 700 }}>Name</TableCell>
+                <TableCell sx={{ bgcolor: '#f8fafc', color: 'text.secondary', fontWeight: 700 }}>Value</TableCell>
+                <TableCell width={88} sx={{ bgcolor: '#f8fafc' }} />
               </TableRow>
             </TableHead>
             <TableBody>
