@@ -138,7 +138,7 @@ const MODES = [
   {
     id: 'combination',
     label: 'Combinations',
-    detail: 'Crosses each selected enum. An optional enum includes null and omit, and a null already in the enum is listed once. An enum that is not crossed uses one selected value. A string or number uses its default plus any other values you add, and can include null and omit when it is optional. Other optional query filters stay off the request. Skip rules are left out. A check passes on a success status, and when each expected response value matches.',
+    detail: 'Crosses each selected enum. An optional enum includes null and omit, and a null already in the enum is listed once. An optional object is sent filled, as null, and omitted. An enum that is not crossed uses one selected value. A string or number uses its default plus any other values you add, and can include null and omit when it is optional. Other optional query filters stay off the request. Skip rules are left out. A check passes on a success status, and when each expected response value matches.',
   },
   {
     id: 'individual',
@@ -1110,7 +1110,7 @@ export default function App() {
                               field={field}
                               resolved={resolved}
                               source={source}
-                              hidden={field.enum && resolved.vary}
+                              hidden={(field.enum || (field.object && !field.required)) && resolved.vary}
                               onChange={(sample) => writeEndpoint(field, sample)}
                               onInherit={() => writeEndpoint(field, '', true)}
                               onObject={(next) => writeObject(field, next)}
@@ -1118,7 +1118,7 @@ export default function App() {
                           </TableCell>
                           {activeMode === 'combination' && (
                             <TableCell>
-                              {field.enum && resolved.vary ? (
+                              {(field.enum || (field.object && !field.required)) && resolved.vary ? (
                                 <Stack direction="row" spacing={0.5} useFlexGap sx={{ flexWrap: 'wrap', alignItems: 'center' }}>
                                   {resolved.values.map((value, index) => <Chip key={`${valueText(value)}-${index}`} label={loopLabel(value)} size="small" />)}
                                 </Stack>
@@ -3096,6 +3096,7 @@ function FieldSummary({ field, depth, exclusive }) {
 }
 
 function DefaultValue({ field, resolved, source, hidden = false, onChange, onInherit, onObject }) {
+  if (hidden) return null
   if (field.object) {
     return <ObjectChoice value={objectChoice(resolved.sample)} onChange={onObject} />
   }
@@ -3167,6 +3168,7 @@ function constraintLabels(field) {
 function loopLabel(value) {
   if (isOmitted(value)) return 'Omit'
   if (value == null) return 'Null'
+  if (value === OBJECT_FIELDS) return 'Fields'
   return valueText(value)
 }
 

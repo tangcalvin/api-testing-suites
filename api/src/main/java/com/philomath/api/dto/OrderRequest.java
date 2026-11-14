@@ -104,7 +104,6 @@ public record OrderRequest(
         @Size(max = 20)
         String promotionCode,
 
-        @NotNull
         @Valid
         DeliveryAddress deliveryAddress
 ) {

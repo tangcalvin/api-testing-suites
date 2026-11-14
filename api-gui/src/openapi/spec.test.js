@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { OMIT, individualChoices, buildIndividualCases, applyErrorOverrides, applyErrorRowToGroup, buildCases, buildCustomCases, buildCustomErrorCases, buildErrorCases, caseCount, detectPagination, judge, listOperations, operationGroups, parseSpecText, planContinuation, responseChecks, responseViews, responsesForMode, scalarCombinationField, specGaps, textCombinationField, viewsWithStatuses, withTextCombinationValues } from './spec.js'
+import { OMIT, OBJECT_FIELDS, individualChoices, buildIndividualCases, applyErrorOverrides, applyErrorRowToGroup, buildCases, buildCustomCases, buildCustomErrorCases, buildErrorCases, caseCount, detectPagination, judge, listOperations, operationGroups, parseSpecText, planContinuation, responseChecks, responseViews, responsesForMode, scalarCombinationField, specGaps, textCombinationField, viewsWithStatuses, withTextCombinationValues } from './spec.js'
 
 const SPEC = `
 openapi: 3.1.0
@@ -586,6 +586,55 @@ paths:
   assert.equal(cases[2].body.orderNumber, 'ORD-1001')
   assert.equal(cases[3].body.status, undefined)
   assert.equal(cases[3].label, 'status=omit')
+})
+
+test('an optional object is filled, null, or omitted in combinations', () => {
+  const fields = listOperations(parseSpecText(`
+openapi: 3.1.0
+paths:
+  /api/orders:
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status:
+                  type: string
+                  enum: [DRAFT, CONFIRMED]
+                deliveryAddress:
+                  type: object
+                  required: [line1, city]
+                  properties:
+                    line1:
+                      type: string
+                      example: 1 Road
+                    city:
+                      type: string
+                      enum: [Hong Kong, Kowloon]
+`))[0].fields
+  const address = fields.find((field) => field.name === 'deliveryAddress')
+  assert.equal(address.required, false)
+  assert.equal(address.vary, true)
+  assert.deepEqual(address.values, [OBJECT_FIELDS, null, OMIT])
+  const cases = buildCases(fields)
+  assert.equal(caseCount(fields), 8)
+  assert.equal(cases.length, 8)
+  const filled = cases.filter((item) => item.varied.deliveryAddress === OBJECT_FIELDS)
+  assert.equal(filled.length, 4)
+  assert.equal(filled[0].body.deliveryAddress.line1, '1 Road')
+  assert.ok(filled.some((item) => item.body.deliveryAddress.city === 'Hong Kong' && item.body.status === 'DRAFT'))
+  assert.ok(filled.some((item) => item.body.deliveryAddress.city === 'Kowloon' && item.body.status === 'CONFIRMED'))
+  const nulled = cases.filter((item) => item.body.deliveryAddress === null)
+  assert.equal(nulled.length, 2)
+  assert.equal(nulled[0].body.status, 'DRAFT')
+  assert.equal(nulled[1].body.status, 'CONFIRMED')
+  assert.equal(nulled[0].varied['deliveryAddress.city'], undefined)
+  const omitted = cases.filter((item) => item.body.deliveryAddress === undefined && item.varied.deliveryAddress === OMIT)
+  assert.equal(omitted.length, 2)
+  assert.equal(omitted[0].body.status, 'DRAFT')
 })
 
 test('builds the cartesian product of enum fields and keeps other fields fixed', () => {

@@ -153,21 +153,11 @@ export function specGaps(operations, profiles) {
 }
 
 export function caseCount(fields) {
-  const varied = fields.filter((field) => field.vary && field.values.length > 0)
-  if (varied.length === 0) {
-    return 1
-  }
-  return varied.reduce((count, field) => count * field.values.length, 1)
+  return combinationPlans(fields).length
 }
 
 export function buildCases(fields, exclusions = {}) {
-  const varied = fields.filter((field) => field.vary && field.values.length > 0)
-  const groups = varied.map((field) => field.values.map((value) => [field.name, value]))
-  const combinations = groups.reduce(
-    (current, group) => current.flatMap((prefix) => group.map((pair) => [...prefix, pair])),
-    [[]],
-  )
-  return combinations.map((pairs) => {
+  return combinationPlans(fields).map((pairs) => {
     const overrides = Object.fromEntries(pairs)
     return {
       kind: 'combination',
@@ -177,6 +167,37 @@ export function buildCases(fields, exclusions = {}) {
       ...assemble(fields, overrides, { combination: true }),
     }
   }).filter((item) => !combinationExcluded(fields, item.varied, exclusions))
+}
+
+function combinationPlans(fields, parent = '') {
+  const axes = []
+  for (const field of fields) {
+    if (!directChild(field.name, parent)) continue
+    if (field.object && !field.required && field.vary !== false && field.location === 'body') {
+      const nested = combinationPlans(fields, field.name)
+      const filled = nested.length
+        ? nested.map((pairs) => [[field.name, OBJECT_FIELDS], ...pairs])
+        : [[[field.name, OBJECT_FIELDS]]]
+      axes.push([...filled, [[field.name, null]], [[field.name, OMIT]]])
+    } else if (field.object) {
+      const nested = combinationPlans(fields, field.name)
+      if (nested.length) axes.push(nested)
+    } else if (field.vary && field.values.length > 0) {
+      axes.push(field.values.map((value) => [[field.name, value]]))
+    }
+  }
+  if (axes.length === 0) return parent ? [] : [[]]
+  return axes.reduce(
+    (current, axis) => current.flatMap((prefix) => axis.map((pairs) => [...prefix, ...pairs])),
+    [[]],
+  )
+}
+
+function directChild(name, parent) {
+  const text = String(name || '')
+  if (!parent) return !text.includes('.')
+  const prefix = `${parent}.`
+  return text.startsWith(prefix) && !text.slice(prefix.length).includes('.')
 }
 
 function combinationExcluded(fields, varied, exclusions) {
@@ -231,6 +252,8 @@ export function objectChoice(value) {
 export function valueText(value) {
   if (isOmitted(value)) return 'omit'
   if (value === null) return 'null'
+  if (value === OBJECT_FIELDS) return 'fields'
+  if (value === OBJECT_EMPTY) return 'empty'
   if (value === '') return 'blank'
   return String(value)
 }
@@ -1659,6 +1682,7 @@ function fieldFromSchema(name, schema, required, location, object = false) {
   const isEnum = Array.isArray(schema.enum) && schema.enum.length > 0
   // Optional query filters stay empty so a list call is not narrowed to a placeholder range.
   const optionalQuery = location === 'query' && !required
+  const optionalObject = object && !required && location === 'body'
   const sample = object || optionalQuery ? undefined : sampleFor(schema, name, required)
   return {
     name,
@@ -1669,8 +1693,8 @@ function fieldFromSchema(name, schema, required, location, object = false) {
     format: object ? '' : (schema.format || ''),
     required,
     members: isEnum ? uniqueMembers(values) : undefined,
-    values: object ? [] : (isEnum ? enumLoopValues(uniqueMembers(values), required) : (values || [])),
-    vary: object ? false : isEnum,
+    values: object ? (optionalObject ? [OBJECT_FIELDS, null, OMIT] : []) : (isEnum ? enumLoopValues(uniqueMembers(values), required) : (values || [])),
+    vary: optionalObject ? true : (object ? false : isEnum),
     sample: sample === undefined ? '' : sample,
     constraints: {
       minimum: numberOrNull(schema.minimum),

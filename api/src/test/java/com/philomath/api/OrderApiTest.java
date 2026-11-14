@@ -189,6 +189,43 @@ class OrderApiTest {
     }
 
     @Test
+    void acceptsAMissingEmptyOrNullDeliveryAddress() throws Exception {
+        for (String address : new String[]{"\"deliveryAddress\": null", "\"deliveryAddress\": {}", "\"deliveryAddress\": {\"region\": {}}"}) {
+            mockMvc.perform(post("/api/orders")
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content(replaceAddress(address)))
+                    .andExpect(status().isCreated())
+                    .andExpect(jsonPath("$.deliveryAddress").value(nullValue()));
+        }
+        mockMvc.perform(post("/api/orders")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(omitAddress()))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.deliveryAddress").value(nullValue()));
+    }
+
+    private static String replaceAddress(String addressJson) {
+        int key = VALID_ORDER.indexOf("\"deliveryAddress\"");
+        return VALID_ORDER.substring(0, key) + addressJson + VALID_ORDER.substring(addressEnd(key));
+    }
+
+    private static String omitAddress() {
+        int key = VALID_ORDER.indexOf("\"deliveryAddress\"");
+        return VALID_ORDER.substring(0, VALID_ORDER.lastIndexOf(',', key)) + VALID_ORDER.substring(addressEnd(key));
+    }
+
+    private static int addressEnd(int key) {
+        int open = VALID_ORDER.indexOf('{', key);
+        int depth = 0;
+        for (int index = open; index < VALID_ORDER.length(); index++) {
+            char character = VALID_ORDER.charAt(index);
+            if (character == '{') depth++;
+            else if (character == '}' && --depth == 0) return index + 1;
+        }
+        throw new IllegalStateException("deliveryAddress was not found");
+    }
+
+    @Test
     void rejectsAFieldInsideTheDeliveryAddress() throws Exception {
         String invalid = VALID_ORDER.replace("\"postalCode\": \"999077\"", "\"postalCode\": \"" + "P".repeat(13) + "\"");
 
@@ -437,7 +474,8 @@ class OrderApiTest {
                 .andExpect(jsonPath("$.paths['/api/customers/{id}'].get").exists())
                 .andExpect(jsonPath("$.paths['/api/customers/{id}'].put").exists())
                 .andExpect(jsonPath("$.paths['/api/customers/{id}'].delete").exists())
-                .andExpect(jsonPath("$.components.schemas.OrderRequest.required", hasSize(16)))
+                .andExpect(jsonPath("$.components.schemas.OrderRequest.required", hasSize(15)))
+                .andExpect(jsonPath("$.components.schemas.OrderRequest.required", not(hasItem("deliveryAddress"))))
                 .andExpect(jsonPath("$.components.schemas.OrderRequest.properties.couponCode").exists())
                 .andExpect(jsonPath("$.components.schemas.OrderRequest.properties.promotionCode").exists())
                 .andExpect(jsonPath("$.components.schemas.OrderRequest['x-mutually-exclusive'][0][0]").value("couponCode"))
