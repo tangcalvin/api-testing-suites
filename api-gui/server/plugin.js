@@ -118,6 +118,23 @@ async function handle(store, proxy, request, response, pathname) {
     send(response, 201, JSON.stringify(saved), 'application/json')
     return
   }
+  const datasetId = pathname.startsWith('/files/datasets/') ? decodeURIComponent(pathname.slice('/files/datasets/'.length)) : ''
+  if (datasetId && !datasetId.includes('/') && request.method === 'GET') {
+    send(response, 200, JSON.stringify(await store.readDatasets(datasetId)), 'application/json')
+    return
+  }
+  if (datasetId && !datasetId.includes('/') && request.method === 'PUT') {
+    let payload
+    try {
+      payload = JSON.parse(await readBody(request))
+    } catch {
+      send(response, 400, 'Records must be JSON.')
+      return
+    }
+    await store.writeDatasets(datasetId, payload)
+    send(response, 204, '')
+    return
+  }
   const runName = pathname.startsWith('/files/runs/') ? decodeURIComponent(pathname.slice('/files/runs/'.length)) : ''
   if (runName && request.method === 'GET') {
     send(response, 200, await store.readRun(runName), 'application/yaml')

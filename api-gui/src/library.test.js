@@ -119,6 +119,15 @@ test('defaults and custom cases import as separate files', () => {
   assert.equal(withIds.ids['POST /api/shipments/queryShipments'], '')
   assert.equal(casesDocument(withIds).ids['POST /api/shipments/getShipment'], 'instructionNumber')
   assert.equal(casesDocument(parseCases('{"kind":"cases","operations":{}}')).ids, undefined)
+  const withFilters = parseCases(JSON.stringify({
+    kind: 'cases',
+    operations: {},
+    filters: { 'GET /api/orders': { customerName: { mode: 'equals', column: 'customerName' }, notes: { mode: 'nope' } } },
+  }))
+  assert.equal(withFilters.filters['GET /api/orders'].customerName.mode, 'equals')
+  assert.equal(withFilters.filters['GET /api/orders'].notes, undefined)
+  assert.equal(casesDocument(withFilters).filters['GET /api/orders'].customerName.column, 'customerName')
+  assert.equal(casesDocument(parseCases('{"kind":"cases","operations":{}}')).filters, undefined)
   assert.throws(() => parseCases('{"kind":"defaults","global":{}}'), /custom cases/)
   assert.deepEqual(defaults.variables, {})
 })

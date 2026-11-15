@@ -36,6 +36,7 @@ export function listOperations(spec) {
         fields: fieldsFor(spec, pathItem, operation),
         exclusive: exclusiveGroups(spec, operation),
         pagination: detectPagination(spec, pathItem, operation),
+        recordColumns: responseRecordColumns(spec, operation),
         responses: responseViews(spec, operation),
       }
       listed.role = operationRole(listed)
@@ -1911,6 +1912,21 @@ function objectRows(spec, schema, prefix, depth) {
     }
   }
   return rows
+}
+
+function responseRecordColumns(spec, operation) {
+  const schema = successSchema(spec, operation)
+  if (!schema) return []
+  const item = schema.type === 'array' || schema.items
+    ? resolveSchema(spec, schema.items || {})
+    : itemSchema(spec, schema)
+  return Object.keys(item?.properties || {})
+}
+
+function itemSchema(spec, schema) {
+  const items = findItems(schemaFields(spec, schema))
+  if (!items) return null
+  return resolveSchema(spec, items.schema.items || {})
 }
 
 function successSchema(spec, operation) {

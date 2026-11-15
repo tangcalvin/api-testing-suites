@@ -53,6 +53,23 @@ export async function saveClientsFile(yamlText) {
   if (!response.ok && response.status !== 204) throw new Error(await response.text() || 'Could not save clients.yaml.')
 }
 
+export async function loadDatasets(clientId) {
+  const response = await fetch(`/files/datasets/${encodeURIComponent(clientId)}`)
+  if (!fromFileApi(response) || !response.ok) return {}
+  const data = await response.json()
+  return data && typeof data === 'object' && !Array.isArray(data) ? data : {}
+}
+
+export async function saveDatasets(clientId, datasets) {
+  const response = await fetch(`/files/datasets/${encodeURIComponent(clientId)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(datasets || {}),
+  })
+  if (!fromFileApi(response)) throw new Error('Restart the tester to save the uploaded records.')
+  if (!response.ok && response.status !== 204) throw new Error(await response.text() || 'Could not save the uploaded records.')
+}
+
 export async function listRuns() {
   const response = await fetch('/files/runs')
   if (!fromFileApi(response) || !response.ok) return []

@@ -23,7 +23,7 @@ export function storedRate(value) {
 }
 
 export function emptyCases() {
-  return { operations: {}, exclusions: {}, values: {}, errors: {}, checks: {}, steps: {}, ids: {} }
+  return { operations: {}, exclusions: {}, values: {}, errors: {}, checks: {}, steps: {}, ids: {}, filters: {} }
 }
 
 export function loadStored(key, empty, parse) {
@@ -68,6 +68,7 @@ export function casesDocument(cases) {
   const checks = cases.checks || {}
   const steps = cases.steps || {}
   const ids = cases.ids || {}
+  const filters = cases.filters || {}
   return {
     version: 1,
     kind: 'cases',
@@ -78,6 +79,7 @@ export function casesDocument(cases) {
     ...(Object.keys(checks).length > 0 ? { checks } : {}),
     ...(Object.keys(steps).length > 0 ? { steps } : {}),
     ...(Object.keys(ids).length > 0 ? { ids } : {}),
+    ...(Object.keys(filters).length > 0 ? { filters } : {}),
   }
 }
 
@@ -113,6 +115,7 @@ export function hasSavedCases(cases) {
     || Object.keys(cases?.values || {}).length > 0
     || Object.keys(cases?.steps || {}).length > 0
     || Object.keys(cases?.ids || {}).length > 0
+    || Object.keys(cases?.filters || {}).length > 0
 }
 
 export function emptyOauth() {
@@ -263,7 +266,28 @@ export function parseCases(value) {
     checks: errorCheckMaps(data.checks),
     steps: stepMaps(data.steps),
     ids: idMaps(data.ids),
+    filters: filterMaps(data.filters),
   }
+}
+
+const FILTER_MODES = new Set(['equals', 'equalsIgnoreCase', 'contains', 'starts', 'ends', 'minimum', 'maximum', 'greater', 'less', 'in', 'not', 'empty', 'present', 'compare', 'bounds', 'skip'])
+
+function filterMaps(source) {
+  const filters = {}
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return filters
+  for (const [operationId, fields] of Object.entries(source)) {
+    if (!fields || typeof fields !== 'object' || Array.isArray(fields)) continue
+    const next = {}
+    for (const [name, raw] of Object.entries(fields)) {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue
+      const item = {}
+      if (typeof raw.mode === 'string' && FILTER_MODES.has(raw.mode)) item.mode = raw.mode
+      if (typeof raw.column === 'string' && raw.column.trim()) item.column = raw.column.trim()
+      if (Object.keys(item).length > 0) next[name] = item
+    }
+    if (Object.keys(next).length > 0) filters[operationId] = next
+  }
+  return filters
 }
 
 function idMaps(source) {

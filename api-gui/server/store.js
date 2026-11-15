@@ -1,10 +1,11 @@
-import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import yaml from 'js-yaml'
 
 const CLIENTS_FILE = 'clients.yaml'
 const SPEC_FILE = 'openapi.yaml'
 const RUNS_DIR = 'runs'
+const DATASETS_DIR = 'datasets'
 const RUN_NAME = /^[0-9]{8}T[0-9]{9}Z(?:-\d+)?\.yaml$/
 
 export function createStore(root) {
@@ -71,6 +72,28 @@ export function createStore(root) {
         if (error.code === 'ENOENT') throw httpError(404, 'That saved run does not exist.')
         throw error
       }
+    },
+    async readDatasets(clientId) {
+      const text = await readOptional(datasetPath(dataDir, clientId))
+      if (text == null) return {}
+      try {
+        return cleanDatasets(JSON.parse(text))
+      } catch (error) {
+        if (error.status) throw error
+        throw httpError(400, 'The saved records could not be read.')
+      }
+    },
+    async writeDatasets(clientId, input) {
+      const file = datasetPath(dataDir, clientId)
+      const clean = cleanDatasets(input)
+      if (Object.keys(clean).length === 0) {
+        await rm(file, { force: true })
+        return {}
+      }
+      await mkdir(path.dirname(file), { recursive: true })
+      const body = `${JSON.stringify(clean)}\n`
+      await writeFile(file, body, 'utf8')
+      return clean
     },
     async writeRun(input) {
       const results = Array.isArray(input?.results) ? input.results.map(cleanResult) : null
@@ -150,6 +173,57 @@ async function uniqueRunName(runsDir, savedAt) {
     suffix += 1
   }
   return name
+}
+
+function datasetPath(dataDir, clientId) {
+  const name = String(clientId || '')
+  if (!/^[A-Za-z0-9._-]{1,80}$/.test(name)) throw httpError(400, 'Unknown client.')
+  return path.join(dataDir, DATASETS_DIR, `${name}.json`)
+}
+
+function cleanDatasets(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw httpError(400, 'Records must be a JSON object.')
+  const next = {}
+  for (const [operationId, item] of Object.entries(input)) {
+    const id = String(operationId || '').trim()
+    if (!id || id.length > 300 || /[\r\n]/.test(id)) continue
+    if (!item || typeof item !== 'object' || Array.isArray(item) || !Array.isArray(item.rows)) continue
+    next[id] = {
+      name: text(item.name).slice(0, 180) || 'records',
+      ordered: Boolean(item.ordered),
+      rows: cleanRows(item.rows),
+    }
+  }
+  return next
+}
+
+function cleanRows(rows) {
+  if (rows.length > 20000) throw httpError(413, 'A record set can hold 20,000 rows.')
+  return rows.map((row, index) => {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) {
+      throw httpError(400, `Record ${index + 1} must be an object.`)
+    }
+    return cleanValue(row, 0)
+  })
+}
+
+function cleanValue(value, depth) {
+  if (value == null) return null
+  if (typeof value === 'string' || typeof value === 'boolean') return value
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null
+  if (depth >= 6) return null
+  if (Array.isArray(value)) return value.slice(0, 200).map((item) => cleanValue(item, depth + 1))
+  if (typeof value === 'object') {
+    const next = {}
+    for (const [key, item] of Object.entries(value)) {
+      if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue
+      const name = String(key).trim()
+      if (!name) continue
+      next[name] = cleanValue(item, depth + 1)
+    }
+    return next
+  }
+  return null
 }
 
 function runPath(runsDir, name) {

@@ -94,6 +94,7 @@ import {
   responsesForMode,
   withTextCombinationValues,
 } from './openapi/spec'
+import { compareRecords, filterModeChoices, filterRecords, filterRules, filterSummary, FILTER_MODE_LABELS, parseRecordFile } from './openapi/records'
 import {
   CASES_KEY,
   DEFAULTS_KEY,
@@ -142,7 +143,7 @@ import {
   uuidToken,
 } from './library'
 import { accessTokenFor, derivedAudience, oauthMode, relativeTokenPath } from './jwt'
-import { listRuns, loadClientsFile, loadProxy, loadRun, loadSpecFile, saveClientsFile, saveProxy, saveRun, saveSpecFile } from './files'
+import { listRuns, loadClientsFile, loadDatasets, loadProxy, loadRun, loadSpecFile, saveClientsFile, saveDatasets, saveProxy, saveRun, saveSpecFile } from './files'
 
 const EXAMPLES_SEEDED_KEY = 'api-tester.examples-loaded'
 const EXAMPLE_CLIENTS_KEY = 'api-tester.example-clients'
@@ -152,7 +153,7 @@ const MODES = [
   {
     id: 'combination',
     label: 'Combinations',
-    detail: 'Crosses each selected enum. An optional enum includes null and omit, and a null already in the enum is listed once. An optional object is sent filled, as null, and omitted. An enum that is not crossed uses one selected value. A string or number uses its default plus any other values you add, and can include null and omit when it is optional. Other optional query filters stay off the request. Skip rules are left out. A check passes on a success status, and when each expected response value matches.',
+    detail: 'Crosses each selected enum. An optional enum includes null and omit, and a null already in the enum is listed once. An optional object is sent filled, as null, and omitted. An enum that is not crossed uses one selected value. A string or number uses its default plus any other values you add, and can include null and omit when it is optional. Other optional query filters stay off the request. Skip rules are left out. A check passes on a success status, and when each expected response value matches. With a record set uploaded, each check filters that set and compares it with the rows from every page.',
   },
   {
     id: 'individual',
@@ -202,6 +203,7 @@ export default function App() {
   const [profileName, setProfileName] = useState('')
   const [defaults, setDefaults] = useState(emptyDefaults)
   const [customCases, setCustomCases] = useState(emptyCases)
+  const [datasets, setDatasets] = useState({})
   const [libraryReady, setLibraryReady] = useState(false)
   const [defaultsOpen, setDefaultsOpen] = useState(false)
   const [libraryOpen, setLibraryOpen] = useState(false)
@@ -281,6 +283,19 @@ export default function App() {
       cancelled = true
     }
   }, [])
+
+  useEffect(() => {
+    if (!libraryReady || !activeId) return undefined
+    let cancelled = false
+    loadDatasets(activeId).then((data) => {
+      if (!cancelled) setDatasets(data)
+    }).catch(() => {
+      if (!cancelled) setDatasets({})
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [libraryReady, activeId])
 
   useEffect(() => {
     if (!proxyLoaded) return undefined
@@ -748,6 +763,32 @@ export default function App() {
     })
   }
 
+  function writeDataset(operationId, next) {
+    const map = { ...datasets }
+    if (next) map[operationId] = next
+    else delete map[operationId]
+    setDatasets(map)
+    if (!activeId) return
+    saveDatasets(activeId, map).catch((error) => {
+      setFileNotice(error.message || 'Could not save the uploaded records.')
+    })
+  }
+
+  function writeFilter(operationId, field, patch, detected) {
+    setCustomCases((current) => {
+      const filters = { ...(current.filters || {}) }
+      const operation = { ...(filters[operationId] || {}) }
+      const next = { ...patch }
+      const mode = next.mode && next.mode !== detected.mode ? next.mode : ''
+      const column = typeof next.column === 'string' && next.column.trim() && next.column.trim() !== detected.column ? next.column.trim() : ''
+      if (!mode && !column) delete operation[field]
+      else operation[field] = { ...(mode ? { mode } : {}), ...(column ? { column } : {}) }
+      if (Object.keys(operation).length === 0) delete filters[operationId]
+      else filters[operationId] = operation
+      return { ...current, filters }
+    })
+  }
+
   function writeExclusions(operationId, exclusion) {
     setCustomCases((current) => {
       const exclusions = { ...(current.exclusions || {}) }
@@ -892,6 +933,15 @@ export default function App() {
           variables: defaults.variables,
           pages: response.pages,
         })
+        const table = datasets[selected.id]
+        if (activeMode === 'combination' && table?.rows?.length && response.status >= 200 && response.status < 300) {
+          const rules = filterRules(selected.fields, selected.recordColumns, customCases.filters?.[selected.id], selected.pagination)
+          const expectedRows = filterRecords(table.rows, rules, response.request || { body: item.body, query: item.query, path: item.path })
+          const actualRows = (response.records || []).map((record) => record.value)
+          const compared = compareRecords(expectedRows, actualRows, { ordered: Boolean(table.ordered) })
+          verdict.detail = [verdict.detail, compared.detail].filter(Boolean).join(' ')
+          if (!compared.passed) verdict.passed = false
+        }
         let enquiry = null
         const target = useEnquiry ? enquiryTarget(item, plan.idField, plan.location) : null
         if (target != null && !stopRef.current) {
@@ -1298,6 +1348,18 @@ export default function App() {
                 </Box>
                 )}
 
+                {activeMode === 'combination' && selected?.pagination && (
+                  <RecordSet
+                    fields={fields}
+                    columns={selected.recordColumns}
+                    pagination={selected.pagination}
+                    dataset={datasets[selected.id]}
+                    overrides={customCases.filters?.[selected.id]}
+                    onDataset={(next) => writeDataset(selected.id, next)}
+                    onFilter={(field, patch, detected) => writeFilter(selected.id, field, patch, detected)}
+                  />
+                )}
+
                 {activeMode === 'combination' && selected && (
                   <CombinationExclusions
                     key={selected.id}
@@ -1357,7 +1419,7 @@ export default function App() {
                             ? 'This operation has no checks in the selected mode.'
                             : running
                               ? `${finishedChecks} of ${planned.length} complete${activity ? ` · ${activity}` : ''}`
-                              : `List checks follow the spec. Requests stay within this rate.${skippedCombinations > 0 ? ` ${skippedCombinations} combinations skipped.` : ''}`}
+                              : `List checks follow the spec. Requests stay within this rate.${skippedCombinations > 0 ? ` ${skippedCombinations} combinations skipped.` : ''}${activeMode === 'combination' && datasets[selected?.id]?.rows?.length ? ` ${datasets[selected.id].rows.length} uploaded ${datasets[selected.id].rows.length === 1 ? 'record is' : 'records are'} filtered for each check.` : ''}`}
                     </Typography>
                     <PaginationHelp pagination={selected.pagination} />
                   </Stack>
@@ -2856,6 +2918,111 @@ function downloadText(filename, text, type) {
   link.download = filename
   link.click()
   URL.revokeObjectURL(url)
+}
+
+function RecordSet({ fields, columns, pagination, dataset, overrides, onDataset, onFilter }) {
+  const detected = filterRules(fields, columns, {}, pagination)
+  const rules = filterRules(fields, columns, overrides, pagination)
+  const known = new Set(columns || [])
+  const [open, setOpen] = useState(false)
+  const [error, setError] = useState('')
+  async function upload(event) {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file) return
+    setError('')
+    try {
+      const rows = await parseRecordFile(file)
+      if (!rows.length) throw new Error('That file has no records.')
+      onDataset({ name: file.name, rows, ordered: Boolean(dataset?.ordered) })
+    } catch (failure) {
+      setError(failure.message || 'Could not read that file.')
+    }
+  }
+  return (
+    <Stack spacing={0.75} sx={{ border: 1, borderColor: 'divider', borderRadius: 1, px: 1.25, py: 1 }}>
+      <Stack direction="row" spacing={1} sx={{ alignItems: 'center' }}>
+        <Typography variant="subtitle2">Expected records</Typography>
+        {dataset?.rows?.length ? <Chip size="small" variant="outlined" label={dataset.rows.length} /> : null}
+      </Stack>
+      <Typography variant="body2" color="text.secondary">
+        Upload the full set as csv, xlsx, or JSON. Each combination filters it and compares the rows from every page. Column names match the response.
+      </Typography>
+      <Stack direction="row" spacing={1} useFlexGap sx={{ alignItems: 'center', flexWrap: 'wrap' }}>
+        <Button variant="outlined" size="small" component="label" startIcon={<UploadFileIcon />}>
+          Upload
+          <input hidden type="file" accept=".csv,.xlsx,.json,text/csv,application/json" onChange={upload} />
+        </Button>
+        {dataset?.name ? <Typography variant="body2">{dataset.name}</Typography> : null}
+        {dataset ? (
+          <FormControlLabel
+            sx={{ ml: 0 }}
+            control={<Checkbox size="small" checked={Boolean(dataset.ordered)} onChange={(event) => onDataset({ ...dataset, ordered: event.target.checked })} />}
+            label="Order matters"
+          />
+        ) : null}
+        {dataset ? <Button size="small" color="inherit" onClick={() => onDataset(null)}>Remove</Button> : null}
+      </Stack>
+      {error ? <Alert severity="error">{error}</Alert> : null}
+      {rules.length > 0 && (
+        <Box>
+          <Button size="small" color="inherit" onClick={() => setOpen((value) => !value)} endIcon={<ExpandMoreIcon sx={{ transform: open ? 'none' : 'rotate(-90deg)' }} />}>
+            Filter rules
+          </Button>
+          <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>{filterSummary(rules)}</Typography>
+          <Collapse in={open}>
+            <Box sx={{ overflow: 'auto', maxHeight: 240, mt: 0.5 }}>
+              <Table size="small" sx={{ width: '100%' }}>
+                <TableHead>
+                  <TableRow>
+                    <TableCell>Filter</TableCell>
+                    <TableCell sx={{ width: '34%' }}>How</TableCell>
+                    <TableCell sx={{ width: '34%' }}>Record field</TableCell>
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {rules.map((rule) => {
+                    const origin = detected.find((item) => item.field === rule.field) || rule
+                    const unmapped = !rule.column.includes('.') && known.size > 0 && !known.has(rule.column)
+                    return (
+                      <TableRow key={rule.field}>
+                        <TableCell>
+                          <Typography variant="body2">{rule.field}</Typography>
+                          {rule.or ? <Typography variant="caption" color="text.secondary">Any of this group</Typography> : null}
+                        </TableCell>
+                        <TableCell>
+                          <TextField
+                            select
+                            size="small"
+                            fullWidth
+                            value={rule.mode}
+                            onChange={(event) => onFilter(rule.field, { mode: event.target.value, column: rule.column }, origin)}
+                          >
+                            {filterModeChoices(origin).map((mode) => (
+                              <MenuItem key={mode} value={mode}>{FILTER_MODE_LABELS[mode]}</MenuItem>
+                            ))}
+                          </TextField>
+                        </TableCell>
+                        <TableCell>
+                          <TextField
+                            size="small"
+                            fullWidth
+                            value={rule.column}
+                            onChange={(event) => onFilter(rule.field, { mode: rule.mode, column: event.target.value }, origin)}
+                            {...(unmapped ? { helperText: 'Not in the response' } : {})}
+                          />
+                        </TableCell>
+                      </TableRow>
+                    )
+                  })}
+                </TableBody>
+              </Table>
+            </Box>
+          </Collapse>
+        </Box>
+      )}
+    </Stack>
+  )
 }
 
 function CombinationExclusions({ fields, exclusive, value, onChange }) {

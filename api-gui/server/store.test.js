@@ -39,6 +39,16 @@ test('clients.yaml and run files stay inside the data directory', async () => {
     assert.equal(loaded.kind, 'run')
     assert.equal(loaded.results[0].text, '{"id":1}')
     await assert.rejects(() => store.readRun('../clients.yaml'), /Unknown run name/)
+
+    assert.deepEqual(await store.readDatasets('client-hk'), {})
+    await store.writeDatasets('client-hk', {
+      'GET /api/orders': { name: 'orders.csv', ordered: false, rows: [{ id: 1, customerName: 'Ada' }] },
+    })
+    const records = await store.readDatasets('client-hk')
+    assert.equal(records['GET /api/orders'].rows[0].customerName, 'Ada')
+    await store.writeDatasets('client-hk', {})
+    assert.deepEqual(await store.readDatasets('client-hk'), {})
+    await assert.rejects(() => store.readDatasets('../clients'), /Unknown client/)
   } finally {
     await rm(root, { recursive: true, force: true })
   }
