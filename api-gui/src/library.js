@@ -23,7 +23,7 @@ export function storedRate(value) {
 }
 
 export function emptyCases() {
-  return { operations: {}, exclusions: {}, values: {}, errors: {}, checks: {}, steps: {}, ids: {}, filters: {} }
+  return { operations: {}, exclusions: {}, values: {}, errors: {}, checks: {}, steps: {}, ids: {}, filters: {}, scenarios: [] }
 }
 
 export function loadStored(key, empty, parse) {
@@ -69,6 +69,7 @@ export function casesDocument(cases) {
   const steps = cases.steps || {}
   const ids = cases.ids || {}
   const filters = cases.filters || {}
+  const scenarios = Array.isArray(cases.scenarios) ? cases.scenarios : []
   return {
     version: 1,
     kind: 'cases',
@@ -80,6 +81,7 @@ export function casesDocument(cases) {
     ...(Object.keys(steps).length > 0 ? { steps } : {}),
     ...(Object.keys(ids).length > 0 ? { ids } : {}),
     ...(Object.keys(filters).length > 0 ? { filters } : {}),
+    ...(scenarios.length > 0 ? { scenarios } : {}),
   }
 }
 
@@ -116,6 +118,7 @@ export function hasSavedCases(cases) {
     || Object.keys(cases?.steps || {}).length > 0
     || Object.keys(cases?.ids || {}).length > 0
     || Object.keys(cases?.filters || {}).length > 0
+    || (cases?.scenarios || []).length > 0
 }
 
 export function emptyOauth() {
@@ -267,6 +270,7 @@ export function parseCases(value) {
     steps: stepMaps(data.steps),
     ids: idMaps(data.ids),
     filters: filterMaps(data.filters),
+    scenarios: scenarioList(data.scenarios),
   }
 }
 
@@ -288,6 +292,77 @@ function filterMaps(source) {
     if (Object.keys(next).length > 0) filters[operationId] = next
   }
   return filters
+}
+
+function scenarioList(source) {
+  if (!Array.isArray(source)) return []
+  return source.map(normalizeScenario).filter(Boolean)
+}
+
+function normalizeScenario(item) {
+  if (!item || typeof item !== 'object' || Array.isArray(item)) return null
+  const columns = []
+  for (const name of Array.isArray(item.columns) ? item.columns : []) {
+    const key = String(name || '').trim()
+    if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) && !columns.includes(key)) columns.push(key)
+  }
+  const steps = (Array.isArray(item.steps) ? item.steps : []).map(normalizeScenarioStep).filter(Boolean)
+  const iterations = (Array.isArray(item.iterations) ? item.iterations : []).map((row) => normalizeIteration(row, columns)).filter(Boolean)
+  return {
+    id: typeof item.id === 'string' && item.id ? item.id : newId(),
+    name: typeof item.name === 'string' && item.name.trim() ? item.name.trim() : 'Scenario',
+    steps,
+    columns,
+    iterations,
+  }
+}
+
+function normalizeScenarioStep(item) {
+  if (!item || typeof item !== 'object' || Array.isArray(item)) return null
+  const request = {}
+  const source = item.request && typeof item.request === 'object' && !Array.isArray(item.request) ? item.request : {}
+  for (const [name, value] of Object.entries(source)) {
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') request[name] = value
+  }
+  const captures = []
+  const listed = Array.isArray(item.captures)
+    ? item.captures
+    : Object.entries(item.save && typeof item.save === 'object' && !Array.isArray(item.save) ? item.save : {}).map(([name, path]) => ({ name, path }))
+  for (const entry of listed) {
+    if (!entry || typeof entry !== 'object') continue
+    captures.push({
+      name: typeof entry.name === 'string' ? entry.name : '',
+      path: typeof entry.path === 'string' ? entry.path : '',
+    })
+  }
+  const fields = (Array.isArray(item.expect?.fields) ? item.expect.fields : []).map((field) => {
+    if (!field || typeof field.path !== 'string' || !field.path.trim()) return null
+    return {
+      path: field.path.trim(),
+      equals: field.equals == null ? '' : String(field.equals),
+      ...(field.ordered ? { ordered: true } : {}),
+    }
+  }).filter(Boolean)
+  return {
+    id: typeof item.id === 'string' && item.id ? item.id : newId(),
+    operationId: typeof item.operationId === 'string' ? item.operationId : '',
+    request,
+    omit: Array.isArray(item.omit) ? item.omit.filter((name) => typeof name === 'string' && name) : [],
+    expect: { status: item.expect?.status ? String(item.expect.status).replace(/\D/g, '').slice(0, 3) : '', fields },
+    captures,
+    cleanup: Boolean(item.cleanup),
+  }
+}
+
+function normalizeIteration(item, columns) {
+  if (!item || typeof item !== 'object' || Array.isArray(item)) return null
+  const source = item.values && typeof item.values === 'object' && !Array.isArray(item.values) ? item.values : {}
+  const values = {}
+  for (const name of columns) {
+    const raw = source[name]
+    values[name] = raw == null ? '' : String(raw)
+  }
+  return { id: typeof item.id === 'string' && item.id ? item.id : newId(), values }
 }
 
 function idMaps(source) {

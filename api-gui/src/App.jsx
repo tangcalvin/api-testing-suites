@@ -95,6 +95,8 @@ import {
   withTextCombinationValues,
 } from './openapi/spec'
 import { compareRecords, filterModeChoices, filterRecords, filterRules, filterSummary, FILTER_MODE_LABELS, parseRecordFile } from './openapi/records'
+import { capturedFrom, scenarioCall, scenarioRequest, stepShouldRun } from './openapi/scenarios'
+import ScenarioEditor from './ScenarioEditor'
 import {
   CASES_KEY,
   DEFAULTS_KEY,
@@ -204,6 +206,8 @@ export default function App() {
   const [defaults, setDefaults] = useState(emptyDefaults)
   const [customCases, setCustomCases] = useState(emptyCases)
   const [datasets, setDatasets] = useState({})
+  const [showScenarios, setShowScenarios] = useState(false)
+  const [scenarioId, setScenarioId] = useState('')
   const [libraryReady, setLibraryReady] = useState(false)
   const [defaultsOpen, setDefaultsOpen] = useState(false)
   const [libraryOpen, setLibraryOpen] = useState(false)
@@ -392,7 +396,8 @@ export default function App() {
     return () => clearTimeout(handle)
   }, [profiles, activeId, profileName, defaults, customCases, oauth, libraryReady])
   const passed = results.filter((result) => result.passed).length
-  const visible = onlyFailed ? results.filter((result) => !result.passed) : results
+  const skippedCount = results.filter((result) => result.skipped).length
+  const visible = onlyFailed ? results.filter((result) => !result.passed && !result.skipped) : results
 
   async function applySpec(text, sourceLabel, { save = false, profiles: gapProfiles } = {}) {
     const spec = parseSpecText(text)
@@ -458,6 +463,7 @@ export default function App() {
   }
 
   function selectOperation(operation) {
+    setShowScenarios(false)
     setSelectedId(operation.id)
     setFields(operation.fields.map((field) => ({ ...field })))
     setResults([])
@@ -774,6 +780,10 @@ export default function App() {
     })
   }
 
+  function writeScenarios(list) {
+    setCustomCases((current) => ({ ...current, scenarios: list }))
+  }
+
   function writeFilter(operationId, field, patch, detected) {
     setCustomCases((current) => {
       const filters = { ...(current.filters || {}) }
@@ -1012,7 +1022,97 @@ export default function App() {
     }
   }
 
-  const failed = results.length - passed
+  async function runScenario() {
+    const scenario = (customCases.scenarios || []).find((item) => item.id === scenarioId)
+    if (!scenario || scenario.steps.length === 0 || running) return
+    const pace = createPacer(tps)
+    stopRef.current = false
+    setRunning(true)
+    setStopRequested(false)
+    setActivity('')
+    setResults([])
+    setSavedRunName('')
+    setOpenResult(null)
+    try {
+      await saveProxy({ api: apiBase, idp: idpBase })
+    } catch (error) {
+      setRunning(false)
+      setFileNotice(error.message || 'Could not prepare the proxy.')
+      return
+    }
+    const next = []
+    const headers = requestHeaders(defaults)
+    const iterations = scenario.iterations.length > 0 ? scenario.iterations : [{ id: 'once', values: {} }]
+    const push = (entry) => {
+      next.push({ index: next.length + 1, ...entry })
+      setResults([...next])
+    }
+    try {
+      for (let rowIndex = 0; rowIndex < iterations.length; rowIndex += 1) {
+        if (stopRef.current) break
+        const captured = {}
+        let rowFailed = false
+        for (const step of scenario.steps) {
+          if (stopRef.current) break
+          const operation = operations.find((item) => item.id === step.operationId)
+          const label = `${rowIndex + 1} · ${operation?.summary || step.operationId || 'Step'}`
+          if (!operation) {
+            rowFailed = true
+            push({ label, status: 0, passed: false, detail: 'That endpoint is not in the loaded document.' })
+            continue
+          }
+          if (!stepShouldRun(step, rowFailed)) {
+            push({ label, status: 0, passed: false, skipped: true, detail: 'Skipped because an earlier step failed.' })
+            continue
+          }
+          const variables = { ...iterations[rowIndex].values, ...captured }
+          const call = scenarioCall(operation, step, defaults, variables)
+          setActivity(`iteration ${rowIndex + 1} of ${iterations.length} · ${operation.summary || operation.path}`)
+          await pace()
+          if (stopRef.current) break
+          const sent = scenarioRequest(call)
+          const response = await callOperation(apiBase, idpBase, operation, sent, null, headers, oauth)
+          const verdict = judge(call.expect, response.status, response.text, {
+            request: sent,
+            variables: { ...(defaults.variables || {}), ...variables },
+          })
+          if (!verdict.passed) rowFailed = true
+          Object.assign(captured, capturedFrom(step.captures, response.status, response.text, response.location))
+          const request = [formatRequestBody(sent.body), Object.keys(sent.query || {}).length ? formatRequestBody(sent.query) : ''].filter(Boolean).join('\n')
+          push({
+            label,
+            status: response.status,
+            passed: verdict.passed,
+            detail: verdict.detail,
+            text: pretty(response.text),
+            ...(request ? { request } : {}),
+          })
+        }
+      }
+    } finally {
+      setActivity('')
+      setRunning(false)
+    }
+    if (next.length > 0) {
+      try {
+        const saved = await saveRun({
+          client: profileLabel({ name: profileName, oauth }),
+          clientId: oauth.clientId || '',
+          operation: scenario.name || 'Scenario',
+          mode: 'Scenarios',
+          baseUrl: apiBase,
+          stopped: stopRef.current,
+          results: next,
+        })
+        setSavedRunName(saved.name)
+        setSavedRuns(await listRuns())
+      } catch (error) {
+        setFileNotice(error.message || 'Could not save that run.')
+      }
+    }
+  }
+
+  const failed = results.filter((result) => !result.passed && !result.skipped).length
   const showRequest = visible.some((result) => result.request)
 
   return (
@@ -1105,6 +1205,22 @@ export default function App() {
               {operations.length > 0 && <Chip size="small" label={operations.length} variant="outlined" />}
             </Stack>
             <List dense disablePadding sx={{ maxHeight: { lg: 'calc(100vh - 250px)' }, overflow: 'auto' }}>
+              <ListItemButton
+                selected={showScenarios}
+                onClick={() => {
+                  const list = customCases.scenarios || []
+                  if (!showScenarios) {
+                    setResults([])
+                    setOpenResult(null)
+                  }
+                  setShowScenarios(true)
+                  setScenarioId((current) => (list.some((item) => item.id === current) ? current : (list[0]?.id || '')))
+                }}
+                sx={{ py: 1, borderBottom: 1, borderColor: 'divider' }}
+              >
+                <ListItemText primary="Scenarios" slotProps={{ primary: { variant: 'body2', sx: { fontWeight: 700 } } }} />
+                {(customCases.scenarios || []).length > 0 && <Chip size="small" label={customCases.scenarios.length} variant="outlined" />}
+              </ListItemButton>
               {operationGroups(operations).map((group) => {
                 const open = openTag === group.tag
                 return (
@@ -1126,7 +1242,7 @@ export default function App() {
                         {group.operations.map((operation) => (
                           <ListItemButton
                             key={operation.id}
-                            selected={operation.id === selectedId}
+                            selected={operation.id === selectedId && !showScenarios}
                             onClick={() => selectOperation(operation)}
                             sx={{ py: 1, gap: 1.25, alignItems: 'flex-start' }}
                           >
@@ -1158,7 +1274,25 @@ export default function App() {
           </Paper>
 
           <Paper sx={{ p: { xs: 1.5, md: 2 }, minWidth: 0 }}>
-            {selected ? (
+            {showScenarios ? (
+              <ScenarioEditor
+                scenarios={customCases.scenarios || []}
+                scenarioId={scenarioId}
+                operations={operations}
+                variableNames={Object.keys(defaults.variables || {})}
+                running={running}
+                activity={activity}
+                tps={tps}
+                onTps={setTps}
+                onSelect={setScenarioId}
+                onChange={writeScenarios}
+                onRun={runScenario}
+                onStop={() => {
+                  stopRef.current = true
+                  setStopRequested(true)
+                }}
+              />
+            ) : selected ? (
               <Stack spacing={1.75}>
                 <Stack direction="row" spacing={1.25} sx={{ alignItems: 'center', minWidth: 0 }}>
                   <MethodBadge method={selected.method} />
@@ -1506,6 +1640,7 @@ export default function App() {
                 <>
                   <Chip size="small" label={`${passed} passed`} sx={{ bgcolor: '#e7f6f3', color: '#0f766e' }} />
                   <Chip size="small" label={`${failed} failed`} sx={{ bgcolor: failed ? '#fdecec' : '#f1f5f9', color: failed ? '#b42318' : '#526070' }} />
+                  {skippedCount > 0 && <Chip size="small" label={`${skippedCount} skipped`} variant="outlined" />}
                   {stopRequested && <Chip size="small" label="Stopped" variant="outlined" />}
                   <Box sx={{ flex: 1 }} />
                   <Button size="small" variant={onlyFailed ? 'contained' : 'text'} onClick={() => setOnlyFailed((current) => !current)}>
@@ -1535,18 +1670,18 @@ export default function App() {
                       onClick={() => setOpenResult(openResult === result.index ? null : result.index)}
                       sx={{
                         cursor: 'pointer',
-                        boxShadow: result.passed ? 'none' : 'inset 3px 0 0 #b42318',
-                        bgcolor: result.passed ? 'inherit' : '#fff8f7',
+                        boxShadow: result.passed || result.skipped ? 'none' : 'inset 3px 0 0 #b42318',
+                        bgcolor: result.passed || result.skipped ? 'inherit' : '#fff8f7',
                       }}
                     >
                       <TableCell sx={{ color: 'text.secondary' }}>{result.index}</TableCell>
                       <TableCell>
                         <Chip
                           size="small"
-                          label={result.passed ? 'Pass' : 'Fail'}
+                          label={result.skipped ? 'Skip' : result.passed ? 'Pass' : 'Fail'}
                           sx={{
-                            bgcolor: result.passed ? '#e7f6f3' : '#fdecec',
-                            color: result.passed ? '#0f766e' : '#b42318',
+                            bgcolor: result.skipped ? '#f1f5f9' : result.passed ? '#e7f6f3' : '#fdecec',
+                            color: result.skipped ? '#526070' : result.passed ? '#0f766e' : '#b42318',
                           }}
                         />
                       </TableCell>

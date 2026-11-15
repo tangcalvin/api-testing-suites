@@ -100,6 +100,7 @@ export function createStore(root) {
       if (!results || results.length === 0) throw httpError(400, 'A run needs at least one result.')
       const savedAt = new Date().toISOString()
       const passed = results.filter((item) => item.passed).length
+      const skipped = results.filter((item) => item.skipped).length
       const document = {
         version: 1,
         kind: 'run',
@@ -111,7 +112,7 @@ export function createStore(root) {
         baseUrl: text(input.baseUrl),
         stopped: Boolean(input.stopped),
         passed,
-        failed: results.length - passed,
+        failed: results.length - passed - skipped,
         results,
       }
       await mkdir(runsDir, { recursive: true })
@@ -153,6 +154,7 @@ function cleanResult(item) {
     label: text(item?.label),
     status: Number(item?.status) || 0,
     passed: Boolean(item?.passed),
+    ...(item?.skipped ? { skipped: true } : {}),
     detail: text(item?.detail),
     text: text(item?.text),
     pages,
