@@ -4,6 +4,7 @@ import io.swagger.v3.oas.annotations.media.Schema;
 
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
+import java.util.Map;
 
 @Schema(description = "Stored order")
 public record Order(
@@ -27,6 +28,8 @@ public record Order(
         String warehouseCode,
         String couponCode,
         String promotionCode,
-        DeliveryAddress deliveryAddress
+        DeliveryAddress deliveryAddress,
+        @Schema(description = "Empty object when options was sent.", additionalProperties = Schema.AdditionalPropertiesValue.FALSE)
+        Map<String, Object> options
 ) {
 }

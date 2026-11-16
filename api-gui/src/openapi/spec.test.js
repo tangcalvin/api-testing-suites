@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { OMIT, OBJECT_FIELDS, individualChoices, buildIndividualCases, applyErrorOverrides, applyErrorRowToGroup, assignFixture, buildCases, buildCustomCases, buildCustomErrorCases, buildErrorCases, caseCount, detectPagination, enquiryShouldMiss, enquiryTarget, fixtureEnabled, fixtureNote, fixturePlan, fixtureRequest, fixtureSteps, judge, listOperations, operationGroups, operationRole, parseSpecText, planContinuation, readCreatedId, recordId, detectPayloadId, idNameRank, resolvedId, responseChecks, responseViews, responsesForMode, sampleCall, scalarCombinationField, specGaps, textCombinationField, viewsWithStatuses, withFixtureId, withTextCombinationValues } from './spec.js'
+import { OMIT, OBJECT_COMPOSITE, OBJECT_FIELDS, applyPaging, collectPaging, individualChoices, buildIndividualCases, applyErrorOverrides, applyErrorRowToGroup, assignFixture, buildCases, buildCustomCases, buildCustomErrorCases, buildErrorCases, buildTrialCases, caseCount, combinationObjectMode, compositeField, detectPagination, enquiryShouldMiss, enquiryTarget, firstPageQuery, fixtureEnabled, fixtureNote, fixturePlan, fixtureRequest, fixtureSteps, judge, listOperations, operationGroups, operationRole, parseSpecText, planContinuation, readCreatedId, recordId, detectPayloadId, idNameRank, resolvedId, responseChecks, responseViews, responsesForMode, sampleCall, scalarCombinationField, specGaps, textCombinationField, underComposite, viewsWithStatuses, withFixtureId, withTextCombinationValues } from './spec.js'
+import { resolvePagination, storedPaging } from './pagination.js'
 
 const SPEC = `
 openapi: 3.1.0
@@ -233,6 +234,71 @@ paths:
   assert.equal(detectPagination({ paths: {} }, { parameters: [] }, { parameters: [], responses: {} }), null)
 })
 
+test('a POST body cursor with first page 0 treats totalSize as this page', () => {
+  const operation = listOperations(parseSpecText(`
+openapi: 3.1.0
+paths:
+  /api/shipments/queryShipments:
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                nextCursor: { type: string, default: "0", example: "0" }
+                size: { type: integer }
+                reference: { type: string }
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  content: { type: array, items: { type: object } }
+                  nextCursor: { type: string }
+                  totalSize: { type: integer }
+`))[0]
+  assert.equal(operation.pagination.style, 'cursor')
+  assert.equal(operation.pagination.request.cursor, 'nextCursor')
+  assert.deepEqual(operation.pagination.firstCursor, { type: 'string', value: '0' })
+  assert.deepEqual(operation.pagination.lastCursor, { type: 'string', value: '0' })
+  assert.equal(operation.pagination.response.total, null)
+  assert.deepEqual(operation.pagination.response.size, ['totalSize'])
+  assert.deepEqual(firstPageQuery(operation.pagination, {}), { nextCursor: '0' })
+  const more = planContinuation(operation.pagination, { nextCursor: '0', size: 1 }, {
+    content: [{ id: 1 }], totalSize: 1, nextCursor: 'MQ.hash',
+  }, [{ count: 1, cursor: '0' }])
+  assert.equal(more.query.nextCursor, 'MQ.hash')
+  const last = planContinuation(operation.pagination, { nextCursor: 'MQ.hash', size: 1 }, {
+    content: [{ id: 2 }], totalSize: 1, nextCursor: '0',
+  }, [{ count: 1, cursor: '0' }, { count: 1, cursor: 'MQ.hash' }])
+  assert.equal(last, null)
+
+  const override = storedPaging({
+    mode: 'cursor',
+    request: { size: 'size', cursor: 'nextCursor' },
+    response: { cursor: 'nextCursor', pageSize: 'totalSize' },
+    firstCursor: { type: 'string', value: '0' },
+    lastCursor: { type: 'string', value: '0' },
+  })
+  const resolved = resolvePagination(null, override)
+  assert.equal(resolved.style, 'cursor')
+  assert.deepEqual(resolved.response.size, ['totalSize'])
+  assert.equal(resolved.response.total, null)
+  const paged = applyPaging(
+    { query: {}, body: { reference: 'SHP', size: 20 } },
+    resolved,
+    firstPageQuery(resolved, collectPaging({ query: {}, body: { reference: 'SHP', size: 20 } }, resolved)),
+    operation.fields,
+  )
+  assert.equal(paged.body.nextCursor, '0')
+  assert.equal(paged.body.size, 20)
+  assert.equal(paged.body.reference, 'SHP')
+  assert.equal(paged.query.nextCursor, undefined)
+})
+
 test('a composite body field is sent as one nested object', () => {
   const fields = listOperations(parseSpecText(`
 openapi: 3.1.0
@@ -313,6 +379,108 @@ paths:
   assert.deepEqual(empty.body, { deliveryAddress: {} })
   const omitted = buildCustomCases(fields, [{ name: 'Omit address', request: {}, omit: ['deliveryAddress'], expect: {} }])[0]
   assert.deepEqual(omitted.body, {})
+})
+
+test('a composite nested object is one combination value for all of its fields', () => {
+  const fields = listOperations(parseSpecText(`
+openapi: 3.1.0
+paths:
+  /api/orders:
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [deliveryAddress]
+              properties:
+                deliveryAddress:
+                  type: object
+                  required: [city, region]
+                  properties:
+                    city:
+                      type: string
+                      enum: [HK, KL]
+                    region:
+                      type: object
+                      required: [code]
+                      properties:
+                        code:
+                          type: string
+                          enum: [N, S]
+                        district:
+                          type: object
+                          properties:
+                            name:
+                              type: string
+                              enum: [Central, East]
+`))[0].fields
+  assert.equal(compositeField(fields.find((field) => field.name === 'deliveryAddress'), fields), false)
+  assert.equal(compositeField(fields.find((field) => field.name === 'deliveryAddress.region'), fields), true)
+  assert.equal(compositeField(fields.find((field) => field.name === 'deliveryAddress.region.district'), fields), true)
+  assert.equal(underComposite('deliveryAddress.region.code', fields), true)
+  assert.equal(underComposite('deliveryAddress.city', fields), false)
+  const cases = buildCases(fields)
+  assert.equal(cases.length, 2)
+  assert.deepEqual(cases.map((item) => item.body.deliveryAddress.city).sort(), ['HK', 'KL'])
+  for (const item of cases) {
+    assert.equal(item.body.deliveryAddress.region.code, 'N')
+    assert.equal(item.body.deliveryAddress.region.district.name, 'Central')
+    assert.equal(item.varied['deliveryAddress.region.code'], undefined)
+    assert.equal(item.varied['deliveryAddress.region.district.name'], undefined)
+  }
+})
+
+test('a marked composite object crosses child value sets together', () => {
+  const fields = listOperations(parseSpecText(`
+openapi: 3.1.0
+paths:
+  /api/orders:
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [deliveryAddress]
+              properties:
+                deliveryAddress:
+                  type: object
+                  required: [city, region]
+                  properties:
+                    city:
+                      type: string
+                      enum: [HK, KL]
+                    region:
+                      type: object
+                      required: [code, name]
+                      properties:
+                        code: { type: string, example: HK-IS }
+                        name: { type: string, example: Island }
+`))[0].fields
+  const region = fields.find((field) => field.name === 'deliveryAddress.region')
+  assert.equal(combinationObjectMode(region, fields), 'composite')
+  const marked = fields.map((field) => field.name === 'deliveryAddress' ? { ...field, sample: OBJECT_COMPOSITE } : field)
+  assert.equal(compositeField(marked.find((field) => field.name === 'deliveryAddress'), marked), true)
+  assert.equal(underComposite('deliveryAddress.city', marked), true)
+  const independent = fields.map((field) => field.name === 'deliveryAddress.region' ? { ...field, sample: OBJECT_FIELDS } : field)
+  assert.equal(compositeField(independent.find((field) => field.name === 'deliveryAddress.region'), independent), false)
+  const crossed = withTextCombinationValues(fields, {
+    'deliveryAddress.region': [
+      { code: 'A', name: 'RegA' },
+      { code: 'B', name: 'RegB' },
+    ],
+  }, {})
+  const regionField = crossed.find((field) => field.name === 'deliveryAddress.region')
+  assert.equal(regionField.vary, true)
+  assert.equal(regionField.values.length, 2)
+  const cases = buildCases(crossed)
+  assert.equal(cases.length, 4)
+  assert.deepEqual(
+    cases.map((item) => [item.body.deliveryAddress.region.code, item.body.deliveryAddress.region.name]).sort(),
+    [['A', 'RegA'], ['A', 'RegA'], ['B', 'RegB'], ['B', 'RegB']],
+  )
+  assert.ok(cases.every((item) => item.varied['deliveryAddress.region.code'] && item.varied['deliveryAddress.region.name']))
 })
 
 test('response schema lists nested fields for each status', () => {
@@ -1055,6 +1223,18 @@ test('response expectations compare a sent request field and a typed value', () 
   }]
   const names = new Set(['status'])
   assert.deepEqual(responseChecks(views, names, { '201': { id: '' } }), { '201': { status: '@{status}' } })
+  const cursorViews = [{
+    status: '200',
+    fields: [
+      { name: 'nextCursor', type: 'string' },
+      { name: 'size', type: 'integer' },
+      { name: 'reference', type: 'string' },
+    ],
+  }]
+  assert.deepEqual(
+    responseChecks(cursorViews, new Set(['nextCursor', 'size', 'reference'])),
+    { '200': { size: '@{size}', reference: '@{reference}' } },
+  )
 
   const request = { body: { status: 'CONFIRMED', orderNumber: 'ORD-1' }, query: {}, path: {} }
   const expectations = { '201': { status: '@{status}', orderNumber: '@{orderNumber}', note: 'fixed' } }
@@ -1092,6 +1272,30 @@ test('response expectations compare a sent request field and a typed value', () 
   )
   assert.equal(list.passed, false)
   assert.match(list.detail, /content\[\]\.status expected CONFIRMED/)
+
+  const any = judge(
+    { outcome: 'success' },
+    200,
+    '{"content":[{"status":"CONFIRMED"},{"status":"DRAFT"}]}',
+    { request: { body: {}, query: { status: '' }, path: {} }, expectations: { '200': { 'content[].status': '@{status}' } } },
+  )
+  assert.equal(any.passed, true)
+
+  const filterOmitted = judge(
+    { outcome: 'success' },
+    200,
+    '{"content":[{"status":"CONFIRMED"},{"status":"DRAFT"}]}',
+    { request: { body: {}, query: {}, path: {} }, expectations: { '200': { 'content[].status': '@{status}' } } },
+  )
+  assert.equal(filterOmitted.passed, true)
+
+  const bodyNull = judge(
+    { outcome: 'success' },
+    200,
+    '{"content":[{"reference":"A"},{"reference":"B"}]}',
+    { request: { body: { reference: null }, query: {}, path: {} }, expectations: { '200': { 'content[].reference': '@{reference}' } } },
+  )
+  assert.equal(bodyNull.passed, true)
 
   const address = judge(
     { outcome: 'success' },
@@ -1131,6 +1335,18 @@ test('response expectations compare a sent request field and a typed value', () 
   )
   assert.equal(kept.passed, false)
   assert.match(kept.detail, /orderNumber expected AB/)
+})
+
+test('a trial sends one request from typed values and defaults', () => {
+  const fields = [
+    { name: 'status', location: 'body', type: 'string', sample: 'DRAFT', values: [], constraints: {} },
+    { name: 'notes', location: 'body', type: 'string', sample: 'Leave at reception', values: [], constraints: {} },
+  ]
+  const [item] = buildTrialCases(fields, { request: { status: 'CONFIRMED' }, omit: [] })
+  assert.equal(item.kind, 'trial')
+  assert.equal(item.body.status, 'CONFIRMED')
+  assert.equal(item.body.notes, 'Leave at reception')
+  assert.equal(item.expect.outcome, 'success')
 })
 
 test('custom cases send request overrides and match response fields', () => {

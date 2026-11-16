@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import CloseIcon from '@mui/icons-material/Close'
+import ContentCopyOutlinedIcon from '@mui/icons-material/ContentCopyOutlined'
 import EditOutlinedIcon from '@mui/icons-material/EditOutlined'
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore'
 import FileDownloadOutlinedIcon from '@mui/icons-material/FileDownloadOutlined'
@@ -24,6 +25,7 @@ import {
   FormControlLabel,
   LinearProgress,
   IconButton,
+  Tooltip,
   InputAdornment,
   List,
   ListItemButton,
@@ -48,6 +50,7 @@ import {
   individualChoices,
   individualIncluded,
   caseCount,
+  compositeField,
   isOmitted,
   casesFor,
   recordId,
@@ -72,16 +75,23 @@ import {
   isArrayOfObjects,
   parseObjectArray,
   readExpectation,
+  applyPaging,
+  collectPaging,
   describeFetched,
   firstPageQuery,
   joinUrl,
   judge,
   listOperations,
   operationGroups,
+  OBJECT_COMPOSITE,
   OBJECT_EMPTY,
   OBJECT_FIELDS,
   OBJECT_NULL,
   objectChoice,
+  combinationObjectMode,
+  descendantScalars,
+  objectHasChildren,
+  storedComposition,
   parseSpecText,
   planContinuation,
   readItems,
@@ -90,11 +100,13 @@ import {
   serverUrl,
   specGaps,
   scalarCombinationField,
+  underComposite,
   valueText,
   responsesForMode,
   withTextCombinationValues,
 } from './openapi/spec'
 import { compareRecords, filterModeChoices, filterRecords, filterRules, filterSummary, FILTER_MODE_LABELS, parseRecordFile } from './openapi/records'
+import { CURSOR_TYPES, PAGING_MODES, pagingForm, pathName, resolvePagination, storedPaging } from './openapi/pagination.js'
 import { capturedFrom, scenarioCall, scenarioRequest, stepShouldRun } from './openapi/scenarios'
 import ScenarioEditor from './ScenarioEditor'
 import {
@@ -155,7 +167,7 @@ const MODES = [
   {
     id: 'combination',
     label: 'Combinations',
-    detail: 'Crosses each selected enum. An optional enum includes null and omit, and a null already in the enum is listed once. An optional object is sent filled, as null, and omitted. An enum that is not crossed uses one selected value. A string or number uses its default plus any other values you add, and can include null and omit when it is optional. Other optional query filters stay off the request. Skip rules are left out. A check passes on a success status, and when each expected response value matches. With a record set uploaded, each check filters that set and compares it with the rows from every page.',
+    detail: 'Crosses each selected enum. An optional enum includes null and omit, and a null already in the enum is listed once. An optional object is sent filled, as null, and omitted. Mark an object with children as Composite to send those children as one value, and add those sets in Values. Composite combinations use only the sets you add. An enum that is not crossed uses one selected value. A string or number uses its default plus any other values you add, and can include null and omit when it is optional. Other optional query filters stay off the request. Skip rules are left out. A check passes on a success status, and when each expected response value matches. With a record set uploaded, each check filters that set and compares it with the rows from every page.',
   },
   {
     id: 'individual',
@@ -171,6 +183,11 @@ const MODES = [
     id: 'custom',
     label: 'Custom',
     detail: 'Runs the cases saved for this operation. Blank request fields use the defaults. A check passes on the HTTP status. A response field with an expected value uses that value. Any other field is compared with the same request field when that value was sent.',
+  },
+  {
+    id: 'trial',
+    label: 'Trial',
+    detail: 'Fill the request and send it once. Blank fields use the defaults. Pagination is not followed. A 2xx status is a pass.',
   },
 ]
 
@@ -230,6 +247,7 @@ export default function App() {
   const clientsBody = useRef('')
 
   const selected = operations.find((operation) => operation.id === selectedId) || null
+  const selectedPaging = resolvePagination(selected?.pagination, customCases.paging?.[selected?.id])
   const activeMode = mode === 'boundary' ? 'individual' : mode
   const modeInfo = MODES.find((item) => item.id === activeMode)
   const resolvedFields = useMemo(() => {
@@ -242,13 +260,14 @@ export default function App() {
   const operationExclusions = selected ? customCases.exclusions?.[selected.id] : undefined
   const operationErrorCases = selected ? customCases.errors?.[selected.id] : undefined
   const operationErrorChecks = selected ? customCases.checks?.[selected.id] : undefined
+  const operationTrial = selected ? customCases.trials?.[selected.id] : undefined
   const builtCases = useMemo(
     () => (selected ? casesFor(activeMode, resolvedFields, resolveCases(operationCases || [], defaults.variables), {
       fieldsets: operationExclusions?.fieldsets || [],
       distinct: operationExclusions?.distinct || [],
       exclusive: selected.exclusive || [],
-    }, operationErrorCases || []) : []),
-    [activeMode, defaults.variables, operationCases, operationErrorCases, operationExclusions, resolvedFields, selected],
+    }, operationErrorCases || [], operationTrial) : []),
+    [activeMode, defaults.variables, operationCases, operationErrorCases, operationExclusions, operationTrial, resolvedFields, selected],
   )
   const planned = useMemo(
     () => applyErrorOverrides(builtCases, operationErrorChecks || {}),
@@ -667,13 +686,24 @@ export default function App() {
   }
 
   function writeObject(field, mode) {
-    const globalMode = objectChoice(defaults.global?.[field.name])
-    if (mode === 'fields' && globalMode === 'fields') {
-      writeEndpoint(field, '', true)
+    if (mode === 'composite') {
+      writeEndpoint(field, OBJECT_COMPOSITE)
       return
     }
-    const raw = mode === 'null' ? OBJECT_NULL : mode === 'empty' ? OBJECT_EMPTY : OBJECT_FIELDS
-    writeEndpoint(field, raw)
+    if (mode === 'fields') {
+      if (objectHasChildren(field, fields) && String(field.name || '').includes('.')) {
+        writeEndpoint(field, OBJECT_FIELDS)
+        return
+      }
+      const globalMode = objectChoice(defaults.global?.[field.name])
+      if (globalMode === 'fields') {
+        writeEndpoint(field, '', true)
+        return
+      }
+      writeEndpoint(field, OBJECT_FIELDS)
+      return
+    }
+    writeEndpoint(field, mode === 'null' ? OBJECT_NULL : OBJECT_EMPTY)
   }
 
   function writeEndpoint(field, raw, inherit = false) {
@@ -692,6 +722,20 @@ export default function App() {
         operations[operationId] = next
       }
       return { ...current, operations }
+    })
+  }
+
+  function writeTrial(operationId, patch) {
+    setCustomCases((current) => {
+      const trials = { ...(current.trials || {}) }
+      const previous = trials[operationId] || { request: {}, omit: [] }
+      const next = {
+        request: patch.request !== undefined ? patch.request : previous.request,
+        omit: patch.omit !== undefined ? patch.omit : previous.omit,
+      }
+      if (Object.keys(next.request || {}).length === 0 && (next.omit || []).length === 0) delete trials[operationId]
+      else trials[operationId] = next
+      return { ...current, trials }
     })
   }
 
@@ -734,6 +778,12 @@ export default function App() {
       const operation = { ...(values[operationId] || {}) }
       const next = []
       for (const item of list || []) {
+        if (item && typeof item === 'object' && !Array.isArray(item)) {
+          const composition = storedComposition(item)
+          if (!composition || next.some((existing) => JSON.stringify(existing) === JSON.stringify(composition))) continue
+          next.push(composition)
+          continue
+        }
         const text = String(item ?? '').trim()
         if (!text || next.includes(text)) continue
         next.push(text)
@@ -782,6 +832,16 @@ export default function App() {
 
   function writeScenarios(list) {
     setCustomCases((current) => ({ ...current, scenarios: list }))
+  }
+
+  function writePaging(operationId, next) {
+    setCustomCases((current) => {
+      const paging = { ...(current.paging || {}) }
+      const saved = storedPaging(next)
+      if (!saved) delete paging[operationId]
+      else paging[operationId] = saved
+      return { ...current, paging }
+    })
   }
 
   function writeFilter(operationId, field, patch, detected) {
@@ -860,9 +920,9 @@ export default function App() {
     const around = fixtureSteps(selected, operations, defaults, customCases.ids?.[selected.id])
     const plan = around?.plan || null
     const savedSteps = customCases.steps?.[selected.id] || {}
-    const useBefore = Boolean(plan) && fixtureEnabled(savedSteps, 'before')
+    const useBefore = activeMode !== 'trial' && Boolean(plan) && fixtureEnabled(savedSteps, 'before')
     const useAfter = useBefore && Boolean(plan?.cleanup) && fixtureEnabled(savedSteps, 'after')
-    const useEnquiry = Boolean(around?.enquiry) && fixtureEnabled(savedSteps, 'enquiry')
+    const useEnquiry = activeMode !== 'trial' && Boolean(around?.enquiry) && fixtureEnabled(savedSteps, 'enquiry')
     const assigned = useBefore ? assignFixture(cases, plan) : cases
     let sharedId = null
     const releaseIds = []
@@ -930,6 +990,7 @@ export default function App() {
           onActivity: setActivity,
           headers,
           oauth,
+          paging: customCases.paging?.[selected.id],
         })
         if (!response) {
           if (ownId != null) releaseIds.push(ownId)
@@ -939,7 +1000,9 @@ export default function App() {
         const bodyText = item.expect?.outcome === 'custom' && response.pages?.[0] ? response.pages[0].text : response.text
         const verdict = judge(item.expect, response.status, bodyText, {
           request: response.request || { body: item.body, query: item.query, path: item.path },
-          expectations: responseChecks(responsesForMode(selected.responses, activeMode), new Set(fields.map((field) => field.name)), defaults.responses?.[selected.id]),
+          expectations: activeMode === 'trial'
+            ? {}
+            : responseChecks(responsesForMode(selected.responses, activeMode), new Set(fields.map((field) => field.name)), defaults.responses?.[selected.id]),
           variables: defaults.variables,
           pages: response.pages,
         })
@@ -1113,7 +1176,7 @@ export default function App() {
   }
 
   const failed = results.filter((result) => !result.passed && !result.skipped).length
-  const showRequest = visible.some((result) => result.request)
+  const viewed = results.find((result) => result.index === openResult) || null
 
   return (
     <Box sx={{ minHeight: '100vh' }}>
@@ -1200,27 +1263,27 @@ export default function App() {
 
         <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', lg: '320px minmax(0, 1fr)' }, gap: 2, alignItems: 'start' }}>
           <Paper sx={{ overflow: 'hidden' }}>
+            <ListItemButton
+              selected={showScenarios}
+              onClick={() => {
+                const list = customCases.scenarios || []
+                if (!showScenarios) {
+                  setResults([])
+                  setOpenResult(null)
+                }
+                setShowScenarios(true)
+                setScenarioId((current) => (list.some((item) => item.id === current) ? current : (list[0]?.id || '')))
+              }}
+              sx={{ px: 2, py: 1.5, borderBottom: 1, borderColor: 'divider' }}
+            >
+              <ListItemText primary="Scenarios" slotProps={{ primary: { variant: 'subtitle2' } }} />
+              {(customCases.scenarios || []).length > 0 && <Chip size="small" label={customCases.scenarios.length} variant="outlined" />}
+            </ListItemButton>
             <Stack direction="row" spacing={1} sx={{ px: 2, py: 1.5, alignItems: 'center', borderBottom: 1, borderColor: 'divider' }}>
               <Typography variant="subtitle2">Operations</Typography>
               {operations.length > 0 && <Chip size="small" label={operations.length} variant="outlined" />}
             </Stack>
             <List dense disablePadding sx={{ maxHeight: { lg: 'calc(100vh - 250px)' }, overflow: 'auto' }}>
-              <ListItemButton
-                selected={showScenarios}
-                onClick={() => {
-                  const list = customCases.scenarios || []
-                  if (!showScenarios) {
-                    setResults([])
-                    setOpenResult(null)
-                  }
-                  setShowScenarios(true)
-                  setScenarioId((current) => (list.some((item) => item.id === current) ? current : (list[0]?.id || '')))
-                }}
-                sx={{ py: 1, borderBottom: 1, borderColor: 'divider' }}
-              >
-                <ListItemText primary="Scenarios" slotProps={{ primary: { variant: 'body2', sx: { fontWeight: 700 } } }} />
-                {(customCases.scenarios || []).length > 0 && <Chip size="small" label={customCases.scenarios.length} variant="outlined" />}
-              </ListItemButton>
               {operationGroups(operations).map((group) => {
                 const open = openTag === group.tag
                 return (
@@ -1257,7 +1320,7 @@ export default function App() {
                             />
                             <RoleMark operation={operation} />
                             <IdMark operation={operation} saved={customCases.ids?.[operation.id]} />
-                            <PaginationMark pagination={operation.pagination} />
+                            <PaginationMark pagination={resolvePagination(operation.pagination, customCases.paging?.[operation.id])} />
                           </ListItemButton>
                         ))}
                       </List>
@@ -1310,7 +1373,7 @@ export default function App() {
                   <Button size="small" variant="text" onClick={() => setDefaultsOpen(true)} sx={{ color: 'text.secondary', flexShrink: 0 }}>
                     Defaults
                   </Button>
-                  <PaginationMark pagination={selected.pagination} />
+                  <PaginationMark pagination={selectedPaging} />
                 </Stack>
 
                 <ResponseSchema
@@ -1364,6 +1427,15 @@ export default function App() {
                     custom={operationErrorCases || []}
                     onChange={(list) => writeErrorCases(selected.id, list)}
                   />
+                ) : activeMode === 'trial' ? (
+                  <TrialForm
+                    operation={selected}
+                    fields={fields}
+                    defaults={defaults}
+                    exclusive={selected.exclusive || []}
+                    trial={operationTrial || { request: {}, omit: [] }}
+                    onChange={(next) => writeTrial(selected.id, next)}
+                  />
                 ) : (
                 <Box sx={{ overflow: 'auto', maxHeight: 'min(440px, calc(100vh - 420px))', border: 1, borderColor: 'divider', borderRadius: 1 }}>
                   <Table size="small" stickyHeader sx={{ tableLayout: 'fixed', width: '100%' }}>
@@ -1392,6 +1464,8 @@ export default function App() {
                         const source = sampleSource(field, selected.id, defaults)
                         const depth = field.name.split('.').length - 1
                         const individualField = { ...resolved, individual: field.individual }
+                        const nestedComposite = underComposite(field.name, resolvedFields)
+                        const composite = compositeField(field, resolvedFields)
                         const toggleIndividual = (id, checked) => updateField(field.name, { individual: { ...(field.individual || {}), [id]: checked } })
                         if (activeMode === 'individual') {
                           return (
@@ -1423,8 +1497,8 @@ export default function App() {
                               control={(
                                 <Checkbox
                                   size="small"
-                                  checked={resolved.vary}
-                                  disabled={activeMode !== 'combination' || resolved.values.length === 0}
+                                  checked={nestedComposite ? false : resolved.vary}
+                                  disabled={activeMode !== 'combination' || nestedComposite || resolved.values.length === 0}
                                   onChange={(event) => updateField(field.name, { vary: event.target.checked, textVary: event.target.checked })}
                                 />
                               )}
@@ -1453,7 +1527,9 @@ export default function App() {
                               field={field}
                               resolved={resolved}
                               source={source}
-                              hidden={(field.enum || (field.object && !field.required)) && resolved.vary}
+                              hidden={nestedComposite || ((field.enum || (field.object && !field.required && !objectHasChildren(field, resolvedFields))) && resolved.vary)}
+                              objectComposite={activeMode === 'combination' && objectHasChildren(field, resolvedFields)}
+                              objectMode={activeMode === 'combination' ? combinationObjectMode(resolved, resolvedFields) : undefined}
                               onChange={(sample) => writeEndpoint(field, sample)}
                               onInherit={() => writeEndpoint(field, '', true)}
                               onObject={(next) => writeObject(field, next)}
@@ -1461,7 +1537,16 @@ export default function App() {
                           </TableCell>
                           {activeMode === 'combination' && (
                             <TableCell>
-                              {(field.enum || (field.object && !field.required)) && resolved.vary ? (
+                              {nestedComposite ? (
+                                <Typography variant="caption" color="text.secondary">Set with {compositeParentName(field.name, resolvedFields)}</Typography>
+                              ) : composite ? (
+                                <CompositionSetsEditor
+                                  field={resolved}
+                                  fields={resolvedFields}
+                                  values={customCases.values?.[selected.id]?.[field.name] || []}
+                                  onChange={(list) => writeCombinationValues(selected.id, field.name, list)}
+                                />
+                              ) : (field.enum || (field.object && !field.required)) && resolved.vary ? (
                                 <Stack direction="row" spacing={0.5} useFlexGap sx={{ flexWrap: 'wrap', alignItems: 'center' }}>
                                   {resolved.values.map((value, index) => <Chip key={`${valueText(value)}-${index}`} label={loopLabel(value)} size="small" />)}
                                 </Stack>
@@ -1482,11 +1567,11 @@ export default function App() {
                 </Box>
                 )}
 
-                {activeMode === 'combination' && selected?.pagination && (
+                {activeMode === 'combination' && selectedPaging && (
                   <RecordSet
                     fields={fields}
                     columns={selected.recordColumns}
-                    pagination={selected.pagination}
+                    pagination={selectedPaging}
                     dataset={datasets[selected.id]}
                     overrides={customCases.filters?.[selected.id]}
                     onDataset={(next) => writeDataset(selected.id, next)}
@@ -1505,7 +1590,7 @@ export default function App() {
                 )}
 
                 <Stack spacing={1}>
-                  {preparation && (
+                  {preparation && activeMode !== 'trial' && (
                     <FixtureCalls
                       calls={preparation.calls}
                       saved={customCases.steps?.[selected.id]}
@@ -1520,7 +1605,7 @@ export default function App() {
                       disabled={running || planned.length === 0}
                       onClick={run}
                     >
-                      Run {planned.length} {planned.length === 1 ? 'check' : 'checks'}
+                      {activeMode === 'trial' ? 'Send request' : `Run ${planned.length} ${planned.length === 1 ? 'check' : 'checks'}`}
                     </Button>
                     <Button
                       variant="outlined"
@@ -1553,9 +1638,11 @@ export default function App() {
                             ? 'This operation has no checks in the selected mode.'
                             : running
                               ? `${finishedChecks} of ${planned.length} complete${activity ? ` · ${activity}` : ''}`
-                              : `List checks follow the spec. Requests stay within this rate.${skippedCombinations > 0 ? ` ${skippedCombinations} combinations skipped.` : ''}${activeMode === 'combination' && datasets[selected?.id]?.rows?.length ? ` ${datasets[selected.id].rows.length} uploaded ${datasets[selected.id].rows.length === 1 ? 'record is' : 'records are'} filtered for each check.` : ''}`}
+                              : activeMode === 'trial'
+                              ? 'Sends one request at this rate. Pagination is not followed.'
+                            : `List checks follow the spec. Requests stay within this rate.${skippedCombinations > 0 ? ` ${skippedCombinations} combinations skipped.` : ''}${activeMode === 'combination' && datasets[selected?.id]?.rows?.length ? ` ${datasets[selected.id].rows.length} uploaded ${datasets[selected.id].rows.length === 1 ? 'record is' : 'records are'} filtered for each check.` : ''}`}
                     </Typography>
-                    <PaginationHelp pagination={selected.pagination} />
+                    <PaginationHelp pagination={selectedPaging} />
                   </Stack>
                   {running && (
                     <LinearProgress
@@ -1615,6 +1702,10 @@ export default function App() {
             onImport={(file) => importLibrary(file, 'defaults')}
             onImportProfiles={(file) => importLibrary(file, 'profiles')}
             onDismissNotice={() => setLibraryNotice('')}
+            operations={operations}
+            selectedId={selectedId}
+            paging={customCases.paging}
+            onPaging={writePaging}
           />
         </Box>
 
@@ -1658,7 +1749,6 @@ export default function App() {
                     <TableCell width={80}>HTTP</TableCell>
                     <TableCell>Case</TableCell>
                     <TableCell>Assertion</TableCell>
-                    {showRequest && <TableCell width="28%">Request</TableCell>}
                     <TableCell width="32%">Response</TableCell>
                   </TableRow>
                 </TableHead>
@@ -1667,7 +1757,7 @@ export default function App() {
                     <TableRow
                       key={result.index}
                       hover
-                      onClick={() => setOpenResult(openResult === result.index ? null : result.index)}
+                      onClick={() => setOpenResult(result.index)}
                       sx={{
                         cursor: 'pointer',
                         boxShadow: result.passed || result.skipped ? 'none' : 'inset 3px 0 0 #b42318',
@@ -1688,19 +1778,19 @@ export default function App() {
                       <TableCell sx={{ fontVariantNumeric: 'tabular-nums', fontWeight: 650 }}>{result.status || '—'}</TableCell>
                       <TableCell>{result.label}</TableCell>
                       <TableCell sx={{ color: 'text.secondary' }}>{result.detail}</TableCell>
-                      {showRequest && (
-                        <TableCell>
-                          {openResult === result.index && result.request && <PayloadText text={result.request} open />}
-                        </TableCell>
-                      )}
                       <TableCell>
-                        <ResponsePreview result={result} open={openResult === result.index} />
+                        <ResponsePreview result={result} />
                       </TableCell>
                     </TableRow>
                   ))}
                 </TableBody>
               </Table>
             </Box>}
+            {viewed && (
+              <Dialog open onClose={() => setOpenResult(null)} maxWidth="md" fullWidth>
+                <ResultDialog result={viewed} onClose={() => setOpenResult(null)} />
+              </Dialog>
+            )}
           </Paper>
         )}
       </Box>
@@ -1897,7 +1987,7 @@ function ResponseSchema({ responses, requestNames, expected, onExpected }) {
           ) : (
             <Box sx={{ maxHeight: 280, overflow: 'auto' }}>
               <Typography variant="caption" color="text.secondary" sx={{ display: 'block', px: 1.5, py: 0.75, borderBottom: 1, borderColor: 'divider' }}>
-                {'@{name}'} is the value sent for that request field. Text is compared after leading and trailing spaces are removed, and a value that is only spaces is null. A success field with the same name starts as that reference. Clear a value to skip it. {'${name}'} still reads a variable. For an array of objects, enter a JSON array. Each object must appear, and only the fields you include are compared. In sequence requires those objects to be the first items, in the order you wrote.
+                {'@{name}'} is the value sent for that request field. A null or omitted request field, including a blank list filter, is treated as any value and is not compared. Text is compared after leading and trailing spaces are removed, and a value that is only spaces is null. A success field with the same name starts as that reference, except nextCursor, which is a new token for the next page. Clear a value to skip it. {'${name}'} still reads a variable. For an array of objects, enter a JSON array. Each object must appear, and only the fields you include are compared. In sequence requires those objects to be the first items, in the order you wrote.
               </Typography>
               <Table size="small">
                 <TableHead>
@@ -2422,6 +2512,75 @@ function CustomExpected({ responses, status, fields, onChange }) {
   )
 }
 
+function TrialForm({ operation, fields, defaults, exclusive = [], trial, onChange }) {
+  const active = trial || { request: {}, omit: [] }
+
+  function updateRequest(name, raw, field) {
+    const request = { ...active.request }
+    if (raw === '') delete request[name]
+    else request[name] = coerceFieldValue(field, raw)
+    onChange({ request, omit: active.omit || [] })
+  }
+
+  function toggleOmit(name) {
+    const omit = new Set(active.omit || [])
+    if (omit.has(name)) omit.delete(name)
+    else omit.add(name)
+    onChange({ request: active.request || {}, omit: [...omit] })
+  }
+
+  return (
+    <Box sx={{ overflow: 'auto', maxHeight: 'min(440px, calc(100vh - 420px))', border: 1, borderColor: 'divider', borderRadius: 1 }}>
+      <Table size="small" stickyHeader sx={{ tableLayout: 'fixed', width: '100%' }}>
+        <TableHead>
+          <TableRow>
+            <TableCell sx={{ width: 210 }}>Field</TableCell>
+            <TableCell>Value</TableCell>
+            <TableCell sx={{ width: 72 }}>Omit</TableCell>
+          </TableRow>
+        </TableHead>
+        <TableBody>
+          {fields.map((field) => {
+            if (customAncestorClosed(field.name, fields, active, defaults, operation)) return null
+            const omitted = (active.omit || []).includes(field.name)
+            const hasValue = Object.prototype.hasOwnProperty.call(active.request || {}, field.name)
+            const inherited = effectiveSample(field, operation.id, defaults)
+            const depth = field.name.split('.').length - 1
+            return (
+              <TableRow key={`${field.location}-${field.name}`} hover>
+                <TableCell>
+                  <FieldSummary field={field} depth={depth} exclusive={exclusive} />
+                </TableCell>
+                <TableCell sx={{ minWidth: 160 }}>
+                  {field.object ? (
+                    <ObjectChoice
+                      value={objectChoice(hasValue ? active.request[field.name] : inherited)}
+                      onChange={(mode) => updateRequest(field.name, mode === 'null' ? OBJECT_NULL : mode === 'empty' ? OBJECT_EMPTY : OBJECT_FIELDS, field)}
+                    />
+                  ) : (
+                    <TextField
+                      size="small"
+                      fullWidth
+                      disabled={omitted}
+                      placeholder={omitted ? 'Omitted' : String(inherited ?? '')}
+                      value={hasValue ? String(active.request[field.name]) : ''}
+                      onChange={(event) => updateRequest(field.name, event.target.value, field)}
+                      slotProps={{ htmlInput: { 'aria-label': field.name } }}
+                    />
+                  )}
+                </TableCell>
+                <TableCell>
+                  <Checkbox size="small" checked={omitted} onChange={() => toggleOmit(field.name)} />
+                </TableCell>
+              </TableRow>
+            )
+          })}
+        </TableBody>
+      </Table>
+    </Box>
+  )
+}
+
 function CustomCases({ operation, fields, defaults, exclusive = [], responses = [], cases, onChange, onExport, onImport }) {
   const [activeId, setActiveId] = useState(cases[0]?.id || '')
   const active = cases.find((item) => item.id === activeId) || cases[0] || null
@@ -2577,6 +2736,7 @@ const SETTING_SECTIONS = [
   { id: 'defaults', label: 'Defaults' },
   { id: 'headers', label: 'Headers' },
   { id: 'token', label: 'Access token' },
+  { id: 'pagination', label: 'Pagination' },
 ]
 
 function LibraryDialog({
@@ -2607,6 +2767,10 @@ function LibraryDialog({
   onImport,
   onImportProfiles,
   onDismissNotice,
+  operations = [],
+  selectedId = '',
+  paging = {},
+  onPaging,
 }) {
   const [section, setSection] = useState('client')
   useEffect(() => {
@@ -2616,6 +2780,7 @@ function LibraryDialog({
     variables: Object.keys(defaults.variables || {}).length,
     defaults: Object.keys(defaults.global || {}).length,
     headers: Object.keys(defaults.headers || {}).length,
+    pagination: Object.keys(paging || {}).length,
   }
   const clientLabel = [profileName, oauth.clientId].map((item) => String(item || '').trim()).filter(Boolean).join(' · ')
   return (
@@ -2788,6 +2953,14 @@ function LibraryDialog({
               />
             </SettingSection>
           )}
+          {section === 'pagination' && (
+            <PaginationSetting
+              operations={operations}
+              selectedId={selectedId}
+              paging={paging}
+              onPaging={onPaging}
+            />
+          )}
         </Box>
       </DialogContent>
       <DialogActions sx={{ px: 2.5, py: 1.5, borderTop: 1, borderColor: 'divider', justifyContent: 'space-between', flexWrap: 'wrap', gap: 1 }}>
@@ -2799,6 +2972,141 @@ function LibraryDialog({
         <Button variant="contained" onClick={onClose}>Done</Button>
       </DialogActions>
     </Dialog>
+  )
+}
+
+function PaginationSetting({ operations, selectedId, paging, onPaging }) {
+  const listed = Array.isArray(operations) ? operations : []
+  const [operationId, setOperationId] = useState(selectedId || listed[0]?.id || '')
+  useEffect(() => {
+    if (selectedId) setOperationId(selectedId)
+  }, [selectedId])
+  const operation = listed.find((item) => item.id === operationId) || listed[0] || null
+  const form = pagingForm(operation?.pagination, paging?.[operation?.id])
+  function write(patch) {
+    if (!operation || !onPaging) return
+    onPaging(operation.id, { ...form, ...patch })
+  }
+  return (
+    <SettingSection
+      title="Pagination"
+      hint="Detected names stay in use until you pick a mode for this endpoint. Cursor mode follows nextCursor until the last-page value."
+    >
+      {listed.length === 0 ? (
+        <Typography variant="body2" color="text.secondary">Load an OpenAPI document to configure pagination.</Typography>
+      ) : (
+        <Stack spacing={1.5}>
+          <TextField
+            select
+            size="small"
+            label="Operation"
+            value={operation?.id || ''}
+            onChange={(event) => setOperationId(event.target.value)}
+            fullWidth
+          >
+            {listed.map((item) => (
+              <MenuItem key={item.id} value={item.id}>{item.id}</MenuItem>
+            ))}
+          </TextField>
+          <TextField
+            select
+            size="small"
+            label="Mode"
+            value={form.mode}
+            onChange={(event) => {
+              const mode = event.target.value
+              if (mode === 'detected') onPaging?.(operation.id, { mode: 'detected' })
+              else write({ mode })
+            }}
+            fullWidth
+          >
+            {PAGING_MODES.map((item) => (
+              <MenuItem key={item.id} value={item.id}>{item.label}</MenuItem>
+            ))}
+          </TextField>
+          {form.mode === 'detected' && (
+            <Typography variant="body2" color="text.secondary">{paginationSummary(resolvePagination(operation?.pagination, null))}</Typography>
+          )}
+          {form.mode === 'none' && (
+            <Typography variant="body2" color="text.secondary">Each check sends one request.</Typography>
+          )}
+          {form.mode === 'cursor' && (
+            <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: '1fr 1fr' }, gap: 1.5 }}>
+              <TextField size="small" label="Request page size" value={form.request.size} onChange={(event) => write({ request: { ...form.request, size: event.target.value } })} fullWidth />
+              <TextField size="small" label="Request nextCursor" value={form.request.cursor} onChange={(event) => write({ request: { ...form.request, cursor: event.target.value } })} fullWidth />
+              <SentinelFields
+                label="First-page cursor"
+                value={form.firstCursor}
+                onChange={(next) => write({ firstCursor: next })}
+              />
+              <TextField size="small" label="Response nextCursor" value={form.response.cursor} onChange={(event) => write({ response: { ...form.response, cursor: event.target.value } })} fullWidth />
+              <TextField size="small" label="Response this page size" value={form.response.pageSize} onChange={(event) => write({ response: { ...form.response, pageSize: event.target.value } })} fullWidth />
+              <TextField size="small" label="Response total records" value={form.response.total} onChange={(event) => write({ response: { ...form.response, total: event.target.value } })} helperText="Leave blank when the API does not return a full count." fullWidth />
+              <SentinelFields
+                label="Last-page cursor"
+                value={form.lastCursor}
+                onChange={(next) => write({ lastCursor: next })}
+              />
+            </Box>
+          )}
+          {form.mode === 'page' && (
+            <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: '1fr 1fr' }, gap: 1.5 }}>
+              <TextField size="small" label="Request page" value={form.request.page} onChange={(event) => write({ request: { ...form.request, page: event.target.value } })} fullWidth />
+              <TextField size="small" label="Request page size" value={form.request.size} onChange={(event) => write({ request: { ...form.request, size: event.target.value } })} fullWidth />
+              <TextField select size="small" label="First page index" value={String(form.pageBase ?? 0)} onChange={(event) => write({ pageBase: Number(event.target.value) })}>
+                <MenuItem value="0">0</MenuItem>
+                <MenuItem value="1">1</MenuItem>
+              </TextField>
+              <TextField size="small" label="Response page" value={form.response.page} onChange={(event) => write({ response: { ...form.response, page: event.target.value } })} fullWidth />
+              <TextField size="small" label="Response page size" value={form.response.pageSize} onChange={(event) => write({ response: { ...form.response, pageSize: event.target.value } })} fullWidth />
+              <TextField size="small" label="Response total records" value={form.response.total} onChange={(event) => write({ response: { ...form.response, total: event.target.value } })} fullWidth />
+              <TextField size="small" label="Response total pages" value={form.response.totalPages} onChange={(event) => write({ response: { ...form.response, totalPages: event.target.value } })} fullWidth />
+            </Box>
+          )}
+          {form.mode === 'offset' && (
+            <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: '1fr 1fr' }, gap: 1.5 }}>
+              <TextField size="small" label="Request offset" value={form.request.offset} onChange={(event) => write({ request: { ...form.request, offset: event.target.value } })} fullWidth />
+              <TextField size="small" label="Request page size" value={form.request.size} onChange={(event) => write({ request: { ...form.request, size: event.target.value } })} fullWidth />
+              <TextField size="small" label="Response this page size" value={form.response.pageSize} onChange={(event) => write({ response: { ...form.response, pageSize: event.target.value } })} fullWidth />
+              <TextField size="small" label="Response total records" value={form.response.total} onChange={(event) => write({ response: { ...form.response, total: event.target.value } })} helperText="Leave blank when the API does not return a full count." fullWidth />
+            </Box>
+          )}
+          {form.mode === 'link' && (
+            <TextField size="small" label="Response next link" value={form.response.nextLink} onChange={(event) => write({ response: { ...form.response, nextLink: event.target.value } })} helperText="A JSON field, or leave blank to use the Link header." fullWidth />
+          )}
+        </Stack>
+      )}
+    </SettingSection>
+  )
+}
+
+function SentinelFields({ label, value, onChange }) {
+  const type = value?.type || 'string'
+  const showValue = type === 'string' || type === 'integer'
+  return (
+    <Box sx={{ display: 'grid', gridTemplateColumns: showValue ? { xs: '1fr', sm: '120px minmax(0, 1fr)' } : '1fr', gap: 1.5, gridColumn: '1 / -1' }}>
+      <TextField
+        select
+        size="small"
+        label={`${label} type`}
+        value={type}
+        onChange={(event) => onChange({ type: event.target.value, value: type === event.target.value ? (value?.value ?? '') : (event.target.value === 'integer' ? '0' : event.target.value === 'string' ? '0' : '') })}
+      >
+        {CURSOR_TYPES.map((item) => (
+          <MenuItem key={item.id} value={item.id}>{item.label}</MenuItem>
+        ))}
+      </TextField>
+      {showValue && (
+        <TextField
+          size="small"
+          label={label}
+          type={type === 'integer' ? 'number' : 'text'}
+          value={value?.value ?? ''}
+          onChange={(event) => onChange({ type, value: event.target.value })}
+          fullWidth
+        />
+      )}
+    </Box>
   )
 }
 
@@ -3268,7 +3576,11 @@ function ExclusiveMark({ name, groups }) {
   const peers = exclusivePeers(name, groups)
   if (peers.length === 0) return null
   const title = `Cannot be set together with ${peers.join(', ')}`
-  return <Chip size="small" variant="outlined" label="exclusive" title={title} sx={{ height: 20, fontSize: 11 }} />
+  return (
+    <Typography component="span" variant="caption" color="text.secondary" title={title} sx={{ fontWeight: 650, letterSpacing: 0.2 }}>
+      excl.
+    </Typography>
+  )
 }
 
 function exclusivePeers(name, groups) {
@@ -3406,47 +3718,106 @@ function statusTone(code) {
   return { bg: '#f1f5f9', fg: '#334155' }
 }
 
-function ResponsePreview({ result, open }) {
+function ResponsePreview({ result }) {
   const summary = responseSummary(result)
   return (
-    <Stack spacing={0.5} sx={{ alignItems: 'flex-start' }}>
-      <Stack direction="row" spacing={0.75} sx={{ alignItems: 'center', minWidth: 0 }}>
-        {summary ? (
-          <Typography variant="body2" color="text.secondary" sx={{ minWidth: 0 }}>{summary}</Typography>
-        ) : result.text ? (
-          <Typography variant="caption" color="text.secondary">JSON</Typography>
-        ) : null}
-        {hasRecordList(result) && <RecordsTableButton result={result} />}
-      </Stack>
-      {open && <ResponseBody result={result} />}
+    <Stack direction="row" spacing={0.75} sx={{ alignItems: 'center', minWidth: 0 }}>
+      {summary ? (
+        <Typography variant="body2" color="text.secondary" sx={{ minWidth: 0 }}>{summary}</Typography>
+      ) : result.text ? (
+        <Typography variant="caption" color="text.secondary">JSON</Typography>
+      ) : null}
+      {hasRecordList(result) && <RecordsTableButton result={result} />}
     </Stack>
   )
 }
 
-function ResponseBody({ result }) {
-  const body = result.pages && result.pages.length > 1 ? (
-    <Stack spacing={0.75}>
-      {result.pages.map((page) => (
-        <Box key={`${page.label}-${page.status}`} sx={{ border: 1, borderColor: 'divider', borderRadius: 1, overflow: 'hidden' }}>
-          <Typography variant="caption" sx={{ display: 'block', px: 1.25, py: 0.4, bgcolor: '#f8fafc', color: 'text.secondary', fontWeight: 700 }}>
-            {page.label} · HTTP {page.status} · {page.count} records
-          </Typography>
-          <PayloadText text={page.text} open />
-        </Box>
-      ))}
-    </Stack>
-  ) : <PayloadText text={result.text} open />
-  if (!result.enquiry) return body
+function ResultDialog({ result, onClose }) {
+  const pages = resultPages(result)
   return (
-    <Stack spacing={0.75}>
-      {body}
-      <Box sx={{ border: 1, borderColor: 'divider', borderRadius: 1, overflow: 'hidden' }}>
-        <Typography variant="caption" sx={{ display: 'block', px: 1.25, py: 0.4, bgcolor: '#f8fafc', color: 'text.secondary', fontWeight: 700 }}>
-          Enquiry {result.enquiry.label} · HTTP {result.enquiry.status}
-        </Typography>
-        <PayloadText text={result.enquiry.text} open />
-      </Box>
-    </Stack>
+    <>
+      <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1, pr: 1.5 }}>
+        <Box sx={{ flex: 1, minWidth: 0 }}>
+          <Typography variant="subtitle1" noWrap>{result.label}</Typography>
+          <Typography variant="caption" color="text.secondary">
+            HTTP {result.status || '—'} · {result.skipped ? 'Skip' : result.passed ? 'Pass' : 'Fail'}
+          </Typography>
+        </Box>
+        <Button onClick={onClose}>Close</Button>
+      </DialogTitle>
+      <DialogContent dividers>
+        <Stack spacing={1.25}>
+          {result.detail && <Typography variant="body2" color="text.secondary">{result.detail}</Typography>}
+          {result.request && (
+            <PayloadBlock title="Request" text={typeof result.request === 'string' ? result.request : (formatRequestBody(result.request) || JSON.stringify(result.request, null, 2))} />
+          )}
+          {pages.length > 1 && (
+            <Stack direction="row" sx={{ justifyContent: 'flex-end' }}>
+              <CopyButton label="Copy all pages" text={pages.map((page) => `${page.label || 'Page'} · HTTP ${page.status}\n${page.text || ''}`).join('\n\n')} />
+            </Stack>
+          )}
+          {pages.map((page, index) => (
+            <PayloadBlock
+              key={`${page.label}-${index}`}
+              title={pages.length > 1 ? `${page.label || `Page ${index + 1}`} · HTTP ${page.status}` : 'Response'}
+              text={page.text || ''}
+            />
+          ))}
+          {result.enquiry && (
+            <PayloadBlock title={`Enquiry ${result.enquiry.label} · HTTP ${result.enquiry.status}`} text={result.enquiry.text || ''} />
+          )}
+        </Stack>
+      </DialogContent>
+    </>
+  )
+}
+
+function resultPages(result) {
+  if (Array.isArray(result?.pages) && result.pages.length > 0) {
+    return result.pages.map((page) => ({
+      label: page.label,
+      status: page.status,
+      text: pretty(page.text || ''),
+    }))
+  }
+  if (result?.text) return [{ label: 'Response', status: result.status, text: pretty(result.text) }]
+  return []
+}
+
+function PayloadBlock({ title, text }) {
+  return (
+    <Box sx={{ border: 1, borderColor: 'divider', borderRadius: 1, overflow: 'hidden' }}>
+      <Stack direction="row" spacing={1} sx={{ alignItems: 'center', px: 1.25, py: 0.4, bgcolor: '#f8fafc' }}>
+        <Typography variant="caption" sx={{ flex: 1, color: 'text.secondary', fontWeight: 700 }}>{title}</Typography>
+        <CopyButton label={`Copy ${title}`} text={text} />
+      </Stack>
+      <PayloadText text={text} open maxHeight={360} />
+    </Box>
+  )
+}
+
+function CopyButton({ label, text }) {
+  const [copied, setCopied] = useState(false)
+  return (
+    <Tooltip title={copied ? 'Copied' : label}>
+      <IconButton
+        size="small"
+        aria-label={label}
+        onClick={async (event) => {
+          event.stopPropagation()
+          try {
+            await navigator.clipboard.writeText(String(text || ''))
+            setCopied(true)
+            setTimeout(() => setCopied(false), 1200)
+          } catch {
+            setCopied(false)
+          }
+        }}
+        sx={{ color: copied ? 'primary.main' : 'text.secondary' }}
+      >
+        <ContentCopyOutlinedIcon sx={{ fontSize: 16 }} />
+      </IconButton>
+    </Tooltip>
   )
 }
 
@@ -3638,7 +4009,7 @@ function cellText(value) {
   return String(value)
 }
 
-function PayloadText({ text, open }) {
+function PayloadText({ text, open, maxHeight = 220 }) {
   return (
     <Box sx={{
       whiteSpace: open ? 'pre' : 'pre-wrap',
@@ -3651,7 +4022,7 @@ function PayloadText({ text, open }) {
       borderRadius: 1,
       px: open ? 1 : 0,
       py: open ? 0.75 : 0,
-      maxHeight: open ? 220 : 'none',
+      maxHeight: open ? maxHeight : 'none',
       overflow: open ? 'auto' : 'hidden',
     }}
     >
@@ -3692,7 +4063,7 @@ function PaginationHelp({ pagination }) {
         <Box sx={{ width: { xs: 320, sm: 460 }, p: 2 }}>
           <Typography variant="subtitle2" sx={{ mb: 0.75 }}>How list pages are followed</Typography>
           <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
-            {paginationSummary(pagination)} The tester reads the query parameters and the success response of the loaded operation. A name it does not recognize is sent only when you fill that sample.
+            {paginationSummary(pagination)} The tester reads the query parameters, the JSON body, and the success response. Setting → Pagination can replace the detected names. A name it does not recognize is sent only when you fill that sample.
           </Typography>
           <Stack spacing={1.25}>
             {PAGINATION_RULES.map((rule) => (
@@ -3714,7 +4085,7 @@ function PaginationHelp({ pagination }) {
 const PAGINATION_RULES = [
   {
     title: 'Cursor',
-    detail: 'The request uses size and a cursor such as nextCursor. The response returns that cursor again, plus size or totalSize. The next request sends the same size and the returned cursor until the cursor is empty, the page is shorter than size, or the fetched count reaches totalSize.',
+    detail: 'The request uses a page size and a cursor such as nextCursor. The first page can send 0, null, or omit the cursor. The response returns the next cursor and may return this page size. Leave total records blank when the API does not publish a full count. The run stops when the response cursor matches the last-page value, is empty, repeats, or the page is shorter than size.',
   },
   {
     title: 'Page',
@@ -3736,8 +4107,14 @@ function paginationSummary(pagination) {
   }
   if (pagination.style === 'cursor') {
     const size = pagination.request.size ? ` and ${pagination.request.size}` : ''
-    const total = pagination.response.total ? `, until ${pagination.response.total} is reached` : ''
-    return `This operation is treated as cursor pagination via ${pagination.request.cursor}${size}${total}.`
+    const first = pagination.firstCursor && pagination.firstCursor.type !== 'omit'
+      ? `, first ${pagination.request.cursor}=${pagination.firstCursor.type === 'null' ? 'null' : pagination.firstCursor.value}`
+      : ''
+    const last = pagination.lastCursor && pagination.lastCursor.type !== 'omit'
+      ? `, last when ${pathName(pagination.response.nextCursor)} is ${pagination.lastCursor.type === 'null' ? 'null' : pagination.lastCursor.value}`
+      : ''
+    const total = pagination.response.total ? `, until ${pathName(pagination.response.total)} is reached` : ''
+    return `This operation is treated as cursor pagination via ${pagination.request.cursor}${size}${first}${last}${total}.`
   }
   if (pagination.style === 'offset') {
     return `This operation is treated as offset pagination via ${pagination.request.offset}${pagination.request.size ? ` and ${pagination.request.size}` : ''}.`
@@ -3757,28 +4134,37 @@ function fieldTypeLabel(field) {
 
 function FieldSummary({ field, depth, exclusive }) {
   const leaf = field.name.split('.').pop()
+  const meta = [depth === 0 ? field.location : '', fieldTypeLabel(field), ...constraintLabels(field)].filter(Boolean).join(' · ')
   return (
-    <Stack spacing={0.5} sx={{ pl: depth * 1.5 }}>
-      <Stack direction="row" spacing={0.75} useFlexGap sx={{ alignItems: 'center', flexWrap: 'wrap' }}>
-        <Typography variant="body2" sx={{ fontWeight: field.object ? 700 : 650 }}>{leaf}</Typography>
-        {depth === 0 && <ToneChip label={field.location} tone={LOCATION_TONE[field.location]} />}
-        {field.required && <Chip label="required" size="small" variant="outlined" />}
+    <Stack spacing={0.15} sx={{ pl: depth * 1.5, minWidth: 0 }}>
+      <Stack direction="row" spacing={0.5} useFlexGap sx={{ alignItems: 'baseline', flexWrap: 'wrap' }}>
+        <Typography variant="body2" sx={{ fontWeight: field.object ? 700 : 650, lineHeight: 1.3 }}>
+          {leaf}
+          {field.required ? (
+            <Box component="span" title="Required" sx={{ color: 'primary.main', ml: 0.35, fontWeight: 800 }}>*</Box>
+          ) : null}
+        </Typography>
         <ExclusiveMark name={field.name} groups={exclusive} />
       </Stack>
-      <Stack direction="row" spacing={0.5} useFlexGap sx={{ alignItems: 'center', flexWrap: 'wrap' }}>
-        <Typography variant="caption" color="text.secondary">{fieldTypeLabel(field)}</Typography>
-        {constraintLabels(field).map((label) => (
-          <Chip key={label} label={label} size="small" variant="outlined" sx={{ fontWeight: 500 }} />
-        ))}
-      </Stack>
+      {meta && (
+        <Typography variant="caption" color="text.secondary" sx={{ lineHeight: 1.35, display: 'block' }}>
+          {meta}
+        </Typography>
+      )}
     </Stack>
   )
 }
 
-function DefaultValue({ field, resolved, source, hidden = false, onChange, onInherit, onObject }) {
+function DefaultValue({ field, resolved, source, hidden = false, objectComposite = false, objectMode, onChange, onInherit, onObject }) {
   if (hidden) return null
   if (field.object) {
-    return <ObjectChoice value={objectChoice(resolved.sample)} onChange={onObject} />
+    return (
+      <ObjectChoice
+        value={objectMode || objectChoice(resolved.sample)}
+        composite={objectComposite}
+        onChange={onObject}
+      />
+    )
   }
   if (hidden) return null
   return (
@@ -3832,11 +4218,17 @@ function IndividualChoices({ field, onToggle }) {
 
 function constraintLabels(field) {
   const labels = []
-  const { constraints } = field
-  if (constraints.minimum != null) labels.push(`min ${constraints.minimum}`)
-  if (constraints.maximum != null) labels.push(`max ${constraints.maximum}`)
-  if (constraints.minLength) labels.push(`minLen ${constraints.minLength}`)
-  if (constraints.maxLength) labels.push(`maxLen ${constraints.maxLength}`)
+  const { constraints = {} } = field
+  const min = constraints.minimum
+  const max = constraints.maximum
+  if (min != null && max != null) labels.push(`${min}–${max}`)
+  else if (min != null) labels.push(`≥${min}`)
+  else if (max != null) labels.push(`≤${max}`)
+  const minLen = constraints.minLength
+  const maxLen = constraints.maxLength
+  if (minLen && maxLen) labels.push(`${minLen}–${maxLen} chars`)
+  else if (maxLen) labels.push(`≤${maxLen} chars`)
+  else if (minLen) labels.push(`≥${minLen} chars`)
   if (constraints.pattern) labels.push(constraints.pattern)
   if (field.enum) {
     const count = (field.values || []).filter((value) => value != null && !isOmitted(value)).length
@@ -3849,7 +4241,19 @@ function loopLabel(value) {
   if (isOmitted(value)) return 'Omit'
   if (value == null) return 'Null'
   if (value === OBJECT_FIELDS) return 'Fields'
+  if (value === OBJECT_EMPTY) return 'Empty'
+  if (value === OBJECT_COMPOSITE) return 'Composite'
   return valueText(value)
+}
+
+function compositeParentName(name, fields) {
+  const parts = String(name || '').split('.')
+  for (let length = 1; length < parts.length; length += 1) {
+    const parent = parts.slice(0, length).join('.')
+    const field = (fields || []).find((item) => item?.object && item.name === parent)
+    if (field && compositeField(field, fields)) return parent
+  }
+  return parts.slice(0, -1).join('.')
 }
 
 function enumMemberOptions(field) {
@@ -3905,6 +4309,17 @@ function CombinationDefault({ field, onChange }) {
       </TextField>
     )
   }
+  if (field.format === 'date' || field.format === 'date-time') {
+    return (
+      <TypedValue
+        value={field.sample ?? ''}
+        kinds={field.format === 'date' ? ['date'] : ['timestamp']}
+        format={field.format}
+        placeholder={temporalPlaceholder(field.format) || 'Default'}
+        onChange={onChange}
+      />
+    )
+  }
   return (
     <TextField
       size="small"
@@ -3914,6 +4329,84 @@ function CombinationDefault({ field, onChange }) {
       onChange={(event) => onChange(coerceSample(field, event.target.value))}
       slotProps={{ htmlInput: { 'aria-label': 'Default' } }}
     />
+  )
+}
+
+function CompositionSetsEditor({ field, fields, values, onChange }) {
+  const children = descendantScalars(field, fields)
+  const prefix = `${field.name}.`
+  const emptyDraft = () => Object.fromEntries(children.map((child) => [child.name.slice(prefix.length), '']))
+  const [draft, setDraft] = useState(emptyDraft)
+  const compositions = (values || []).filter((item) => item && typeof item === 'object' && !Array.isArray(item))
+  const tokens = (values || []).filter((item) => item === '@null' || item === '@omit')
+  const extrasOn = compositions.length > 0 || tokens.length > 0
+  const filled = storedComposition(draft)
+  const taken = compositions.some((item) => JSON.stringify(storedComposition(item)) === JSON.stringify(filled))
+  const add = () => {
+    if (!filled || taken) return
+    onChange([...(values || []), filled])
+    setDraft(emptyDraft())
+  }
+  const toggle = (token) => onChange(values.includes(token) ? values.filter((item) => item !== token) : [...values, token])
+  const choiceSx = (on) => ({
+    height: 22,
+    borderColor: on ? 'primary.main' : 'divider',
+    bgcolor: on ? 'rgba(15, 39, 68, 0.06)' : 'transparent',
+    color: on ? 'primary.main' : 'text.secondary',
+    '& .MuiChip-label': { px: 0.75, fontSize: 12, fontWeight: on ? 650 : 500 },
+  })
+  return (
+    <Stack spacing={0.75}>
+      <Stack direction="row" spacing={0.5} useFlexGap sx={{ flexWrap: 'wrap', alignItems: 'center' }}>
+        {compositions.map((value, index) => (
+          <Chip
+            key={`${valueText(value)}-${index}`}
+            size="small"
+            label={loopLabel(value)}
+            onDelete={() => onChange(values.filter((item) => item !== value))}
+          />
+        ))}
+        {!field.required && extrasOn && (
+          <>
+            <Chip size="small" variant="outlined" label="Null" onClick={() => toggle('@null')} sx={choiceSx(tokens.includes('@null'))} />
+            <Chip size="small" variant="outlined" label="Omit" onClick={() => toggle('@omit')} sx={choiceSx(tokens.includes('@omit'))} />
+          </>
+        )}
+        {!field.required && !extrasOn && (
+          <>
+            <Chip size="small" label="Null" />
+            <Chip size="small" label="Omit" />
+          </>
+        )}
+      </Stack>
+      {children.length > 0 && (
+        <Stack direction="row" spacing={0.75} useFlexGap sx={{ flexWrap: 'wrap', alignItems: 'center' }}>
+          {children.map((child) => {
+            const relative = child.name.slice(prefix.length)
+            return (
+              <TextField
+                key={child.name}
+                size="small"
+                placeholder={relative}
+                value={draft[relative] ?? ''}
+                onChange={(event) => setDraft((current) => ({ ...current, [relative]: event.target.value }))}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    event.preventDefault()
+                    add()
+                  }
+                }}
+                slotProps={{ htmlInput: { 'aria-label': relative } }}
+                sx={{ width: '100%', maxWidth: 120, flex: '1 1 88px' }}
+              />
+            )
+          })}
+          <Button size="small" variant="outlined" onClick={add} disabled={!filled || taken} sx={{ flexShrink: 0, px: 1 }}>
+            Add
+          </Button>
+        </Stack>
+      )}
+    </Stack>
   )
 }
 
@@ -3973,6 +4466,7 @@ function valueKinds(field) {
   if (!field) return ['text']
   if (field.format === 'date') return ['date']
   if (field.format === 'date-time') return ['timestamp']
+  if (field.format === 'time') return ['text']
   if (field.type === 'boolean') return ['text', 'boolean']
   if (field.type === 'integer' || field.type === 'number') return ['text', 'number']
   if (field.type === 'string' && !(field.values?.length > 0)) return ['text', 'uuid']
@@ -3982,6 +4476,7 @@ function valueKinds(field) {
 function temporalPlaceholder(format) {
   if (format === 'date') return 'YYYY-MM-DD'
   if (format === 'date-time') return 'YYYY-MM-DDThh:mm:ssZ'
+  if (format === 'time') return 'HH:mm:ss'
   return ''
 }
 
@@ -4009,7 +4504,7 @@ function TypedValue({ value, onChange, kinds = ['text'], format = '', placeholde
   const showClock = (shown === 'date' || shown === 'timestamp') && (text === '' || clock)
   return (
     <Box sx={{ minWidth: 0 }}>
-      <Box sx={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 104px', columnGap: 0.75, alignItems: 'center' }}>
+      <Box sx={{ display: 'grid', gridTemplateColumns: kinds.length > 1 ? 'minmax(0, 1fr) 104px' : 'minmax(0, 1fr)', columnGap: 0.75, alignItems: 'center' }}>
         <Box sx={{ display: 'flex', gap: 0.75, minWidth: 0, alignItems: 'center' }}>
           <TextField
             size="small"
@@ -4018,7 +4513,7 @@ function TypedValue({ value, onChange, kinds = ['text'], format = '', placeholde
             error={Boolean(invalid)}
             onChange={(event) => editTemporal(kind, event.target.value, onChange, setDraft)}
             onBlur={() => setDraft(null)}
-            slotProps={{ htmlInput: { 'aria-label': 'Value' } }}
+            slotProps={{ htmlInput: { 'aria-label': 'Default' } }}
             sx={{ flex: 1, minWidth: 0 }}
           />
           {showClock && (
@@ -4064,17 +4559,18 @@ function TypedValue({ value, onChange, kinds = ['text'], format = '', placeholde
             />
           )}
         </Box>
-        <TextField
-          select
-          size="small"
-          fullWidth
-          disabled={kinds.length <= 1}
-          value={shown}
-          onChange={(event) => onChange(valueForKind(event.target.value, text))}
-          slotProps={{ select: { 'aria-label': 'Type' } }}
-        >
-          {(kinds.length > 1 ? kinds : [shown]).map((kind) => <MenuItem key={kind} value={kind}>{kindLabel(kind)}</MenuItem>)}
-        </TextField>
+        {kinds.length > 1 && (
+          <TextField
+            select
+            size="small"
+            fullWidth
+            value={shown}
+            onChange={(event) => onChange(valueForKind(event.target.value, text))}
+            slotProps={{ select: { 'aria-label': 'Type' } }}
+          >
+            {kinds.map((item) => <MenuItem key={item} value={item}>{kindLabel(item)}</MenuItem>)}
+          </TextField>
+        )}
       </Box>
       {hint && <Typography variant="caption" color={invalid ? 'error' : 'text.secondary'}>{hint}</Typography>}
     </Box>
@@ -4176,7 +4672,8 @@ function hiddenByObject(field, resolvedFields) {
   const parts = field.name.split('.')
   for (let length = 1; length < parts.length; length += 1) {
     const parent = resolvedFields.find((item) => item.object && item.name === parts.slice(0, length).join('.'))
-    if (parent && objectChoice(parent.sample) !== 'fields') return true
+    const mode = objectChoice(parent.sample)
+    if (parent && mode !== 'fields' && mode !== 'composite') return true
   }
   return false
 }
@@ -4190,7 +4687,8 @@ function customAncestorClosed(name, fields, active, defaults, operation) {
     if ((active.omit || []).includes(parentName)) return true
     const hasValue = Object.prototype.hasOwnProperty.call(active.request || {}, parentName)
     const raw = hasValue ? active.request[parentName] : effectiveSample(parent, operation.id, defaults)
-    if (objectChoice(raw) !== 'fields') return true
+    const mode = objectChoice(raw)
+    if (mode !== 'fields' && mode !== 'composite') return true
   }
   return false
 }
@@ -4210,18 +4708,20 @@ function proxiedApiUrl(apiBase, pathOrUrl) {
   return new URL(joinUrl('/api', pathOrUrl), window.location.origin)
 }
 
-function ObjectChoice({ value, onChange }) {
+function ObjectChoice({ value, onChange, composite = false }) {
+  const selected = value === 'null' || value === 'empty' || value === 'composite' ? value : 'fields'
   return (
     <ToggleButtonGroup
       exclusive
       size="small"
-      value={value === 'null' || value === 'empty' ? value : 'fields'}
+      value={selected === 'composite' && !composite ? 'fields' : selected}
       onChange={(_event, next) => {
         if (next) onChange(next)
       }}
-      sx={{ '& .MuiToggleButton-root': { py: 0.15, px: 0.9, textTransform: 'none', fontSize: 12, lineHeight: 1.6 } }}
+      sx={{ flexWrap: 'wrap', '& .MuiToggleButton-root': { py: 0.15, px: 0.9, textTransform: 'none', fontSize: 12, lineHeight: 1.6 } }}
     >
       <ToggleButton value="fields">Fields</ToggleButton>
+      {composite && <ToggleButton value="composite">Composite</ToggleButton>}
       <ToggleButton value="null">Null</ToggleButton>
       <ToggleButton value="empty">Empty</ToggleButton>
     </ToggleButtonGroup>
@@ -4235,10 +4735,11 @@ async function executeCheck(apiBase, idpBase, operation, item, hooks) {
     query: evaluateDynamics(item.query),
     path: evaluateDynamics(item.path),
   }
-  const pagination = operation.pagination
-  const followPages = sent.expect?.outcome !== 'error' && sent.expect?.outcome !== 'custom' && pagination
-  let query = followPages ? firstPageQuery(pagination, sent.query) : { ...sent.query }
-  const request = { body: sent.rawBody != null ? sent.rawBody : sent.body, query: { ...query }, path: sent.path }
+  const pagination = resolvePagination(operation.pagination, hooks.paging)
+  const followPages = sent.kind !== 'trial' && sent.expect?.outcome !== 'error' && sent.expect?.outcome !== 'custom' && pagination
+  let paging = followPages ? firstPageQuery(pagination, collectPaging(sent, pagination)) : { ...sent.query }
+  const firstSent = followPages ? applyPaging(sent, pagination, paging, operation.fields) : { ...sent, query: paging }
+  const request = { body: sent.rawBody != null ? sent.rawBody : firstSent.body, query: { ...firstSent.query }, path: sent.path }
   let url = null
   const reports = []
   let first = null
@@ -4251,7 +4752,8 @@ async function executeCheck(apiBase, idpBase, operation, item, hooks) {
       return null
     }
     if (oauthMode(hooks.oauth) === 'on') hooks.onActivity('requesting access token')
-    const response = await callOperation(apiBase, idpBase, operation, { ...sent, query }, url, hooks.headers, hooks.oauth)
+    const pageSent = followPages ? applyPaging(sent, pagination, paging, operation.fields) : { ...sent, query: paging }
+    const response = await callOperation(apiBase, idpBase, operation, pageSent, url, hooks.headers, hooks.oauth)
     if (!first) {
       first = response
     }
@@ -4263,18 +4765,18 @@ async function executeCheck(apiBase, idpBase, operation, item, hooks) {
       count: items.length,
       items,
       text: response.text,
-      label: stepLabel(pagination, reports.length, pageIndex, query),
+      label: stepLabel(pagination, reports.length, pageIndex, paging),
       pageIndex,
-      offset: pagination?.request.offset ? Number(query[pagination.request.offset] ?? 0) : 0,
-      cursor: pagination?.request.cursor ? query[pagination.request.cursor] : undefined,
+      offset: pagination?.request.offset ? Number(paging[pagination.request.offset] ?? 0) : 0,
+      cursor: pagination?.request.cursor ? paging[pagination.request.cursor] : undefined,
     })
     const followed = followPages && response.status >= 200 && response.status < 300
-    const step = followed ? planContinuation(pagination, query, body, reports, response.link) : null
+    const step = followed ? planContinuation(pagination, paging, body, reports, response.link) : null
     if (!step) {
       break
     }
     hooks.onActivity(step.label)
-    query = step.query || query
+    paging = step.query || paging
     url = step.url || null
   }
   if (!first) return null

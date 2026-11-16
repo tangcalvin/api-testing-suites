@@ -1,5 +1,6 @@
 import yaml from 'js-yaml'
 import { applyDefaults, coerceFieldValue, evaluateDynamics, substitute } from '../library.js'
+import { cursorValue, isLastCursor, isZeroSentinel, sentinelFrom } from './pagination.js'
 
 const METHODS = ['get', 'post', 'put', 'patch', 'delete']
 
@@ -228,6 +229,15 @@ function combinationPlans(fields, parent = '') {
   const axes = []
   for (const field of fields) {
     if (!directChild(field.name, parent)) continue
+    if (compositeField(field, fields)) {
+      const listed = field.vary && Array.isArray(field.values) ? field.values : []
+      if (listed.length > 0) {
+        axes.push(listed.map((value) => compositionPairs(field, value, fields)))
+      } else if (!field.required && field.location === 'body') {
+        axes.push([[[field.name, OBJECT_FIELDS]], [[field.name, null]], [[field.name, OMIT]]])
+      }
+      continue
+    }
     if (field.object && !field.required && field.vary !== false && field.location === 'body') {
       const nested = combinationPlans(fields, field.name)
       const filled = nested.length
@@ -253,6 +263,114 @@ function directChild(name, parent) {
   if (!parent) return !text.includes('.')
   const prefix = `${parent}.`
   return text.startsWith(prefix) && !text.slice(prefix.length).includes('.')
+}
+
+export function objectHasChildren(field, fields = []) {
+  if (!field?.object) return false
+  const prefix = `${field.name}.`
+  return (fields || []).some((other) => String(other?.name || '').startsWith(prefix))
+}
+
+export function compositeField(field, fields = []) {
+  if (!objectHasChildren(field, fields)) return false
+  if (field.sample === OBJECT_COMPOSITE) return true
+  if (field.sample === OBJECT_FIELDS) return false
+  return String(field.name || '').includes('.')
+}
+
+export function combinationObjectMode(field, fields = []) {
+  const choice = objectChoice(field?.sample)
+  if (choice === 'null' || choice === 'empty' || choice === 'composite') return choice
+  if (field?.sample === OBJECT_FIELDS) return 'fields'
+  return compositeField(field, fields) ? 'composite' : 'fields'
+}
+
+export function underComposite(name, fields = []) {
+  const parts = String(name || '').split('.')
+  for (let length = 1; length < parts.length; length += 1) {
+    const parent = parts.slice(0, length).join('.')
+    const field = (fields || []).find((item) => item?.object && item.name === parent)
+    if (field && compositeField(field, fields)) return true
+  }
+  return false
+}
+
+export function descendantScalars(parent, fields = []) {
+  const prefix = `${parent?.name}.`
+  return (fields || []).filter((field) => !field?.object && String(field?.name || '').startsWith(prefix))
+}
+
+function compositionPairs(field, value, fields) {
+  if (!isComposition(value)) return [[field.name, value]]
+  const prefix = `${field.name}.`
+  const flat = flattenComposition(value)
+  const pairs = []
+  for (const child of descendantScalars(field, fields)) {
+    const relative = child.name.slice(prefix.length)
+    if (!Object.prototype.hasOwnProperty.call(flat, relative)) continue
+    const typed = typedCompositionValue(child, flat[relative])
+    if (typed === undefined) continue
+    pairs.push([child.name, typed])
+  }
+  return pairs.length > 0 ? pairs : [[field.name, OBJECT_FIELDS]]
+}
+
+export function flattenComposition(value, prefix = '') {
+  if (!plainObject(value)) return {}
+  const out = {}
+  for (const [key, item] of Object.entries(value)) {
+    const name = String(key || '').trim()
+    if (!name) continue
+    const path = prefix ? `${prefix}.${name}` : name
+    if (plainObject(item)) Object.assign(out, flattenComposition(item, path))
+    else if (item != null && item !== '') out[path] = item
+  }
+  return out
+}
+
+export function storedComposition(value) {
+  const flat = flattenComposition(value)
+  const stored = {}
+  for (const [key, item] of Object.entries(flat)) {
+    const text = String(item ?? '').trim()
+    if (!text) continue
+    stored[key] = text
+  }
+  return Object.keys(stored).length > 0 ? stored : null
+}
+
+function isComposition(value) {
+  return plainObject(value)
+}
+
+function typedCompositionValue(field, raw) {
+  if (raw === '@null') return field.required ? undefined : null
+  if (raw === '@omit' || raw === OMIT) return field.required ? undefined : OMIT
+  if (field.type === 'integer' || field.type === 'number') {
+    const value = Number(raw)
+    return Number.isFinite(value) ? value : raw
+  }
+  if (field.type === 'boolean') {
+    if (raw === true || raw === 'true') return true
+    if (raw === false || raw === 'false') return false
+  }
+  return raw
+}
+
+function sameCompositeCombination(left, right) {
+  if (isComposition(left) && isComposition(right)) {
+    return JSON.stringify(flattenComposition(left)) === JSON.stringify(flattenComposition(right))
+  }
+  return sameCombinationValue(left, right)
+}
+
+function substituteComposition(value, variables) {
+  const flat = flattenComposition(value)
+  const out = {}
+  for (const [key, item] of Object.entries(flat)) {
+    out[key] = typeof item === 'string' ? substitute(item, variables) : item
+  }
+  return out
 }
 
 function combinationExcluded(fields, varied, exclusions) {
@@ -297,11 +415,18 @@ export function isOmitted(value) {
 export const OBJECT_NULL = '@null'
 export const OBJECT_EMPTY = '@empty'
 export const OBJECT_FIELDS = '@fields'
+export const OBJECT_COMPOSITE = '@composite'
 
 export function objectChoice(value) {
   if (value === OBJECT_NULL || value === null) return 'null'
   if (value === OBJECT_EMPTY) return 'empty'
+  if (value === OBJECT_COMPOSITE) return 'composite'
   return 'fields'
+}
+
+export function sendsObjectFields(value) {
+  const choice = objectChoice(value)
+  return choice === 'fields' || choice === 'composite'
 }
 
 export function valueText(value) {
@@ -309,6 +434,11 @@ export function valueText(value) {
   if (value === null) return 'null'
   if (value === OBJECT_FIELDS) return 'fields'
   if (value === OBJECT_EMPTY) return 'empty'
+  if (value === OBJECT_COMPOSITE) return 'composite'
+  if (plainObject(value)) {
+    const parts = Object.entries(flattenComposition(value)).map(([name, item]) => `${name}=${item}`)
+    return parts.length > 0 ? parts.join(', ') : 'composite'
+  }
   if (value === '') return 'blank'
   return String(value)
 }
@@ -363,16 +493,42 @@ function sameCombinationValue(left, right) {
 export function withTextCombinationValues(fields, saved, variables) {
   const source = saved && typeof saved === 'object' && !Array.isArray(saved) ? saved : {}
   return fields.map((field) => {
-    if (!scalarCombinationField(field)) return field
-    const raw = Array.isArray(source[field.name]) ? source[field.name] : []
-    const extras = raw.map((item) => {
-      const resolved = substitute(item, variables)
-      return resolved == null ? '' : String(resolved)
-    })
-    const values = scalarCombinationValues(field, extras)
-    if (values.length < 2) return { ...field, values: [] }
-    return { ...field, values, vary: field.textVary === false ? false : true }
+    if (scalarCombinationField(field)) {
+      const raw = Array.isArray(source[field.name]) ? source[field.name] : []
+      const extras = raw.map((item) => {
+        const resolved = substitute(item, variables)
+        return resolved == null ? '' : String(resolved)
+      })
+      const values = scalarCombinationValues(field, extras)
+      if (values.length < 2) return { ...field, values: [] }
+      return { ...field, values, vary: field.textVary === false ? false : true }
+    }
+    if (field.object) return withObjectCombinationValues(field, fields, source[field.name], variables)
+    return field
   })
+}
+
+function withObjectCombinationValues(field, fields, raw, variables) {
+  const list = Array.isArray(raw) ? raw : []
+  const extras = []
+  for (const item of list) {
+    if (plainObject(item)) {
+      const composition = storedComposition(substituteComposition(item, variables))
+      if (composition) extras.push(composition)
+      continue
+    }
+    const text = String(item ?? '').trim()
+    if (text === '@null' && !field.required) extras.push(null)
+    else if ((text === '@omit' || text === OMIT) && !field.required) extras.push(OMIT)
+  }
+  if (extras.length === 0) return field
+  const values = []
+  for (const extra of extras) {
+    if (values.some((item) => sameCompositeCombination(item, extra))) continue
+    values.push(extra)
+  }
+  if (values.length === 0) return field
+  return { ...field, values, vary: field.textVary === false ? false : true }
 }
 
 export function applyErrorRowToGroup(rows, cases, source) {
@@ -731,7 +887,7 @@ function expectsLiveSuccess(item) {
   return true
 }
 
-export function casesFor(mode, fields, customCases = [], exclusions = {}, errorCases = []) {
+export function casesFor(mode, fields, customCases = [], exclusions = {}, errorCases = [], trial) {
   if (mode === 'individual' || mode === 'boundary') {
     return buildIndividualCases(fields)
   }
@@ -741,7 +897,21 @@ export function casesFor(mode, fields, customCases = [], exclusions = {}, errorC
   if (mode === 'custom') {
     return buildCustomCases(fields, customCases)
   }
+  if (mode === 'trial') {
+    return buildTrialCases(fields, trial)
+  }
   return buildCases(fields, exclusions)
+}
+
+export function buildTrialCases(fields, trial) {
+  const [item] = buildCustomCases(fields, [{
+    name: 'Trial',
+    request: trial?.request || {},
+    omit: trial?.omit || [],
+    expect: { status: '', fields: [] },
+  }])
+  if (!item) return []
+  return [{ ...item, kind: 'trial', label: 'Trial', expect: { outcome: 'success' } }]
 }
 
 export function buildCustomCases(fields, cases) {
@@ -1089,10 +1259,15 @@ function plainObject(value) {
 
 export function defaultResponseExpected(field, requestNames, status) {
   if (!String(status).startsWith('2') || !scalarResponseField(field)) return ''
+  if (cursorResponseField(field.name)) return ''
   if (requestNames?.has(field.name)) return `@{${field.name}}`
   const leaf = responseLeaf(field.name)
-  if (!leaf || !requestNames?.has(leaf)) return ''
+  if (!leaf || cursorResponseField(leaf) || !requestNames?.has(leaf)) return ''
   return `@{${leaf}}`
+}
+
+function cursorResponseField(name) {
+  return CURSOR_PARAMS.has(normalizeName(responseLeaf(name) || name))
 }
 
 export function responseChecks(views, requestNames, overridesByStatus = {}) {
@@ -1271,7 +1446,7 @@ function judgeExpectedValues(context, status, text) {
     for (const [path, template] of Object.entries(fields)) {
       const expectation = readExpectation(template)
       const resolved = resolveRequestTemplate(expectation.text, context.request, context.variables)
-      if (resolved.skip) continue
+      if (resolved.skip || filterAny(path, resolved.value)) continue
       checked = true
       if (parsed == null || typeof parsed !== 'object') {
         if (!reportedJson) {
@@ -1328,6 +1503,11 @@ function sentValue(request, name) {
     return { sent: true, value: storedText(found.value) }
   }
   return { sent: false }
+}
+
+function filterAny(path, value) {
+  if (!String(path || '').includes('[]')) return false
+  return value == null || value === ''
 }
 
 function valueAt(source, name) {
@@ -1495,9 +1675,20 @@ export function detectPagination(spec, pathItem, operation) {
     pageBase = 1
   }
 
+  const firstCursor = style === 'cursor' ? sentinelFrom(cursor?.schema) : null
+  const lastCursor = isZeroSentinel(firstCursor) ? { ...firstCursor } : null
+  let totalField = total
+  let thisSize = sizeField
+  if (style === 'cursor' && isZeroSentinel(lastCursor) && total?.key === 'totalsize') {
+    thisSize = thisSize || total
+    totalField = findField(fields, ['totalelements', 'totalcount', 'totalitems', 'total'])
+  }
+
   return {
     style,
     pageBase,
+    firstCursor,
+    lastCursor,
     request: {
       page: page ? page.raw : null,
       offset: offset ? offset.raw : null,
@@ -1507,9 +1698,9 @@ export function detectPagination(spec, pathItem, operation) {
     response: {
       items: itemsField ? itemsField.path : null,
       totalPages: totalPages ? totalPages.path : null,
-      total: total ? total.path : null,
+      total: totalField ? totalField.path : null,
       page: pageField ? pageField.path : null,
-      size: sizeField ? sizeField.path : null,
+      size: thisSize ? thisSize.path : null,
       nextCursor: nextCursor ? nextCursor.path : null,
       hasMore: hasMore ? hasMore.path : null,
       nextLink: nextLink ? nextLink.path : null,
@@ -1524,8 +1715,46 @@ export function firstPageQuery(pagination, query) {
   }
   if (pagination.request.page) delete next[pagination.request.page]
   if (pagination.request.offset) delete next[pagination.request.offset]
-  if (pagination.request.cursor) delete next[pagination.request.cursor]
+  if (pagination.request.cursor) {
+    const first = pagination.firstCursor
+    if (!first || first.type === 'omit') delete next[pagination.request.cursor]
+    else next[pagination.request.cursor] = cursorValue(first).value
+  }
   return next
+}
+
+export function collectPaging(sent, pagination) {
+  const bag = { ...(sent?.query || {}) }
+  const names = Object.values(pagination?.request || {}).filter(Boolean)
+  const body = sent?.body
+  if (body && typeof body === 'object' && !Array.isArray(body)) {
+    for (const name of names) {
+      if (Object.prototype.hasOwnProperty.call(body, name)) bag[name] = body[name]
+    }
+  }
+  return bag
+}
+
+export function applyPaging(sent, pagination, paging, fields) {
+  const query = { ...(sent?.query || {}) }
+  const source = sent?.body
+  const body = source && typeof source === 'object' && !Array.isArray(source) ? { ...source } : source
+  const names = Object.values(pagination?.request || {}).filter(Boolean)
+  for (const name of names) {
+    const field = (fields || []).find((item) => item.name === name)
+    const inBody = field?.location === 'body'
+      || (source && typeof source === 'object' && Object.prototype.hasOwnProperty.call(source, name))
+    const present = Object.prototype.hasOwnProperty.call(paging || {}, name)
+    if (inBody && body && typeof body === 'object' && !Array.isArray(body)) {
+      if (present) place(body, name, paging[name])
+      else dropField(body, name)
+    } else if (present) {
+      query[name] = paging[name]
+    } else {
+      delete query[name]
+    }
+  }
+  return { ...sent, query, body }
 }
 
 export function planContinuation(pagination, query, body, fetched, linkHeader) {
@@ -1541,7 +1770,10 @@ export function planContinuation(pagination, query, body, fetched, linkHeader) {
     const items = readItems(body, pagination)
     const total = numberOrNull(readPath(body, pagination.response.total))
     const fetchedCount = fetched.reduce((sum, step) => sum + (Number(step.count) || 0), 0)
-    if (items.length === 0 || (total != null && fetchedCount >= total)) {
+    if (items.length === 0) {
+      return null
+    }
+    if (!isZeroSentinel(pagination.lastCursor) && total != null && fetchedCount >= total) {
       return null
     }
     const size = numberOrNull(readPath(body, pagination.response.size)) ?? numberOrNull(query[pagination.request.size])
@@ -1549,7 +1781,7 @@ export function planContinuation(pagination, query, body, fetched, linkHeader) {
       return null
     }
     const token = readPath(body, pagination.response.nextCursor)
-    if (token == null || token === '') {
+    if (isLastCursor(pagination, token)) {
       return null
     }
     if (fetched.some((step) => step.cursor === token)) {
@@ -1703,7 +1935,7 @@ function matchCustomFields(text, fields, context) {
   for (const field of rest) {
     const path = String(field.path).trim()
     const resolved = resolveRequestTemplate(String(field.equals ?? ''), context.request, context.variables)
-    if (resolved.skip) return { ok: false, detail: 'Expected value could not be filled' }
+    if (resolved.skip || filterAny(path, resolved.value)) continue
     const compared = comparePath(parsed, path, resolved.value, Boolean(field.ordered))
     if (compared.skip || compared.ok) continue
     return {
@@ -1811,7 +2043,7 @@ function normalizeName(name) {
 export function responsesForMode(views, mode) {
   const listed = Array.isArray(views) ? views : []
   if (mode === 'error') return listed.filter((view) => /^[45]/.test(String(view.status)))
-  if (mode === 'combination' || mode === 'individual' || mode === 'boundary') {
+  if (mode === 'combination' || mode === 'individual' || mode === 'boundary' || mode === 'trial') {
     return listed.filter((view) => /^2/.test(String(view.status)))
   }
   return listed
@@ -2347,7 +2579,7 @@ function assemble(fields, overrides, options = {}) {
   for (const field of fields) {
     if (!field.object || field.location !== 'body') continue
     const value = Object.prototype.hasOwnProperty.call(overrides, field.name) ? overrides[field.name] : field.sample
-    if (isOmitted(value) || objectChoice(value) !== 'fields') suppressed.add(field.name)
+    if (isOmitted(value) || !sendsObjectFields(value)) suppressed.add(field.name)
   }
   for (const field of fields) {
     if (nestedUnder(field.name, suppressed)) continue
@@ -2356,7 +2588,7 @@ function assemble(fields, overrides, options = {}) {
     }
     const value = Object.prototype.hasOwnProperty.call(overrides, field.name) ? overrides[field.name] : field.sample
     if (field.object) {
-      if (isOmitted(value) || objectChoice(value) === 'fields') continue
+      if (isOmitted(value) || sendsObjectFields(value)) continue
       place(body, field.name, objectChoice(value) === 'null' ? null : {})
       continue
     }
@@ -2396,6 +2628,20 @@ function place(body, name, value) {
     node = node[part]
   }
   node[parts[parts.length - 1]] = value
+}
+
+function dropField(body, name) {
+  const parts = String(name).split('.')
+  if (parts.length === 1) {
+    delete body[name]
+    return
+  }
+  let node = body
+  for (let index = 0; index < parts.length - 1; index += 1) {
+    if (!node[parts[index]] || typeof node[parts[index]] !== 'object') return
+    node = node[parts[index]]
+  }
+  delete node[parts[parts.length - 1]]
 }
 
 function schemaType(schema) {

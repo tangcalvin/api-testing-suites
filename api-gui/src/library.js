@@ -1,4 +1,5 @@
 import yaml from 'js-yaml'
+import { pagingMaps } from './openapi/pagination.js'
 
 export const DEFAULTS_KEY = 'api-tester.defaults'
 export const CASES_KEY = 'api-tester.cases'
@@ -23,7 +24,7 @@ export function storedRate(value) {
 }
 
 export function emptyCases() {
-  return { operations: {}, exclusions: {}, values: {}, errors: {}, checks: {}, steps: {}, ids: {}, filters: {}, scenarios: [] }
+  return { operations: {}, exclusions: {}, values: {}, errors: {}, checks: {}, steps: {}, ids: {}, filters: {}, paging: {}, scenarios: [], trials: {} }
 }
 
 export function loadStored(key, empty, parse) {
@@ -69,7 +70,9 @@ export function casesDocument(cases) {
   const steps = cases.steps || {}
   const ids = cases.ids || {}
   const filters = cases.filters || {}
+  const paging = cases.paging || {}
   const scenarios = Array.isArray(cases.scenarios) ? cases.scenarios : []
+  const trials = cases.trials || {}
   return {
     version: 1,
     kind: 'cases',
@@ -81,7 +84,9 @@ export function casesDocument(cases) {
     ...(Object.keys(steps).length > 0 ? { steps } : {}),
     ...(Object.keys(ids).length > 0 ? { ids } : {}),
     ...(Object.keys(filters).length > 0 ? { filters } : {}),
+    ...(Object.keys(paging).length > 0 ? { paging } : {}),
     ...(scenarios.length > 0 ? { scenarios } : {}),
+    ...(Object.keys(trials).length > 0 ? { trials } : {}),
   }
 }
 
@@ -118,7 +123,9 @@ export function hasSavedCases(cases) {
     || Object.keys(cases?.steps || {}).length > 0
     || Object.keys(cases?.ids || {}).length > 0
     || Object.keys(cases?.filters || {}).length > 0
+    || Object.keys(cases?.paging || {}).length > 0
     || (cases?.scenarios || []).length > 0
+    || Object.keys(cases?.trials || {}).length > 0
 }
 
 export function emptyOauth() {
@@ -270,8 +277,23 @@ export function parseCases(value) {
     steps: stepMaps(data.steps),
     ids: idMaps(data.ids),
     filters: filterMaps(data.filters),
+    paging: pagingMaps(data.paging),
     scenarios: scenarioList(data.scenarios),
+    trials: trialMaps(data.trials),
   }
+}
+
+function trialMaps(source) {
+  const trials = {}
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return trials
+  for (const [operationId, raw] of Object.entries(source)) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue
+    const request = valueMap(raw.request)
+    const omit = Array.isArray(raw.omit) ? raw.omit.filter((name) => typeof name === 'string' && name) : []
+    if (Object.keys(request).length === 0 && omit.length === 0) continue
+    trials[operationId] = { request, omit }
+  }
+  return trials
 }
 
 const FILTER_MODES = new Set(['equals', 'equalsIgnoreCase', 'contains', 'starts', 'ends', 'minimum', 'maximum', 'greater', 'less', 'in', 'not', 'empty', 'present', 'compare', 'bounds', 'skip'])
@@ -466,18 +488,47 @@ function combinationValueMaps(source) {
     const next = {}
     for (const [name, list] of Object.entries(fields)) {
       if (!Array.isArray(list)) continue
-      const texts = []
+      const items = []
       for (const item of list) {
+        if (item && typeof item === 'object' && !Array.isArray(item)) {
+          const composition = storedCombinationComposition(item)
+          if (!composition || items.some((existing) => sameStoredComposition(existing, composition))) continue
+          items.push(composition)
+          continue
+        }
         if (typeof item !== 'string') continue
         const text = item.trim()
-        if (!text || texts.includes(text)) continue
-        texts.push(text)
+        if (!text || items.includes(text)) continue
+        items.push(text)
       }
-      if (texts.length > 0) next[name] = texts
+      if (items.length > 0) next[name] = items
     }
     if (Object.keys(next).length > 0) values[operationId] = next
   }
   return values
+}
+
+function storedCombinationComposition(value) {
+  const stored = {}
+  const walk = (node, prefix) => {
+    if (!node || typeof node !== 'object' || Array.isArray(node)) return
+    for (const [key, item] of Object.entries(node)) {
+      const name = String(key || '').trim()
+      if (!name) continue
+      const path = prefix ? `${prefix}.${name}` : name
+      if (item && typeof item === 'object' && !Array.isArray(item)) walk(item, path)
+      else if (item != null && item !== '') {
+        const text = String(item).trim()
+        if (text) stored[path] = text
+      }
+    }
+  }
+  walk(value, '')
+  return Object.keys(stored).length > 0 ? stored : null
+}
+
+function sameStoredComposition(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right)
 }
 
 function exclusionMaps(source) {

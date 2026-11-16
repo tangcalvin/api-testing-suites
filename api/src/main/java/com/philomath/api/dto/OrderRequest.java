@@ -18,6 +18,7 @@ import jakarta.validation.constraints.Size;
 
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
+import java.util.Map;
 
 @MutuallyExclusive({ "couponCode", "promotionCode" })
 @Schema(description = "Fields accepted when creating or replacing an order")
@@ -105,6 +106,10 @@ public record OrderRequest(
         String promotionCode,
 
         @Valid
-        DeliveryAddress deliveryAddress
+        DeliveryAddress deliveryAddress,
+
+        @Schema(description = "Must be an empty object when sent.", example = "{}", additionalProperties = Schema.AdditionalPropertiesValue.FALSE)
+        @Size(max = 0)
+        Map<String, Object> options
 ) {
 }

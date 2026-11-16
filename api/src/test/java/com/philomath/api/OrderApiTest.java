@@ -460,6 +460,29 @@ class OrderApiTest {
     }
 
     @Test
+    void acceptsAnEmptyOptionsObject() throws Exception {
+        mockMvc.perform(post("/api/orders")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_ORDER.replace(
+                                "\"warehouseCode\": \"HK-01\"",
+                                "\"warehouseCode\": \"HK-01\",\n              \"options\": {}"
+                        )))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.options").isMap())
+                .andExpect(jsonPath("$.options").isEmpty());
+
+        mockMvc.perform(post("/api/orders")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_ORDER.replace(
+                                "\"warehouseCode\": \"HK-01\"",
+                                "\"warehouseCode\": \"HK-02\",\n              \"options\": { \"extra\": true }"
+                        )))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.exceptions[0].field").value("options"))
+                .andExpect(jsonPath("$.exceptions[0].code").value("Size"));
+    }
+
+    @Test
     void publishesOrderCrudInOpenApi() throws Exception {
         mockMvc.perform(get("/v3/api-docs"))
                 .andExpect(status().isOk())
@@ -478,6 +501,8 @@ class OrderApiTest {
                 .andExpect(jsonPath("$.components.schemas.OrderRequest.required", not(hasItem("deliveryAddress"))))
                 .andExpect(jsonPath("$.components.schemas.OrderRequest.properties.couponCode").exists())
                 .andExpect(jsonPath("$.components.schemas.OrderRequest.properties.promotionCode").exists())
+                .andExpect(jsonPath("$.components.schemas.OrderRequest.properties.options").exists())
+                .andExpect(jsonPath("$.components.schemas.Order.properties.options").exists())
                 .andExpect(jsonPath("$.components.schemas.OrderRequest['x-mutually-exclusive'][0][0]").value("couponCode"))
                 .andExpect(jsonPath("$.components.schemas.OrderRequest['x-mutually-exclusive'][0][1]").value("promotionCode"))
                 .andExpect(jsonPath("$.components.schemas.DeliveryAddress.properties.line1").exists())

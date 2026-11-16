@@ -14,6 +14,11 @@ import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
 
+import java.time.LocalDate;
+import java.time.LocalTime;
+import java.time.OffsetDateTime;
+import java.util.Map;
+
 @Entity
 @Table(name = "shipment")
 public class ShipmentEntity {
@@ -45,17 +50,65 @@ public class ShipmentEntity {
     @Column(nullable = false)
     private Boolean insured;
 
+    @Column
+    private LocalDate readyDate;
+
+    @Column
+    private LocalTime cutoffTime;
+
+    @Column
+    private OffsetDateTime bookedAt;
+
+    @Column
+    private Boolean packaging;
+
     public static ShipmentEntity from(ShipmentRequest request) {
         ShipmentEntity entity = new ShipmentEntity();
-        entity.apply(request.reference(), request.recipient(), request.destination(), request.weightKg(), request.priority(), request.status(), request.insured());
+        entity.apply(
+                request.reference(),
+                request.recipient(),
+                request.destination(),
+                request.weightKg(),
+                request.priority(),
+                request.status(),
+                request.insured(),
+                request.readyDate(),
+                request.cutoffTime(),
+                request.bookedAt(),
+                request.packaging()
+        );
         return entity;
     }
 
     public void apply(ShipmentUpdate request) {
-        apply(request.reference(), request.recipient(), request.destination(), request.weightKg(), request.priority(), request.status(), request.insured());
+        apply(
+                request.reference(),
+                request.recipient(),
+                request.destination(),
+                request.weightKg(),
+                request.priority(),
+                request.status(),
+                request.insured(),
+                request.readyDate(),
+                request.cutoffTime(),
+                request.bookedAt(),
+                request.packaging()
+        );
     }
 
-    private void apply(String reference, String recipient, String destination, Double weightKg, Priority priority, ShipmentStatus status, Boolean insured) {
+    private void apply(
+            String reference,
+            String recipient,
+            String destination,
+            Double weightKg,
+            Priority priority,
+            ShipmentStatus status,
+            Boolean insured,
+            LocalDate readyDate,
+            LocalTime cutoffTime,
+            OffsetDateTime bookedAt,
+            Map<String, Object> packaging
+    ) {
         this.reference = Text.trim(reference);
         this.recipient = Text.trim(recipient);
         this.destination = Text.trim(destination);
@@ -63,10 +116,27 @@ public class ShipmentEntity {
         this.priority = priority;
         this.status = status;
         this.insured = insured;
+        this.readyDate = readyDate;
+        this.cutoffTime = cutoffTime;
+        this.bookedAt = bookedAt;
+        this.packaging = packaging == null ? null : Boolean.TRUE;
     }
 
     public Shipment toRecord() {
-        return new Shipment(id, reference, recipient, destination, weightKg, priority, status, insured);
+        return new Shipment(
+                id,
+                reference,
+                recipient,
+                destination,
+                weightKg,
+                priority,
+                status,
+                insured,
+                readyDate,
+                cutoffTime,
+                bookedAt,
+                Boolean.TRUE.equals(packaging) ? Map.of() : null
+        );
     }
 
     public Long getId() {

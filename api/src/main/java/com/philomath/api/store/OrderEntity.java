@@ -18,6 +18,7 @@ import jakarta.persistence.Table;
 
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
+import java.util.Map;
 
 @Entity
 @Table(name = "purchase_order")
@@ -99,6 +100,9 @@ public class OrderEntity {
     @Column(length = 80)
     private String deliveryRegionName;
 
+    @Column
+    private Boolean options;
+
     public static OrderEntity from(OrderRequest request) {
         OrderEntity entity = new OrderEntity();
         entity.apply(request);
@@ -131,6 +135,7 @@ public class OrderEntity {
         Region region = address == null ? null : address.region();
         deliveryRegionCode = region == null ? null : Text.trim(region.code());
         deliveryRegionName = region == null ? null : Text.trim(region.name());
+        options = request.options() == null ? null : Boolean.TRUE;
     }
 
     public Order toRecord() {
@@ -154,7 +159,8 @@ public class OrderEntity {
                 warehouseCode,
                 couponCode,
                 promotionCode,
-                deliveryAddress()
+                deliveryAddress(),
+                Boolean.TRUE.equals(options) ? Map.of() : null
         );
     }
 

@@ -89,8 +89,41 @@ test('defaults and custom cases import as separate files', () => {
   }))
   assert.deepEqual(withValues.values['POST /api/orders'].customerName, ['Grace', 'Ada'])
   assert.deepEqual(casesDocument(withValues).values['POST /api/orders'].customerName, ['Grace', 'Ada'])
+  const withCompositions = parseCases(JSON.stringify({
+    kind: 'cases',
+    operations: {},
+    values: {
+      'POST /api/orders': {
+        'deliveryAddress.region': [
+          { code: 'A', name: 'RegA' },
+          { code: 'A', name: 'RegA' },
+          { nested: { code: 'B', name: 'RegB' } },
+          '@null',
+          '',
+        ],
+      },
+    },
+  }))
+  assert.deepEqual(withCompositions.values['POST /api/orders']['deliveryAddress.region'], [
+    { code: 'A', name: 'RegA' },
+    { 'nested.code': 'B', 'nested.name': 'RegB' },
+    '@null',
+  ])
+  assert.deepEqual(
+    casesDocument(withCompositions).values['POST /api/orders']['deliveryAddress.region'][0],
+    { code: 'A', name: 'RegA' },
+  )
   assert.equal(casesDocument(parseCases('{"kind":"cases","operations":{}}')).values, undefined)
   assert.equal(casesDocument(parseCases('{"kind":"cases","operations":{}}')).checks, undefined)
+  const withTrial = parseCases(JSON.stringify({
+    kind: 'cases',
+    operations: {},
+    trials: { 'POST /api/orders': { request: { notes: 'hello', quantity: 2 }, omit: ['giftWrap'] } },
+  }))
+  assert.equal(withTrial.trials['POST /api/orders'].request.notes, 'hello')
+  assert.deepEqual(withTrial.trials['POST /api/orders'].omit, ['giftWrap'])
+  assert.equal(casesDocument(withTrial).trials['POST /api/orders'].request.quantity, 2)
+  assert.equal(casesDocument(parseCases('{"kind":"cases","operations":{}}')).trials, undefined)
   const withChecks = parseCases(JSON.stringify({
     kind: 'cases',
     operations: {},
@@ -145,6 +178,25 @@ test('defaults and custom cases import as separate files', () => {
   assert.equal(withScenarios.scenarios[0].iterations[0].values.extra, undefined)
   assert.equal(casesDocument(withScenarios).scenarios[0].name, 'Place and ship')
   assert.equal(casesDocument(parseCases('{"kind":"cases","operations":{}}')).scenarios, undefined)
+  const withPaging = parseCases(JSON.stringify({
+    kind: 'cases',
+    operations: {},
+    paging: {
+      'POST /api/shipments/queryShipments': {
+        mode: 'cursor',
+        request: { size: 'size', cursor: 'nextCursor' },
+        response: { cursor: 'nextCursor', pageSize: 'totalSize', total: '' },
+        firstCursor: { type: 'string', value: '0' },
+        lastCursor: { type: 'string', value: '0' },
+      },
+      'GET /api/orders': { mode: 'detected' },
+    },
+  }))
+  assert.equal(withPaging.paging['POST /api/shipments/queryShipments'].mode, 'cursor')
+  assert.equal(withPaging.paging['POST /api/shipments/queryShipments'].firstCursor.value, '0')
+  assert.equal(withPaging.paging['GET /api/orders'], undefined)
+  assert.equal(casesDocument(withPaging).paging['POST /api/shipments/queryShipments'].response.pageSize, 'totalSize')
+  assert.equal(casesDocument(parseCases('{"kind":"cases","operations":{}}')).paging, undefined)
   assert.throws(() => parseCases('{"kind":"defaults","global":{}}'), /custom cases/)
   assert.deepEqual(defaults.variables, {})
 })
