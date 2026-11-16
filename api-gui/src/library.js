@@ -13,7 +13,7 @@ export const EXAMPLE_PROFILES_URL = '/examples/clients.yaml'
 export const DEFAULT_RATE = '30'
 
 export function emptyDefaults() {
-  return { variables: {}, global: {}, headers: {}, operations: {}, responses: {}, extraStatuses: {}, tps: DEFAULT_RATE }
+  return { variables: {}, patterns: {}, global: {}, headers: {}, operations: {}, responses: {}, extraStatuses: {}, tps: DEFAULT_RATE }
 }
 
 export function storedRate(value) {
@@ -53,6 +53,7 @@ export function defaultsDocument(defaults) {
     version: 1,
     kind: 'defaults',
     variables: defaults.variables || {},
+    ...(Object.keys(defaults.patterns || {}).length > 0 ? { patterns: defaults.patterns } : {}),
     global: defaults.global || {},
     headers: defaults.headers || {},
     operations: defaults.operations || {},
@@ -97,6 +98,7 @@ export function parseDefaults(value) {
   }
   return {
     variables: valueMap(data.variables),
+    patterns: valueMap(data.patterns),
     global: valueMap(data.global),
     headers: valueMap(data.headers),
     operations: operationMaps(data.operations),
@@ -109,6 +111,7 @@ export function parseDefaults(value) {
 export function hasSavedDefaults(defaults) {
   if (!defaults) return false
   return Object.keys(defaults.variables || {}).length > 0
+    || Object.keys(defaults.patterns || {}).length > 0
     || Object.keys(defaults.global || {}).length > 0
     || Object.keys(defaults.headers || {}).length > 0
     || Object.keys(defaults.operations || {}).length > 0
@@ -928,15 +931,31 @@ function responseFieldMap(source) {
   const map = {}
   if (!source || typeof source !== 'object' || Array.isArray(source)) return map
   for (const [name, raw] of Object.entries(source)) {
-    if (typeof raw === 'string' || typeof raw === 'number' || typeof raw === 'boolean') {
-      map[name] = raw
-    } else if (raw && typeof raw === 'object' && !Array.isArray(raw) && (raw.value != null || raw.ordered)) {
-      const text = raw.value == null ? '' : String(raw.value)
-      if (raw.ordered) map[name] = { value: text, ordered: true }
-      else if (text !== '') map[name] = text
-    }
+    const stored = storedResponseField(raw)
+    if (stored !== undefined) map[name] = stored
   }
   return map
+}
+
+function storedResponseField(raw) {
+  if (typeof raw === 'string' || typeof raw === 'number' || typeof raw === 'boolean') return raw
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined
+  if (typeof raw.pattern === 'string') {
+    const name = raw.pattern.trim()
+    return name ? { pattern: name } : { match: 'pattern' }
+  }
+  if (typeof raw.regex === 'string') return raw.regex ? { regex: raw.regex } : { match: 'regex' }
+  if (raw.match === 'pattern' || raw.match === 'regex') {
+    const text = raw.value == null ? '' : String(raw.value)
+    if (raw.match === 'pattern') return text.trim() ? { pattern: text.trim() } : { match: 'pattern' }
+    return text ? { regex: text } : { match: 'regex' }
+  }
+  if (raw.value != null || raw.ordered) {
+    const text = raw.value == null ? '' : String(raw.value)
+    if (raw.ordered) return { value: text, ordered: true }
+    if (text !== '') return text
+  }
+  return undefined
 }
 
 function operationMaps(source) {

@@ -50,6 +50,17 @@ test('defaults and custom cases import as separate files', () => {
   }))
   assert.equal(withResponses.responses['POST /api/orders']['201'].status, '@{status}')
   assert.equal(withResponses.responses['POST /api/orders']['201'].id, '')
+  assert.deepEqual(defaults.patterns, {})
+  const withPatterns = parseDefaults(JSON.stringify({
+    kind: 'defaults',
+    patterns: { uuid: '^[0-9a-f-]{36}$', nested: { skip: true } },
+    responses: { 'POST /api/orders': { '201': { id: { regex: '^[0-9]+$' }, createdAt: { pattern: 'iso' } } } },
+  }))
+  assert.equal(withPatterns.patterns.uuid, '^[0-9a-f-]{36}$')
+  assert.equal(withPatterns.patterns.nested, undefined)
+  assert.deepEqual(withPatterns.responses['POST /api/orders']['201'].id, { regex: '^[0-9]+$' })
+  assert.deepEqual(withPatterns.responses['POST /api/orders']['201'].createdAt, { pattern: 'iso' })
+  assert.deepEqual(defaultsDocument(withPatterns).patterns, { uuid: '^[0-9a-f-]{36}$' })
   assert.throws(() => parseDefaults('{"kind":"cases","operations":{}}'), /field defaults/)
 
   const cases = parseCases(JSON.stringify({

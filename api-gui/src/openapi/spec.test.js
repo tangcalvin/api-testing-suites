@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { OMIT, OBJECT_COMPOSITE, OBJECT_FIELDS, applyPaging, collectPaging, individualChoices, buildIndividualCases, applyErrorOverrides, applyErrorRowToGroup, assignFixture, buildCases, buildCustomCases, buildCustomErrorCases, buildErrorCases, buildTrialCases, caseCount, combinationObjectMode, compositeField, detectPagination, enquiryShouldMiss, enquiryTarget, firstPageQuery, fixtureEnabled, fixtureNote, fixturePlan, fixtureRequest, fixtureSteps, judge, listOperations, operationGroups, operationRole, parseSpecText, planContinuation, readCreatedId, recordId, detectPayloadId, idNameRank, resolvedId, responseChecks, responseViews, responsesForMode, sampleCall, scalarCombinationField, specGaps, textCombinationField, underComposite, viewsWithStatuses, withFixtureId, withTextCombinationValues } from './spec.js'
+import { OMIT, OBJECT_COMPOSITE, OBJECT_FIELDS, applyPaging, collectPaging, individualChoices, buildIndividualCases, applyErrorOverrides, applyErrorRowToGroup, assignFixture, buildCases, buildCustomCases, buildCustomErrorCases, buildErrorCases, buildTrialCases, caseCount, combinationObjectMode, compilePattern, compositeField, detectPagination, enquiryShouldMiss, enquiryTarget, firstPageQuery, fixtureEnabled, fixtureNote, fixturePlan, fixtureRequest, fixtureSteps, judge, listOperations, operationGroups, operationRole, parseSpecText, planContinuation, readCreatedId, recordId, detectPayloadId, idNameRank, resolvedId, readExpectation, responseChecks, responseViews, responsesForMode, sampleCall, scalarCombinationField, specGaps, storedExpectation, textCombinationField, underComposite, viewsWithStatuses, withFixtureId, withTextCombinationValues } from './spec.js'
 import { resolvePagination, storedPaging } from './pagination.js'
 
 const SPEC = `
@@ -1335,6 +1335,60 @@ test('response expectations compare a sent request field and a typed value', () 
   )
   assert.equal(kept.passed, false)
   assert.match(kept.detail, /orderNumber expected AB/)
+})
+
+test('a response field can match a typed regex or a named pattern', () => {
+  assert.equal(compilePattern('^[A-Z]{2}$').regex.test('HK'), true)
+  assert.equal(compilePattern('/ord-\\d+/i').regex.test('ORD-12'), true)
+  assert.equal(Boolean(compilePattern('(').error), true)
+  assert.deepEqual(storedExpectation({ match: 'regex', text: '^[0-9]+$' }), { regex: '^[0-9]+$' })
+  assert.deepEqual(storedExpectation({ match: 'pattern', text: 'uuid' }), { pattern: 'uuid' })
+  assert.equal(readExpectation({ regex: '^[0-9]+$' }).match, 'regex')
+  assert.equal(readExpectation({ pattern: 'uuid' }).text, 'uuid')
+
+  const views = [{ status: '201', fields: [{ name: 'id', type: 'integer' }, { name: 'status', type: 'string' }] }]
+  assert.deepEqual(
+    responseChecks(views, new Set(['status']), { '201': { id: { regex: '^[0-9]+$' } } }),
+    { '201': { id: { regex: '^[0-9]+$' }, status: '@{status}' } },
+  )
+  assert.deepEqual(
+    responseChecks(views, new Set(['status']), { '201': { id: { match: 'regex' } } }),
+    { '201': { status: '@{status}' } },
+  )
+
+  const matched = judge(
+    { outcome: 'success' },
+    201,
+    '{"id":42,"status":"CONFIRMED"}',
+    { request: { body: { status: 'CONFIRMED' }, query: {}, path: {} }, expectations: { '201': { id: { regex: '^[0-9]+$' }, status: '@{status}' } } },
+  )
+  assert.equal(matched.passed, true)
+
+  const missed = judge(
+    { outcome: 'success' },
+    201,
+    '{"id":"ORD-1","status":"CONFIRMED"}',
+    { request: { body: {}, query: {}, path: {} }, expectations: { '201': { id: { regex: '^[0-9]+$' } } } },
+  )
+  assert.equal(missed.passed, false)
+  assert.match(missed.detail, /id expected to match/)
+
+  const named = judge(
+    { outcome: 'success' },
+    201,
+    '{"id":"a1b2"}',
+    { request: { body: {}, query: {}, path: {} }, expectations: { '201': { id: { pattern: 'hex' } } }, patterns: { hex: '^[0-9a-f]+$' } },
+  )
+  assert.equal(named.passed, true)
+
+  const unknown = judge(
+    { outcome: 'success' },
+    201,
+    '{"id":"a1b2"}',
+    { request: { body: {}, query: {}, path: {} }, expectations: { '201': { id: { pattern: 'hex' } } }, patterns: {} },
+  )
+  assert.equal(unknown.passed, false)
+  assert.match(unknown.detail, /unknown pattern hex/)
 })
 
 test('a trial sends one request from typed values and defaults', () => {

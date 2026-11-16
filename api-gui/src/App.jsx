@@ -71,10 +71,12 @@ import {
   errorCheckKey,
   errorColumnDefault,
   createPacer,
+  compilePattern,
   defaultResponseExpected,
   isArrayOfObjects,
   parseObjectArray,
   readExpectation,
+  storedExpectation,
   applyPaging,
   collectPaging,
   describeFetched,
@@ -532,6 +534,48 @@ export default function App() {
       }
       variables[name] = ''
       return { ...current, variables }
+    })
+  }
+
+  function writePattern(name, value) {
+    const key = String(name || '').trim()
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) return
+    setDefaults((current) => ({ ...current, patterns: { ...current.patterns, [key]: value } }))
+  }
+
+  function renamePattern(currentName, nextName) {
+    const key = String(nextName || '').trim()
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) return false
+    if (key !== currentName && Object.prototype.hasOwnProperty.call(defaults.patterns || {}, key)) return false
+    setDefaults((current) => {
+      const patterns = { ...current.patterns }
+      const value = patterns[currentName]
+      delete patterns[currentName]
+      patterns[key] = value ?? ''
+      return { ...current, patterns }
+    })
+    return true
+  }
+
+  function removePattern(name) {
+    setDefaults((current) => {
+      const patterns = { ...current.patterns }
+      delete patterns[name]
+      return { ...current, patterns }
+    })
+  }
+
+  function addPattern() {
+    setDefaults((current) => {
+      const patterns = { ...(current.patterns || {}) }
+      let name = 'name'
+      let suffix = 2
+      while (Object.prototype.hasOwnProperty.call(patterns, name)) {
+        name = `name${suffix}`
+        suffix += 1
+      }
+      patterns[name] = ''
+      return { ...current, patterns }
     })
   }
 
@@ -1004,6 +1048,7 @@ export default function App() {
             ? {}
             : responseChecks(responsesForMode(selected.responses, activeMode), new Set(fields.map((field) => field.name)), defaults.responses?.[selected.id]),
           variables: defaults.variables,
+          patterns: defaults.patterns,
           pages: response.pages,
         })
         const table = datasets[selected.id]
@@ -1138,6 +1183,7 @@ export default function App() {
           const verdict = judge(call.expect, response.status, response.text, {
             request: sent,
             variables: { ...(defaults.variables || {}), ...variables },
+            patterns: defaults.patterns,
           })
           if (!verdict.passed) rowFailed = true
           Object.assign(captured, capturedFrom(step.captures, response.status, response.text, response.location))
@@ -1381,6 +1427,7 @@ export default function App() {
                   responses={responsesForMode(selected.responses, activeMode)}
                   requestNames={new Set(fields.map((field) => field.name))}
                   expected={defaults.responses?.[selected.id] || {}}
+                  patterns={defaults.patterns || {}}
                   onExpected={(status, name, raw) => writeResponseExpected(selected.id, status, name, raw)}
                 />
 
@@ -1692,6 +1739,10 @@ export default function App() {
             onRenameVariable={renameVariable}
             onWriteVariable={writeVariable}
             onRemoveVariable={removeVariable}
+            onAddPattern={addPattern}
+            onRenamePattern={renamePattern}
+            onWritePattern={writePattern}
+            onRemovePattern={removePattern}
             onWriteNamed={writeNamed}
             onRenameNamed={renameNamed}
             onRemoveNamed={removeNamed}
@@ -1918,7 +1969,107 @@ function ToneChip({ label, tone, wide = false }) {
   )
 }
 
-function ResponseSchema({ responses, requestNames, expected, onExpected }) {
+function ExpectedField({ field, status, automatic, stored, hasOverride, objectArray, patterns, onExpected }) {
+  const match = objectArray ? 'equals' : (hasOverride ? (stored.match || 'equals') : 'equals')
+  const shown = stored.text
+  const ordered = stored.ordered
+  const objectArrayError = objectArray ? parseObjectArray(shown)?.error : ''
+  const regexIssue = match === 'regex' && shown ? compilePattern(shown).error : ''
+  const names = Object.keys(patterns || {})
+  const patternOptions = shown && match === 'pattern' && !names.includes(shown) ? [shown, ...names] : names
+
+  function write(patch) {
+    const next = { text: shown, ordered, match, ...patch }
+    if (objectArray) {
+      onExpected(status, field.name, next.ordered || next.text ? storedExpectation({ ...next, match: 'equals' }) : undefined)
+      return
+    }
+    if (next.match === 'equals' && next.text === automatic && !next.ordered) {
+      onExpected(status, field.name, undefined)
+      return
+    }
+    onExpected(status, field.name, storedExpectation(next))
+  }
+
+  return (
+    <Stack direction="row" spacing={0.5} sx={{ alignItems: 'flex-start' }}>
+      {!objectArray && (
+        <TextField
+          select
+          size="small"
+          value={match}
+          onChange={(event) => {
+            const next = event.target.value
+            write({
+              match: next,
+              text: next === match ? shown : (next === 'equals' ? automatic : ''),
+            })
+          }}
+          slotProps={{ htmlInput: { 'aria-label': 'Match' } }}
+          sx={{ width: 108, flexShrink: 0 }}
+        >
+          <MenuItem value="equals">Value</MenuItem>
+          <MenuItem value="pattern">Pattern</MenuItem>
+          <MenuItem value="regex">Regex</MenuItem>
+        </TextField>
+      )}
+      {match === 'pattern' ? (
+        <TextField
+          select
+          size="small"
+          fullWidth
+          value={patternOptions.includes(shown) ? shown : ''}
+          onChange={(event) => write({ match: 'pattern', text: event.target.value })}
+          helperText={names.length === 0 ? 'Add named patterns in Setting.' : undefined}
+          slotProps={{
+            htmlInput: { 'aria-label': 'Pattern' },
+            select: { renderValue: (value) => value || 'Choose a pattern' },
+          }}
+          sx={{ minWidth: 160 }}
+        >
+          <MenuItem value="">Choose a pattern</MenuItem>
+          {patternOptions.map((name) => (
+            <MenuItem key={name} value={name}>
+              <Box sx={{ minWidth: 0 }}>
+                <Typography variant="body2">{name}</Typography>
+                {patterns[name] ? (
+                  <Typography variant="caption" color="text.secondary" noWrap sx={{ display: 'block', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}>
+                    {patterns[name]}
+                  </Typography>
+                ) : null}
+              </Box>
+            </MenuItem>
+          ))}
+        </TextField>
+      ) : (
+        <TextField
+          size="small"
+          fullWidth
+          multiline={objectArray}
+          minRows={objectArray ? 2 : undefined}
+          value={shown}
+          placeholder={
+            objectArray
+              ? '[{"field":"quantity"},{"field":"customerEmail"}]'
+              : (match === 'regex' ? '^[A-Z0-9-]+$' : (hasOverride ? 'Not checked' : (automatic || 'Not checked')))
+          }
+          error={Boolean(objectArrayError || regexIssue)}
+          helperText={objectArrayError || regexIssue || undefined}
+          onChange={(event) => write({ text: event.target.value })}
+          slotProps={{ htmlInput: { 'aria-label': match === 'regex' ? 'Regex' : 'Expected' } }}
+          sx={{ minWidth: 180, '& input, & textarea': { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12.5 } }}
+        />
+      )}
+      {hasOverride && (
+        <Button size="small" onClick={() => onExpected(status, field.name, undefined)} sx={{ flexShrink: 0, minWidth: 0, color: 'text.secondary' }}>
+          Default
+        </Button>
+      )}
+    </Stack>
+  )
+}
+
+function ResponseSchema({ responses, requestNames, expected, patterns = {}, onExpected }) {
   const preferred = responses.find((item) => item.status === '200') || responses.find((item) => String(item.status).startsWith('2')) || responses[0]
   const [open, setOpen] = useState(false)
   const [status, setStatus] = useState(preferred ? preferred.status : '')
@@ -1987,7 +2138,7 @@ function ResponseSchema({ responses, requestNames, expected, onExpected }) {
           ) : (
             <Box sx={{ maxHeight: 280, overflow: 'auto' }}>
               <Typography variant="caption" color="text.secondary" sx={{ display: 'block', px: 1.5, py: 0.75, borderBottom: 1, borderColor: 'divider' }}>
-                {'@{name}'} is the value sent for that request field. A null or omitted request field, including a blank list filter, is treated as any value and is not compared. Text is compared after leading and trailing spaces are removed, and a value that is only spaces is null. A success field with the same name starts as that reference, except nextCursor, which is a new token for the next page. Clear a value to skip it. {'${name}'} still reads a variable. For an array of objects, enter a JSON array. Each object must appear, and only the fields you include are compared. In sequence requires those objects to be the first items, in the order you wrote.
+                {'@{name}'} is the value sent for that request field. A null or omitted request field, including a blank list filter, is treated as any value and is not compared. Text is compared after leading and trailing spaces are removed, and a value that is only spaces is null. A success field with the same name starts as that reference, except nextCursor, which is a new token for the next page. Clear a value to skip it. {'${name}'} still reads a variable. Pattern uses a named regular expression from Setting. Regex accepts a pattern here, optionally written as /pattern/flags. For an array of objects, enter a JSON array. Each object must appear, and only the fields you include are compared. In sequence requires those objects to be the first items, in the order you wrote.
               </Typography>
               <Table size="small">
                 <TableHead>
@@ -2008,10 +2159,7 @@ function ResponseSchema({ responses, requestNames, expected, onExpected }) {
                     const automatic = defaultResponseExpected(field, requestNames, current.status)
                     const stored = expected?.[current.status]
                     const hasOverride = stored && Object.prototype.hasOwnProperty.call(stored, field.name)
-                    const storedEntry = hasOverride ? readExpectation(stored[field.name]) : { text: automatic, ordered: false }
-                    const shown = storedEntry.text
-                    const ordered = storedEntry.ordered
-                    const objectArrayError = objectArray ? parseObjectArray(shown)?.error : ''
+                    const storedEntry = hasOverride ? readExpectation(stored[field.name]) : { text: automatic, ordered: false, match: 'equals' }
                     return (
                       <TableRow key={field.name} hover>
                         <TableCell>
@@ -2031,11 +2179,11 @@ function ResponseSchema({ responses, requestNames, expected, onExpected }) {
                                 control={(
                                   <Checkbox
                                     size="small"
-                                    checked={ordered}
+                                    checked={storedEntry.ordered}
                                     onChange={(event) => onExpected(
                                       current.status,
                                       field.name,
-                                      event.target.checked || shown ? { value: shown, ordered: event.target.checked } : undefined,
+                                      event.target.checked || storedEntry.text ? { value: storedEntry.text, ordered: event.target.checked } : undefined,
                                     )}
                                   />
                                 )}
@@ -2048,29 +2196,16 @@ function ResponseSchema({ responses, requestNames, expected, onExpected }) {
                         <TableCell>{field.required ? 'yes' : ''}</TableCell>
                         <TableCell>
                           {(scalar || objectArray) && (
-                            <Stack direction="row" spacing={0.5} sx={{ alignItems: 'flex-start' }}>
-                              <TextField
-                                size="small"
-                                fullWidth
-                                multiline={objectArray}
-                                minRows={objectArray ? 2 : undefined}
-                                value={shown}
-                                placeholder={objectArray ? '[{"field":"quantity"},{"field":"customerEmail"}]' : (hasOverride ? 'Not checked' : (automatic || 'Not checked'))}
-                                error={Boolean(objectArrayError)}
-                                helperText={objectArrayError || undefined}
-                                onChange={(event) => {
-                                  const next = event.target.value
-                                  if (objectArray) onExpected(current.status, field.name, next || ordered ? (ordered ? { value: next, ordered: true } : next) : undefined)
-                                  else onExpected(current.status, field.name, next === automatic ? undefined : next)
-                                }}
-                                sx={{ minWidth: 220, '& input, & textarea': { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12.5 } }}
-                              />
-                              {hasOverride && (
-                                <Button size="small" onClick={() => onExpected(current.status, field.name, undefined)} sx={{ flexShrink: 0, minWidth: 0, color: 'text.secondary' }}>
-                                  Default
-                                </Button>
-                              )}
-                            </Stack>
+                            <ExpectedField
+                              field={field}
+                              status={current.status}
+                              automatic={automatic}
+                              stored={storedEntry}
+                              hasOverride={hasOverride}
+                              objectArray={objectArray}
+                              patterns={patterns}
+                              onExpected={onExpected}
+                            />
                           )}
                         </TableCell>
                         <TableCell sx={{ color: 'text.secondary' }}>{field.note}</TableCell>
@@ -2733,6 +2868,7 @@ function CustomCases({ operation, fields, defaults, exclusive = [], responses = 
 const SETTING_SECTIONS = [
   { id: 'client', label: 'Client' },
   { id: 'variables', label: 'Variables' },
+  { id: 'patterns', label: 'Patterns' },
   { id: 'defaults', label: 'Defaults' },
   { id: 'headers', label: 'Headers' },
   { id: 'token', label: 'Access token' },
@@ -2757,6 +2893,10 @@ function LibraryDialog({
   onRenameVariable,
   onWriteVariable,
   onRemoveVariable,
+  onAddPattern,
+  onRenamePattern,
+  onWritePattern,
+  onRemovePattern,
   onWriteNamed,
   onRenameNamed,
   onRemoveNamed,
@@ -2778,6 +2918,7 @@ function LibraryDialog({
   }, [open])
   const counts = {
     variables: Object.keys(defaults.variables || {}).length,
+    patterns: Object.keys(defaults.patterns || {}).length,
     defaults: Object.keys(defaults.global || {}).length,
     headers: Object.keys(defaults.headers || {}).length,
     pagination: Object.keys(paging || {}).length,
@@ -2866,6 +3007,20 @@ function LibraryDialog({
               onRename={onRenameVariable}
               onValue={onWriteVariable}
               onRemove={onRemoveVariable}
+            />
+          )}
+          {section === 'patterns' && (
+            <NamedMap
+              title="Patterns"
+              mono
+              valueLabel="Regex"
+              hint="Named regular expressions for response fields that are not on the request. In the response schema, choose Pattern and pick a name, or choose Regex and type one. Use ^ and $ to match the whole value."
+              entries={Object.entries(defaults.patterns || {})}
+              addLabel="Add pattern"
+              onAdd={onAddPattern}
+              onRename={onRenamePattern}
+              onValue={onWritePattern}
+              onRemove={onRemovePattern}
             />
           )}
           {section === 'defaults' && (
@@ -3120,7 +3275,7 @@ function SettingSection({ title, hint, children }) {
   )
 }
 
-function NamedMap({ title, hint, entries, addLabel, onAdd, onRename, onValue, onRemove, typed = false }) {
+function NamedMap({ title, hint, entries, addLabel, onAdd, onRename, onValue, onRemove, typed = false, mono = false, valueLabel = 'Value' }) {
   return (
     <Box>
       <Stack direction="row" spacing={1} sx={{ alignItems: 'flex-start', mb: 1.5 }}>
@@ -3138,13 +3293,13 @@ function NamedMap({ title, hint, entries, addLabel, onAdd, onRename, onValue, on
             <TableHead>
               <TableRow>
                 <TableCell sx={{ width: typed ? '34%' : '36%', bgcolor: '#f8fafc', color: 'text.secondary', fontWeight: 700 }}>Name</TableCell>
-                <TableCell sx={{ bgcolor: '#f8fafc', color: 'text.secondary', fontWeight: 700 }}>Value</TableCell>
+                <TableCell sx={{ bgcolor: '#f8fafc', color: 'text.secondary', fontWeight: 700 }}>{valueLabel}</TableCell>
                 <TableCell width={88} sx={{ bgcolor: '#f8fafc' }} />
               </TableRow>
             </TableHead>
             <TableBody>
               {entries.map(([name, value]) => (
-                <VariableRow key={name} name={name} value={value} typed={typed} onRename={onRename} onValue={onValue} onRemove={onRemove} />
+                <VariableRow key={name} name={name} value={value} typed={typed} mono={mono} valueLabel={valueLabel} onRename={onRename} onValue={onValue} onRemove={onRemove} />
               ))}
             </TableBody>
           </Table>
@@ -3256,7 +3411,7 @@ function DefaultsDialog({ open, operation, fields, defaults, onClose, onGlobal, 
   )
 }
 
-function VariableRow({ name, value, typed = false, onRename, onValue, onRemove }) {
+function VariableRow({ name, value, typed = false, mono = false, valueLabel = 'Value', onRename, onValue, onRemove }) {
   const [draft, setDraft] = useState(name)
   useEffect(() => setDraft(name), [name])
   return (
@@ -3278,7 +3433,16 @@ function VariableRow({ name, value, typed = false, onRename, onValue, onRemove }
         {typed ? (
           <TypedValue value={value} kinds={VALUE_KINDS} onChange={(raw) => onValue(name, raw)} />
         ) : (
-          <TextField size="small" fullWidth value={String(value ?? '')} onChange={(event) => onValue(name, event.target.value)} slotProps={{ htmlInput: { 'aria-label': 'Value' } }} />
+          <TextField
+            size="small"
+            fullWidth
+            value={String(value ?? '')}
+            error={mono && value ? Boolean(compilePattern(value).error) : false}
+            helperText={mono && value ? compilePattern(value).error : undefined}
+            onChange={(event) => onValue(name, event.target.value)}
+            slotProps={{ htmlInput: { 'aria-label': valueLabel } }}
+            sx={mono ? { '& input': { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12.5 } } : undefined}
+          />
         )}
       </TableCell>
       <TableCell sx={{ verticalAlign: 'middle' }}>

@@ -1229,9 +1229,42 @@ export function isArrayOfObjects(field) {
 
 export function readExpectation(raw) {
   if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
-    return { text: raw.value == null ? '' : String(raw.value), ordered: Boolean(raw.ordered) }
+    if (typeof raw.pattern === 'string') {
+      return { text: raw.pattern.trim(), ordered: false, match: 'pattern' }
+    }
+    if (typeof raw.regex === 'string') {
+      return { text: raw.regex, ordered: Boolean(raw.ordered), match: 'regex' }
+    }
+    if (raw.match === 'pattern' || raw.match === 'regex') {
+      return { text: raw.value == null ? '' : String(raw.value), ordered: Boolean(raw.ordered), match: raw.match }
+    }
+    return { text: raw.value == null ? '' : String(raw.value), ordered: Boolean(raw.ordered), match: 'equals' }
   }
-  return { text: raw == null ? '' : String(raw), ordered: false }
+  return { text: raw == null ? '' : String(raw), ordered: false, match: 'equals' }
+}
+
+export function storedExpectation(expectation) {
+  if (!expectation) return undefined
+  const match = expectation.match || 'equals'
+  const text = expectation.text == null ? '' : expectation.text
+  if (match === 'pattern') {
+    const name = String(text).trim()
+    return name ? { pattern: name } : { match: 'pattern' }
+  }
+  if (match === 'regex') return text ? { regex: String(text) } : { match: 'regex' }
+  if (expectation.ordered) return { value: text, ordered: true }
+  return text
+}
+
+export function compilePattern(source) {
+  const text = String(source ?? '')
+  if (!text) return { error: 'Enter a regular expression.' }
+  const wrapped = text.match(/^\/([\s\S]*)\/([gimsuy]*)$/)
+  try {
+    return { regex: wrapped ? new RegExp(wrapped[1], wrapped[2]) : new RegExp(text) }
+  } catch (error) {
+    return { error: error.message || 'Invalid regular expression.' }
+  }
 }
 
 export function parseObjectArray(text) {
@@ -1278,9 +1311,11 @@ export function responseChecks(views, requestNames, overridesByStatus = {}) {
     for (const field of view.fields || []) {
       if (Object.prototype.hasOwnProperty.call(overrides, field.name)) {
         const expectation = readExpectation(overrides[field.name])
-        if (expectation.text !== '') {
-          fields[field.name] = expectation.ordered ? { value: expectation.text, ordered: true } : expectation.text
+        if (expectation.match === 'regex' || expectation.match === 'pattern') {
+          if (expectation.text !== '') fields[field.name] = storedExpectation(expectation)
+          continue
         }
+        if (expectation.text !== '') fields[field.name] = storedExpectation(expectation)
         continue
       }
       const automatic = defaultResponseExpected(field, requestNames, view.status)
@@ -1445,6 +1480,29 @@ function judgeExpectedValues(context, status, text) {
     let reportedJson = false
     for (const [path, template] of Object.entries(fields)) {
       const expectation = readExpectation(template)
+      const where = page.label ? `${page.label} ` : ''
+      if (expectation.match === 'regex' || expectation.match === 'pattern') {
+        const prepared = resolvePatternExpectation(expectation, context)
+        if (prepared.skip) continue
+        checked = true
+        if (prepared.error) {
+          misses.push(`${where}${path} ${prepared.error}`)
+          continue
+        }
+        if (parsed == null || typeof parsed !== 'object') {
+          if (!reportedJson) {
+            misses.push(page.label ? `${page.label}: response was not JSON` : 'Response was not JSON')
+            reportedJson = true
+          }
+          continue
+        }
+        const compared = comparePath(parsed, path, prepared.source, false, prepared.regex)
+        if (compared.skip || compared.ok) continue
+        misses.push(compared.detail
+          ? `${where}${path} ${compared.detail}`
+          : `${where}${path} expected to match ${describeExpected(prepared.source)}, got ${describeActual(compared.actual)}`)
+        continue
+      }
       const resolved = resolveRequestTemplate(expectation.text, context.request, context.variables)
       if (resolved.skip || filterAny(path, resolved.value)) continue
       checked = true
@@ -1457,7 +1515,6 @@ function judgeExpectedValues(context, status, text) {
       }
       const compared = comparePath(parsed, path, resolved.value, expectation.ordered)
       if (compared.skip || compared.ok) continue
-      const where = page.label ? `${page.label} ` : ''
       misses.push(compared.detail
         ? `${where}${path} ${compared.detail}`
         : `${where}${path} expected ${describeExpected(resolved.value)}, got ${describeActual(compared.actual)}`)
@@ -1524,7 +1581,26 @@ function valueAt(source, name) {
   return { present: true, value: current }
 }
 
-function comparePath(body, path, expected, ordered = false) {
+function resolvePatternExpectation(expectation, context) {
+  let source = expectation.text
+  if (expectation.match === 'pattern') {
+    const name = String(source || '').trim()
+    if (!name) return { skip: true }
+    if (!Object.prototype.hasOwnProperty.call(context.patterns || {}, name)) {
+      return { error: `uses unknown pattern ${name}` }
+    }
+    source = context.patterns[name]
+  }
+  if (!String(source ?? '').trim()) return { skip: true }
+  const resolved = resolveRequestTemplate(String(source), context.request, context.variables)
+  if (resolved.skip) return { skip: true }
+  const compiled = compilePattern(resolved.value)
+  if (compiled.error) return { error: compiled.error }
+  return { source: resolved.value, regex: compiled.regex }
+}
+
+function comparePath(body, path, expected, ordered = false, regex = null) {
+  if (regex) return comparePathRegex(body, path, regex)
   const listed = parseObjectArray(expected)
   const values = valuesAt(body, path)
   if (listed) {
@@ -1539,6 +1615,27 @@ function comparePath(body, path, expected, ordered = false) {
   }
   if (values.length === 0) return { ok: false, actual: undefined }
   return sameValue(values[0], expected) ? { ok: true } : { ok: false, actual: values[0] }
+}
+
+function comparePathRegex(body, path, regex) {
+  const values = valuesAt(body, path)
+  const matches = (value) => {
+    regex.lastIndex = 0
+    return regex.test(actualText(value))
+  }
+  if (String(path).includes('[]')) {
+    if (values.length === 0) return { skip: true }
+    const actual = values.find((value) => !matches(value))
+    return actual === undefined ? { ok: true } : { ok: false, actual }
+  }
+  if (values.length === 0) return { ok: false, actual: undefined }
+  return matches(values[0]) ? { ok: true } : { ok: false, actual: values[0] }
+}
+
+function actualText(value) {
+  if (value == null) return ''
+  if (typeof value === 'object') return JSON.stringify(value)
+  return String(value)
 }
 
 function matchObjectArray(actual, objects, ordered = false) {
