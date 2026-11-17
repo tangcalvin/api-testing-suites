@@ -127,7 +127,7 @@ export function createStore(root) {
 function summarizeRun(name, document) {
   return {
     name,
-    savedAt: text(document?.savedAt),
+    savedAt: stamp(document?.savedAt),
     client: text(document?.client),
     operation: text(document?.operation),
     mode: text(document?.mode),
@@ -137,6 +137,15 @@ function summarizeRun(name, document) {
   }
 }
 
+function asBool(value) {
+  return value === true || value === 'true'
+}
+
+function stamp(value) {
+  if (value instanceof Date && !Number.isNaN(value.getTime())) return value.toISOString()
+  return text(value)
+}
+
 function cleanResult(item) {
   const pages = Array.isArray(item?.pages)
     ? item.pages.map((page) => ({
@@ -144,23 +153,57 @@ function cleanResult(item) {
       status: Number(page?.status) || 0,
       count: Number(page?.count) || 0,
       text: text(page?.text),
+      ...(storedRequest(page?.request) ? { request: storedRequest(page.request) } : {}),
     }))
     : null
   const enquiry = item?.enquiry && typeof item.enquiry === 'object'
     ? { label: text(item.enquiry.label), status: Number(item.enquiry.status) || 0, text: text(item.enquiry.text) }
     : null
+  const request = storedRequest(item?.request)
   return {
     index: Number(item?.index) || 0,
     label: text(item?.label),
     status: Number(item?.status) || 0,
-    passed: Boolean(item?.passed),
-    ...(item?.skipped ? { skipped: true } : {}),
+    passed: asBool(item?.passed),
+    ...(asBool(item?.skipped) ? { skipped: true } : {}),
     detail: text(item?.detail),
     text: text(item?.text),
     pages,
+    ...(request ? { request } : {}),
     ...(item?.step ? { step: text(item.step) } : {}),
     ...(enquiry ? { enquiry } : {}),
   }
+}
+
+function storedRequest(value) {
+  if (value == null || value === '') return null
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    if (!trimmed || trimmed === '[object Object]') return null
+    return trimmed
+  }
+  if (typeof value !== 'object' || Array.isArray(value)) return null
+  const structured = Object.prototype.hasOwnProperty.call(value, 'body')
+    || Object.prototype.hasOwnProperty.call(value, 'query')
+    || Object.prototype.hasOwnProperty.call(value, 'path')
+  if (structured) {
+    const stored = {}
+    if (value.path && typeof value.path === 'object' && !Array.isArray(value.path) && Object.keys(value.path).length) {
+      stored.path = cleanValue(value.path, 0)
+    }
+    if (value.query && typeof value.query === 'object' && !Array.isArray(value.query) && Object.keys(value.query).length) {
+      stored.query = cleanValue(value.query, 0)
+    }
+    if (value.body != null && value.body !== '') {
+      if (typeof value.body === 'string') stored.body = value.body
+      else if (typeof value.body === 'object') {
+        const body = cleanValue(value.body, 0)
+        if (body != null && !(typeof body === 'object' && !Array.isArray(body) && Object.keys(body).length === 0)) stored.body = body
+      }
+    }
+    return Object.keys(stored).length ? stored : null
+  }
+  return cleanValue(value, 0)
 }
 
 async function uniqueRunName(runsDir, savedAt) {

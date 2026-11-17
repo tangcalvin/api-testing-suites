@@ -28,16 +28,44 @@ test('clients.yaml and run files stay inside the data directory', async () => {
       mode: 'Combinations',
       baseUrl: '/backend',
       stopped: false,
-      results: [{ index: 1, label: 'status=CONFIRMED', status: 201, passed: true, detail: 'Created', text: '{"id":1}', pages: null }],
+      results: [
+        {
+          index: 1,
+          label: 'status=CONFIRMED',
+          status: 201,
+          passed: true,
+          detail: 'Created',
+          text: '{"id":1}',
+          request: { body: { status: 'CONFIRMED', quantity: 2 }, query: { page: 0 } },
+          pages: null,
+        },
+        {
+          index: 2,
+          label: 'region=null',
+          status: 400,
+          passed: false,
+          detail: 'Expected a success status',
+          text: '{"error":true}',
+          request: '{"region":null}',
+          pages: [{ label: 'Page 1', status: 200, count: 1, text: '[]', request: 'page=0' }],
+        },
+      ],
     })
     assert.match(run.name, /^[0-9]{8}T[0-9]{9}Z\.yaml$/)
     const listed = await store.listRuns()
     assert.equal(listed[0].name, run.name)
     assert.equal(listed[0].passed, 1)
+    assert.equal(listed[0].failed, 1)
     assert.equal(listed[0].operation, 'POST /api/orders')
     const loaded = yaml.load(await store.readRun(run.name))
     assert.equal(loaded.kind, 'run')
     assert.equal(loaded.results[0].text, '{"id":1}')
+    assert.equal(loaded.results[0].passed, true)
+    assert.equal(loaded.results[1].passed, false)
+    assert.equal(loaded.results[0].request.body.status, 'CONFIRMED')
+    assert.equal(loaded.results[0].request.body.quantity, 2)
+    assert.equal(loaded.results[0].request.query.page, 0)
+    assert.equal(loaded.results[1].pages[0].request, 'page=0')
     await assert.rejects(() => store.readRun('../clients.yaml'), /Unknown run name/)
 
     assert.deepEqual(await store.readDatasets('client-hk'), {})

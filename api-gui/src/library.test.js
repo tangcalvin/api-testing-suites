@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { readFileSync } from 'node:fs'
-import { acceptsTemporal, applyDefaults, casesDocument, clockToken, defaultsDocument, evaluateDynamics, formatClock, keptTemporal, parseCases, parseDefaults, parseProfiles, parseProfilesText, profileLabel, profilesDocument, profilesYaml, resolveCases, sampleSource, storedRate, substitute, temporalDraftOk, uuidToken } from './library.js'
+import { acceptsTemporal, applyDefaults, casesDocument, clockToken, defaultsDocument, evaluateDynamics, formatClock, keptTemporal, parseCases, parseDefaults, parseProfiles, parseProfilesText, parseRunDocument, profileLabel, profilesDocument, profilesYaml, resolveCases, sampleSource, storedRate, substitute, temporalDraftOk, uuidToken } from './library.js'
 
 const orderNumber = { name: 'orderNumber', location: 'body', type: 'string', sample: 'Sample', values: [], constraints: {} }
 const queryNumber = { name: 'orderNumber', location: 'query', type: 'string', sample: '', values: [], constraints: {} }
@@ -60,6 +60,28 @@ test('defaults and custom cases import as separate files', () => {
   assert.equal(withPatterns.patterns.nested, undefined)
   assert.deepEqual(withPatterns.responses['POST /api/orders']['201'].id, { regex: '^[0-9]+$' })
   assert.deepEqual(withPatterns.responses['POST /api/orders']['201'].createdAt, { pattern: 'iso' })
+  const withWhen = parseDefaults(JSON.stringify({
+    kind: 'defaults',
+    responses: {
+      'GET /api/orders': {
+        '200': {
+          'content[].orderNumber': {
+            rules: [
+              { when: { status: 'CONFIRMED', notes: '@not-null' }, regex: '^[A-Z0-9-]+$' },
+              { when: { status: 'DRAFT' }, value: 'pending', ignoreCase: true },
+              { when: { notes: '@null' }, value: '' },
+            ],
+          },
+          status: { value: 'draft', ignoreCase: true },
+        },
+      },
+    },
+  }))
+  assert.deepEqual(withWhen.responses['GET /api/orders']['200'].status, { value: 'draft', ignoreCase: true })
+  assert.deepEqual(withWhen.responses['GET /api/orders']['200']['content[].orderNumber'].rules[0].when, { status: 'CONFIRMED', notes: '@not-null' })
+  assert.equal(withWhen.responses['GET /api/orders']['200']['content[].orderNumber'].rules[1].ignoreCase, true)
+  assert.deepEqual(defaultsDocument(withWhen).responses['GET /api/orders']['200'].status, { value: 'draft', ignoreCase: true })
+  assert.equal(defaultsDocument(withWhen).responses['GET /api/orders']['200']['content[].orderNumber'].rules[2].when.notes, '@null')
   assert.deepEqual(defaultsDocument(withPatterns).patterns, { uuid: '^[0-9a-f-]{36}$' })
   assert.throws(() => parseDefaults('{"kind":"cases","operations":{}}'), /field defaults/)
 
@@ -359,6 +381,65 @@ test('a date field keeps a date and drops a plain string', () => {
     operations: { 'GET /api/orders': { deliveryFrom: '1' } },
   })
   assert.equal(overridden[0].sample, '')
+})
+
+test('saved run yaml keeps failed results as failed and restores request payloads', () => {
+  const document = parseRunDocument(`kind: run
+savedAt: '2026-11-17T12:39:42.453Z'
+operation: POST /api/orders
+mode: Combinations
+results:
+  - index: 1
+    label: ok
+    status: 201
+    passed: true
+    request: '{"status":"CONFIRMED"}'
+    text: '{"id":1}'
+  - index: 2
+    label: bad
+    status: 400
+    passed: false
+    request: '{"region":null}'
+    text: '{"error":true}'
+  - index: 3
+    label: pages
+    status: 200
+    passed: true
+    pages:
+      - label: Page 1
+        status: 200
+        count: 2
+        request: 'page=0&size=20'
+        text: '[]'
+`)
+  assert.equal(document.operation, 'POST /api/orders')
+  assert.equal(document.savedAt, '2026-11-17T12:39:42.453Z')
+  assert.equal(document.results[0].passed, true)
+  assert.equal(typeof document.results[0].passed, 'boolean')
+  assert.equal(document.results[1].passed, false)
+  assert.equal(typeof document.results[1].passed, 'boolean')
+  assert.equal(document.results[1].status, 400)
+  assert.equal(document.results[0].request, '{"status":"CONFIRMED"}')
+  assert.equal(document.results[2].pages[0].request, 'page=0&size=20')
+  assert.equal(document.results.filter((item) => item.passed).length, 2)
+  assert.equal(document.results.filter((item) => !item.passed).length, 1)
+  const nested = parseRunDocument(`kind: run
+results:
+  - index: 1
+    label: ok
+    status: 201
+    passed: true
+    request:
+      body:
+        status: CONFIRMED
+        quantity: 2
+      query:
+        page: 0
+    text: '{}'
+`)
+  assert.equal(nested.results[0].request.body.status, 'CONFIRMED')
+  assert.equal(nested.results[0].request.body.quantity, 2)
+  assert.equal(nested.results[0].request.query.page, 0)
 })
 
 test('example files use the export format', () => {

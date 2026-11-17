@@ -1,6 +1,6 @@
 import yaml from 'js-yaml'
 import { applyDefaults, coerceFieldValue, evaluateDynamics, substitute } from '../library.js'
-import { cursorValue, isLastCursor, isZeroSentinel, sentinelFrom } from './pagination.js'
+import { cursorValue, isLastCursor, isZeroSentinel, resolvePagination, sentinelFrom } from './pagination.js'
 
 const METHODS = ['get', 'post', 'put', 'patch', 'delete']
 
@@ -1321,31 +1321,108 @@ export function isArrayOfObjects(field) {
 
 export function readExpectation(raw) {
   if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    if (Array.isArray(raw.rules)) {
+      return {
+        text: '',
+        ordered: false,
+        match: 'when',
+        ignoreCase: false,
+        rules: raw.rules.map(readWhenRule).filter(Boolean),
+      }
+    }
+    const ignoreCase = raw.ignoreCase === true
     if (typeof raw.pattern === 'string') {
-      return { text: raw.pattern.trim(), ordered: false, match: 'pattern' }
+      return { text: raw.pattern.trim(), ordered: false, match: 'pattern', ignoreCase: false, rules: [] }
     }
     if (typeof raw.regex === 'string') {
-      return { text: raw.regex, ordered: Boolean(raw.ordered), match: 'regex' }
+      return { text: raw.regex, ordered: Boolean(raw.ordered), match: 'regex', ignoreCase: false, rules: [] }
     }
     if (raw.match === 'pattern' || raw.match === 'regex') {
-      return { text: raw.value == null ? '' : String(raw.value), ordered: Boolean(raw.ordered), match: raw.match }
+      return { text: raw.value == null ? '' : String(raw.value), ordered: Boolean(raw.ordered), match: raw.match, ignoreCase: false, rules: [] }
     }
-    return { text: raw.value == null ? '' : String(raw.value), ordered: Boolean(raw.ordered), match: 'equals' }
+    return { text: raw.value == null ? '' : String(raw.value), ordered: Boolean(raw.ordered), match: 'equals', ignoreCase, rules: [] }
   }
-  return { text: raw == null ? '' : String(raw), ordered: false, match: 'equals' }
+  return { text: raw == null ? '' : String(raw), ordered: false, match: 'equals', ignoreCase: false, rules: [] }
+}
+
+function readWhenRule(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const rest = { ...raw }
+  delete rest.when
+  delete rest.rules
+  const inner = Object.keys(rest).length === 0 ? readExpectation('') : readExpectation(rest)
+  return {
+    when: readWhenConditions(raw.when),
+    match: inner.match === 'when' ? 'equals' : inner.match,
+    text: inner.text,
+    ignoreCase: inner.ignoreCase === true,
+  }
+}
+
+function readWhenConditions(when) {
+  if (!when || typeof when !== 'object') return []
+  if (Array.isArray(when)) {
+    return when.map((item) => {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) return null
+      const field = String(item.field || '').trim()
+      if (!field) return null
+      if (item.op === 'null' || item.null === true) return { field, op: 'null' }
+      if (item.op === 'not-null' || item.notNull === true) return { field, op: 'not-null' }
+      const value = item.eq != null ? item.eq : item.value
+      return { field, op: 'eq', value: value == null ? '' : String(value) }
+    }).filter(Boolean)
+  }
+  return Object.entries(when).map(([field, value]) => {
+    const name = String(field || '').trim()
+    if (!name) return null
+    if (value === null || value === '@null') return { field: name, op: 'null' }
+    if (value === '@not-null' || value === '@notnull') return { field: name, op: 'not-null' }
+    return { field: name, op: 'eq', value: String(value ?? '') }
+  }).filter(Boolean)
 }
 
 export function storedExpectation(expectation) {
   if (!expectation) return undefined
   const match = expectation.match || 'equals'
+  if (match === 'when') {
+    const rules = (expectation.rules || []).map(storedWhenRule).filter(Boolean)
+    return rules.length ? { rules } : undefined
+  }
   const text = expectation.text == null ? '' : expectation.text
+  const ignoreCase = expectation.ignoreCase === true
   if (match === 'pattern') {
     const name = String(text).trim()
     return name ? { pattern: name } : { match: 'pattern' }
   }
   if (match === 'regex') return text ? { regex: String(text) } : { match: 'regex' }
-  if (expectation.ordered) return { value: text, ordered: true }
+  if (expectation.ordered || ignoreCase) {
+    const stored = { value: text }
+    if (expectation.ordered) stored.ordered = true
+    if (ignoreCase) stored.ignoreCase = true
+    return stored
+  }
   return text
+}
+
+function storedWhenRule(rule) {
+  if (!rule) return null
+  const when = {}
+  for (const item of rule.when || []) {
+    const field = String(item.field || '').trim()
+    if (!field) continue
+    if (item.op === 'null') when[field] = '@null'
+    else if (item.op === 'not-null') when[field] = '@not-null'
+    else when[field] = item.value == null ? '' : String(item.value)
+  }
+  const thenMatch = rule.match === 'when' ? 'equals' : (rule.match || 'equals')
+  const then = storedExpectation({ match: thenMatch, text: rule.text, ignoreCase: rule.ignoreCase === true })
+  if (thenMatch === 'pattern' || thenMatch === 'regex') {
+    if (!then || typeof then !== 'object') return null
+  }
+  const stored = { when }
+  if (then && typeof then === 'object' && !Array.isArray(then)) Object.assign(stored, then)
+  else stored.value = then == null ? '' : then
+  return stored
 }
 
 export function compilePattern(source) {
@@ -1407,7 +1484,14 @@ export function responseChecks(views, requestNames, overridesByStatus = {}) {
           if (expectation.text !== '') fields[field.name] = storedExpectation(expectation)
           continue
         }
-        if (expectation.text !== '') fields[field.name] = storedExpectation(expectation)
+        if (expectation.match === 'when') {
+          const stored = storedExpectation(expectation)
+          if (stored) fields[field.name] = stored
+          continue
+        }
+        if (expectation.text !== '' || expectation.ignoreCase || expectation.ordered) {
+          fields[field.name] = storedExpectation(expectation)
+        }
         continue
       }
       const automatic = defaultResponseExpected(field, requestNames, view.status)
@@ -1573,19 +1657,45 @@ function judgeExpectedValues(context, status, text) {
     for (const [path, template] of Object.entries(fields)) {
       const expectation = readExpectation(template)
       const where = page.label ? `${page.label} ` : ''
+      if (parsed == null || typeof parsed !== 'object') {
+        if (expectation.match === 'when' && (expectation.rules || []).length === 0) continue
+        if (expectation.match === 'regex' || expectation.match === 'pattern') {
+          const prepared = resolvePatternExpectation(expectation, context)
+          if (prepared.skip) continue
+          checked = true
+          if (prepared.error) {
+            misses.push(`${where}${path} ${prepared.error}`)
+            continue
+          }
+        } else if (expectation.match !== 'when') {
+          const resolved = resolveRequestTemplate(expectation.text, context.request, context.variables)
+          if (resolved.skip || filterAny(path, resolved.value)) continue
+          checked = true
+        } else {
+          checked = true
+        }
+        if (!reportedJson) {
+          misses.push(page.label ? `${page.label}: response was not JSON` : 'Response was not JSON')
+          reportedJson = true
+        }
+        continue
+      }
+      if (expectation.match === 'when') {
+        const compared = compareWhenPath(parsed, path, expectation, context)
+        if (compared.skip) continue
+        checked = true
+        if (compared.ok) continue
+        misses.push(compared.detail
+          ? `${where}${path} ${compared.detail}`
+          : `${where}${path} expected ${describeExpected(compared.expected)}, got ${describeActual(compared.actual)}`)
+        continue
+      }
       if (expectation.match === 'regex' || expectation.match === 'pattern') {
         const prepared = resolvePatternExpectation(expectation, context)
         if (prepared.skip) continue
         checked = true
         if (prepared.error) {
           misses.push(`${where}${path} ${prepared.error}`)
-          continue
-        }
-        if (parsed == null || typeof parsed !== 'object') {
-          if (!reportedJson) {
-            misses.push(page.label ? `${page.label}: response was not JSON` : 'Response was not JSON')
-            reportedJson = true
-          }
           continue
         }
         const compared = comparePath(parsed, path, prepared.source, false, prepared.regex)
@@ -1598,14 +1708,7 @@ function judgeExpectedValues(context, status, text) {
       const resolved = resolveRequestTemplate(expectation.text, context.request, context.variables)
       if (resolved.skip || filterAny(path, resolved.value)) continue
       checked = true
-      if (parsed == null || typeof parsed !== 'object') {
-        if (!reportedJson) {
-          misses.push(page.label ? `${page.label}: response was not JSON` : 'Response was not JSON')
-          reportedJson = true
-        }
-        continue
-      }
-      const compared = comparePath(parsed, path, resolved.value, expectation.ordered)
+      const compared = comparePath(parsed, path, resolved.value, expectation.ordered, null, expectation.ignoreCase)
       if (compared.skip || compared.ok) continue
       misses.push(compared.detail
         ? `${where}${path} ${compared.detail}`
@@ -1691,22 +1794,107 @@ function resolvePatternExpectation(expectation, context) {
   return { source: resolved.value, regex: compiled.regex }
 }
 
-function comparePath(body, path, expected, ordered = false, regex = null) {
+function compareWhenPath(body, path, expectation, context) {
+  const rules = expectation.rules || []
+  if (rules.length === 0) return { skip: true }
+  const records = innermostRecords(body, path)
+  if (records.length === 0) return { skip: true }
+  const leaf = responseLeaf(path)
+  let checked = false
+  for (const record of records) {
+    const rule = firstMatchingRule(rules, body, record)
+    if (!rule) continue
+    const actual = leaf && plainObject(record) ? record[leaf] : record
+    const compared = matchRuleActual(actual, path, rule, context)
+    if (compared.skip) continue
+    checked = true
+    if (compared.ok) continue
+    return compared.detail
+      ? compared
+      : { ok: false, actual: compared.actual, expected: compared.expected, detail: compared.detail }
+  }
+  return checked ? { ok: true } : { skip: true }
+}
+
+function innermostRecords(body, path) {
+  const parts = String(path || '').split('.').filter(Boolean)
+  if (parts.length === 0) return [body]
+  const last = parts[parts.length - 1]
+  if (last.endsWith('[]')) return valuesAt(body, path)
+  const parent = parts.slice(0, -1).join('.')
+  if (!parent) return [body]
+  const records = valuesAt(body, parent)
+  return records.length > 0 ? records : [body]
+}
+
+function firstMatchingRule(rules, body, record) {
+  for (const rule of rules) {
+    if ((rule.when || []).every((condition) => conditionHolds(body, record, condition))) return rule
+  }
+  return null
+}
+
+function conditionHolds(body, record, condition) {
+  const found = readConditionValue(body, record, condition.field)
+  if (condition.op === 'null') return !found.present || found.value == null
+  if (condition.op === 'not-null') return found.present && found.value != null
+  if (!found.present || found.value == null) return false
+  return sameValue(found.value, condition.value)
+}
+
+function readConditionValue(body, record, field) {
+  const name = String(field || '').trim()
+  if (!name) return { present: false }
+  if (record != null && typeof record === 'object') {
+    const local = valueAt(record, name)
+    if (local.present) return local
+    const leaf = responseLeaf(name)
+    if (leaf && leaf !== name) {
+      const byLeaf = valueAt(record, leaf)
+      if (byLeaf.present) return byLeaf
+    }
+  }
+  const values = valuesAt(body, name)
+  if (values.length > 0) return { present: true, value: values[0] }
+  return { present: false }
+}
+
+function matchRuleActual(actual, path, rule, context) {
+  if (rule.match === 'regex' || rule.match === 'pattern') {
+    const prepared = resolvePatternExpectation(rule, context)
+    if (prepared.skip) return { skip: true }
+    if (prepared.error) return { ok: false, detail: prepared.error, expected: prepared.source }
+    prepared.regex.lastIndex = 0
+    if (prepared.regex.test(actualText(actual))) return { ok: true }
+    return {
+      ok: false,
+      actual,
+      expected: prepared.source,
+      detail: `expected to match ${describeExpected(prepared.source)}, got ${describeActual(actual)}`,
+    }
+  }
+  const resolved = resolveRequestTemplate(rule.text, context.request, context.variables)
+  if (resolved.skip || filterAny(path, resolved.value)) return { skip: true }
+  if (sameValue(actual, resolved.value, rule.ignoreCase)) return { ok: true }
+  return { ok: false, actual, expected: resolved.value }
+}
+
+function comparePath(body, path, expected, ordered = false, regex = null, ignoreCase = false) {
   if (regex) return comparePathRegex(body, path, regex)
   const listed = parseObjectArray(expected)
   const values = valuesAt(body, path)
   if (listed) {
     if (listed.error) return { ok: false, detail: listed.error }
     const actual = String(path).includes('[]') ? values : values[0]
-    return matchObjectArray(actual, listed.objects, ordered)
+    return matchObjectArray(actual, listed.objects, ordered, ignoreCase)
   }
   if (String(path).includes('[]')) {
     if (values.length === 0) return { skip: true }
-    const actual = values.find((value) => !sameValue(value, expected))
+    const actual = values.find((value) => !sameValue(value, expected, ignoreCase))
     return actual === undefined ? { ok: true } : { ok: false, actual }
   }
   if (values.length === 0) return { ok: false, actual: undefined }
-  return sameValue(values[0], expected) ? { ok: true } : { ok: false, actual: values[0] }
+  return sameValue(values[0], expected, ignoreCase) ? { ok: true } : { ok: false, actual: values[0] }
 }
 
 function comparePathRegex(body, path, regex) {
@@ -1730,13 +1918,13 @@ function actualText(value) {
   return String(value)
 }
 
-function matchObjectArray(actual, objects, ordered = false) {
+function matchObjectArray(actual, objects, ordered = false, ignoreCase = false) {
   if (!Array.isArray(actual)) return { ok: false, actual }
   if (objects.length === 0) return actual.length === 0 ? { ok: true } : { ok: false, actual }
   if (ordered) {
     for (let index = 0; index < objects.length; index += 1) {
       const item = actual[index]
-      if (!plainObject(item) || !objectCovers(item, objects[index])) {
+      if (!plainObject(item) || !objectCovers(item, objects[index], ignoreCase)) {
         return {
           ok: false,
           actual,
@@ -1748,15 +1936,15 @@ function matchObjectArray(actual, objects, ordered = false) {
   }
   const used = new Set()
   for (const expected of objects) {
-    const index = actual.findIndex((item, itemIndex) => !used.has(itemIndex) && plainObject(item) && objectCovers(item, expected))
+    const index = actual.findIndex((item, itemIndex) => !used.has(itemIndex) && plainObject(item) && objectCovers(item, expected, ignoreCase))
     if (index < 0) return { ok: false, actual }
     used.add(index)
   }
   return { ok: true }
 }
 
-function objectCovers(actual, expected) {
-  return Object.keys(expected).every((key) => sameValue(actual[key], expected[key]))
+function objectCovers(actual, expected, ignoreCase = false) {
+  return Object.keys(expected).every((key) => sameValue(actual[key], expected[key], ignoreCase))
 }
 
 function valuesAt(body, path) {
@@ -1780,14 +1968,16 @@ function valuesAt(body, path) {
   return currents
 }
 
-function sameValue(actual, expected) {
+function sameValue(actual, expected, ignoreCase = false) {
   if (actual === expected) return true
   if (actual == null || expected == null) return false
   if (typeof actual === 'object') {
     return JSON.stringify(actual) === (typeof expected === 'string' ? expected : JSON.stringify(expected))
   }
   if (sameInstant(actual, expected)) return true
-  return String(actual) === String(expected)
+  const left = String(actual)
+  const right = String(expected)
+  return ignoreCase ? left.toLowerCase() === right.toLowerCase() : left === right
 }
 
 function sameInstant(actual, expected) {
@@ -1944,6 +2134,89 @@ export function applyPaging(sent, pagination, paging, fields) {
     }
   }
   return { ...sent, query, body }
+}
+
+export function payloadFromCase(item, operation, pagingOverride) {
+  if (!item) return null
+  const pagination = resolvePagination(operation?.pagination, pagingOverride)
+  let sent = { body: item.body, query: { ...(item.query || {}) }, path: { ...(item.path || {}) } }
+  const followPages = item.kind !== 'trial' && item.expect?.outcome !== 'error' && item.expect?.outcome !== 'custom' && pagination
+  if (followPages) {
+    const paging = firstPageQuery(pagination, collectPaging(sent, pagination))
+    sent = applyPaging(sent, pagination, paging, operation?.fields)
+  }
+  const request = {}
+  if (sent.path && typeof sent.path === 'object' && Object.keys(sent.path).length) request.path = sent.path
+  if (sent.query && typeof sent.query === 'object' && Object.keys(sent.query).length) request.query = sent.query
+  if (sent.body != null && sent.body !== '' && !(typeof sent.body === 'object' && !Array.isArray(sent.body) && Object.keys(sent.body).length === 0)) {
+    request.body = sent.body
+  }
+  return Object.keys(request).length ? request : null
+}
+
+export function fillRunRequests(results, cases, operation, pagingOverride, fields) {
+  const byLabel = new Map()
+  for (const item of cases || []) {
+    if (item?.label && !byLabel.has(item.label)) byLabel.set(item.label, item)
+  }
+  const source = fields || operation?.fields || []
+  return (results || []).map((result) => {
+    if (hasStoredRequest(result)) return result
+    const request = payloadFromCase(byLabel.get(result.label), operation, pagingOverride)
+      || payloadFromLabel(result.label, source, operation, pagingOverride)
+    return request ? { ...result, request } : result
+  })
+}
+
+export function payloadFromLabel(label, fields, operation, pagingOverride) {
+  const overrides = overridesFromLabel(label, fields)
+  if (!overrides || Object.keys(overrides).length === 0) return null
+  return payloadFromCase({
+    kind: 'combination',
+    expect: { outcome: 'success' },
+    ...assemble(fields || [], overrides, { combination: true }),
+  }, operation, pagingOverride)
+}
+
+function overridesFromLabel(label, fields) {
+  const text = String(label || '').trim()
+  if (!text || text === 'Valid sample' || text === 'Trial') return null
+  const known = new Set((fields || []).map((field) => field.name))
+  const overrides = {}
+  for (const part of text.split(', ')) {
+    const eq = part.indexOf('=')
+    if (eq <= 0) continue
+    const name = part.slice(0, eq)
+    if (known.size && !known.has(name)) continue
+    overrides[name] = labelValue((fields || []).find((field) => field.name === name), part.slice(eq + 1))
+  }
+  return Object.keys(overrides).length ? overrides : null
+}
+
+function labelValue(field, raw) {
+  if (raw === 'omit') return OMIT
+  if (raw === 'null') return null
+  if (raw === 'empty') return OBJECT_EMPTY
+  if (raw === 'fields') return OBJECT_FIELDS
+  if (raw === 'composite') return OBJECT_COMPOSITE
+  if (raw === 'blank') return ''
+  if (!field) return raw
+  return coerceFieldValue(field, raw)
+}
+
+export function hasStoredRequest(result) {
+  const value = result?.request
+  if (value == null || value === '') return false
+  if (typeof value === 'string') return value.trim() !== '' && value !== '[object Object]'
+  if (typeof value !== 'object' || Array.isArray(value)) return false
+  if (Object.prototype.hasOwnProperty.call(value, 'body') || Object.prototype.hasOwnProperty.call(value, 'query') || Object.prototype.hasOwnProperty.call(value, 'path')) {
+    const body = value.body
+    const hasBody = body != null && body !== '' && !(typeof body === 'object' && !Array.isArray(body) && Object.keys(body).length === 0)
+    const hasQuery = value.query && typeof value.query === 'object' && Object.keys(value.query).length > 0
+    const hasPath = value.path && typeof value.path === 'object' && Object.keys(value.path).length > 0
+    return Boolean(hasBody || hasQuery || hasPath)
+  }
+  return Object.keys(value).length > 0
 }
 
 export function planContinuation(pagination, query, body, fetched, linkHeader) {

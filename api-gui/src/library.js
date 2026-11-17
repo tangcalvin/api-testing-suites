@@ -201,6 +201,83 @@ export function readDocument(text) {
   return trimmed.startsWith('{') || trimmed.startsWith('[') ? JSON.parse(trimmed) : yaml.load(trimmed, { schema: textSchema })
 }
 
+export function parseRunDocument(text) {
+  const trimmed = String(text ?? '').trim()
+  if (!trimmed) {
+    throw new Error('The file is empty.')
+  }
+  const data = trimmed.startsWith('{') || trimmed.startsWith('[') ? JSON.parse(trimmed) : yaml.load(trimmed)
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new Error('This file is not a saved run.')
+  }
+  return {
+    ...data,
+    savedAt: isoText(data.savedAt),
+    results: loadedRunResults(data.results),
+  }
+}
+
+export function loadedRunResults(raw) {
+  if (!Array.isArray(raw)) return []
+  return raw.map((item, index) => {
+    const pages = Array.isArray(item?.pages)
+      ? item.pages.map((page) => ({
+        label: page?.label == null ? '' : String(page.label),
+        status: Number(page?.status) || 0,
+        count: Number(page?.count) || 0,
+        text: payloadText(page?.text),
+        ...(page?.request ? { request: storedPayload(page.request) } : {}),
+      }))
+      : null
+    const result = {
+      index: Number(item?.index) || index + 1,
+      label: item?.label == null ? '' : String(item.label),
+      status: Number(item?.status) || 0,
+      passed: asBool(item?.passed),
+      detail: item?.detail == null ? '' : String(item.detail),
+      text: payloadText(item?.text),
+      pages,
+    }
+    if (asBool(item?.skipped)) result.skipped = true
+    if (item?.request) result.request = storedPayload(item.request)
+    if (Array.isArray(item?.records) && item.records.length) result.records = item.records
+    if (item?.step) result.step = String(item.step)
+    if (item?.enquiry && typeof item.enquiry === 'object') {
+      result.enquiry = {
+        label: String(item.enquiry.label || ''),
+        status: Number(item.enquiry.status) || 0,
+        text: payloadText(item.enquiry.text),
+      }
+    }
+    return result
+  })
+}
+
+function asBool(value) {
+  return value === true || value === 'true'
+}
+
+function isoText(value) {
+  if (value instanceof Date && !Number.isNaN(value.getTime())) return value.toISOString()
+  return value == null ? '' : String(value)
+}
+
+function payloadText(value) {
+  if (value == null || value === '') return ''
+  if (typeof value === 'string') return value
+  try {
+    return JSON.stringify(value, null, 2)
+  } catch {
+    return String(value)
+  }
+}
+
+function storedPayload(value) {
+  if (value == null || value === '' || value === '[object Object]') return undefined
+  if (typeof value === 'string' || typeof value === 'object') return value
+  return String(value)
+}
+
 export function parseProfilesText(text) {
   return parseProfiles(readDocument(text))
 }
@@ -958,6 +1035,10 @@ function responseFieldMap(source) {
 function storedResponseField(raw) {
   if (typeof raw === 'string' || typeof raw === 'number' || typeof raw === 'boolean') return raw
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined
+  if (Array.isArray(raw.rules)) {
+    const rules = raw.rules.map(storedWhenField).filter(Boolean)
+    return rules.length ? { rules } : undefined
+  }
   if (typeof raw.pattern === 'string') {
     const name = raw.pattern.trim()
     return name ? { pattern: name } : { match: 'pattern' }
@@ -968,12 +1049,41 @@ function storedResponseField(raw) {
     if (raw.match === 'pattern') return text.trim() ? { pattern: text.trim() } : { match: 'pattern' }
     return text ? { regex: text } : { match: 'regex' }
   }
-  if (raw.value != null || raw.ordered) {
+  if (raw.value != null || raw.ordered || raw.ignoreCase === true) {
     const text = raw.value == null ? '' : String(raw.value)
-    if (raw.ordered) return { value: text, ordered: true }
+    if (raw.ordered || raw.ignoreCase === true) {
+      const stored = { value: text }
+      if (raw.ordered) stored.ordered = true
+      if (raw.ignoreCase === true) stored.ignoreCase = true
+      return stored
+    }
     if (text !== '') return text
   }
   return undefined
+}
+
+function storedWhenField(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const rest = { ...raw }
+  delete rest.when
+  delete rest.rules
+  const then = storedResponseField(Object.keys(rest).length ? rest : { value: '' })
+  const when = storedWhenMap(raw.when)
+  if (then && typeof then === 'object' && !Array.isArray(then)) return { when, ...then }
+  return { when, value: then == null ? '' : then }
+}
+
+function storedWhenMap(when) {
+  if (!when || typeof when !== 'object' || Array.isArray(when)) return {}
+  const stored = {}
+  for (const [field, value] of Object.entries(when)) {
+    const name = String(field || '').trim()
+    if (!name) continue
+    if (value === null || value === '@null') stored[name] = '@null'
+    else if (value === '@not-null' || value === '@notnull') stored[name] = '@not-null'
+    else stored[name] = String(value ?? '')
+  }
+  return stored
 }
 
 function operationMaps(source) {

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { OMIT, OBJECT_COMPOSITE, OBJECT_FIELDS, applyPaging, collectPaging, individualChoices, buildIndividualCases, applyErrorOverrides, applyErrorRowToGroup, assignFixture, buildCases, buildCustomCases, buildCustomErrorCases, buildErrorCases, buildTrialCases, caseCount, combinationObjectMode, compilePattern, compositeField, detectPagination, enquiryShouldMiss, enquiryTarget, firstPageQuery, fixtureEnabled, fixtureNote, fixturePlan, fixtureRequest, fixtureSteps, judge, listOperations, operationGroups, operationRole, parseSpecText, planContinuation, readCreatedId, readItems, recordId, detectPayloadId, idNameRank, resolvedId, readExpectation, responseChecks, responseViews, responsesForMode, sampleCall, scalarCombinationField, specGaps, storedExpectation, textCombinationField, underComposite, viewsWithStatuses, withFixtureId, withTextCombinationValues } from './spec.js'
+import { OMIT, OBJECT_COMPOSITE, OBJECT_FIELDS, applyPaging, collectPaging, individualChoices, buildIndividualCases, applyErrorOverrides, applyErrorRowToGroup, assignFixture, buildCases, buildCustomCases, buildCustomErrorCases, buildErrorCases, buildTrialCases, caseCount, combinationObjectMode, compilePattern, compositeField, detectPagination, enquiryShouldMiss, enquiryTarget, fillRunRequests, firstPageQuery, fixtureEnabled, fixtureNote, fixturePlan, fixtureRequest, fixtureSteps, judge, listOperations, operationGroups, operationRole, parseSpecText, planContinuation, readCreatedId, readItems, recordId, detectPayloadId, idNameRank, resolvedId, readExpectation, responseChecks, responseViews, responsesForMode, sampleCall, scalarCombinationField, specGaps, storedExpectation, textCombinationField, underComposite, viewsWithStatuses, withFixtureId, withTextCombinationValues } from './spec.js'
 import { resolvePagination, storedPaging } from './pagination.js'
 
 const SPEC = `
@@ -1539,6 +1539,92 @@ test('a response field can match a typed regex or a named pattern', () => {
   assert.match(unknown.detail, /unknown pattern hex/)
 })
 
+test('a response value can be compared without regard to case', () => {
+  assert.deepEqual(storedExpectation({ match: 'equals', text: 'draft', ignoreCase: true }), { value: 'draft', ignoreCase: true })
+  assert.equal(readExpectation({ value: 'draft', ignoreCase: true }).ignoreCase, true)
+
+  const matched = judge(
+    { outcome: 'success' },
+    201,
+    '{"status":"DRAFT"}',
+    { request: { body: {}, query: {}, path: {} }, expectations: { '201': { status: { value: 'draft', ignoreCase: true } } } },
+  )
+  assert.equal(matched.passed, true)
+
+  const missed = judge(
+    { outcome: 'success' },
+    201,
+    '{"status":"DRAFT"}',
+    { request: { body: {}, query: {}, path: {} }, expectations: { '201': { status: { value: 'draft' } } } },
+  )
+  assert.equal(missed.passed, false)
+})
+
+test('a response field can choose a check from other field values', () => {
+  const stored = storedExpectation({
+    match: 'when',
+    rules: [
+      { when: [{ field: 'status', op: 'eq', value: 'CONFIRMED' }, { field: 'notes', op: 'not-null' }], match: 'regex', text: '^[A-Z0-9-]+$' },
+      { when: [{ field: 'status', op: 'eq', value: 'DRAFT' }], match: 'equals', text: 'pending', ignoreCase: true },
+      { when: [{ field: 'notes', op: 'null' }], match: 'equals', text: '' },
+    ],
+  })
+  assert.deepEqual(stored, {
+    rules: [
+      { when: { status: 'CONFIRMED', notes: '@not-null' }, regex: '^[A-Z0-9-]+$' },
+      { when: { status: 'DRAFT' }, value: 'pending', ignoreCase: true },
+      { when: { notes: '@null' }, value: '' },
+    ],
+  })
+  assert.equal(readExpectation(stored).match, 'when')
+  assert.equal(readExpectation(stored).rules[1].ignoreCase, true)
+
+  const confirmed = judge(
+    { outcome: 'success' },
+    201,
+    '{"status":"CONFIRMED","notes":"Leave","trackingNumber":"AB-9"}',
+    { request: { body: {}, query: {}, path: {} }, expectations: { '201': { trackingNumber: stored } } },
+  )
+  assert.equal(confirmed.passed, true)
+
+  const draft = judge(
+    { outcome: 'success' },
+    201,
+    '{"status":"DRAFT","notes":"x","trackingNumber":"PENDING"}',
+    { request: { body: {}, query: {}, path: {} }, expectations: { '201': { trackingNumber: stored } } },
+  )
+  assert.equal(draft.passed, true)
+
+  const wrong = judge(
+    { outcome: 'success' },
+    201,
+    '{"status":"CONFIRMED","notes":"x","trackingNumber":"ab-9"}',
+    { request: { body: {}, query: {}, path: {} }, expectations: { '201': { trackingNumber: stored } } },
+  )
+  assert.equal(wrong.passed, false)
+  assert.match(wrong.detail, /trackingNumber expected to match/)
+
+  const rows = judge(
+    { outcome: 'success' },
+    200,
+    '{"content":[{"status":"CONFIRMED","notes":"a","orderNumber":"AB-1"},{"status":"DRAFT","notes":"b","orderNumber":"pending"}]}',
+    {
+      request: { body: {}, query: {}, path: {} },
+      expectations: {
+        '200': {
+          'content[].orderNumber': {
+            rules: [
+              { when: { status: 'CONFIRMED' }, regex: '^[A-Z0-9-]+$' },
+              { when: { status: 'DRAFT' }, value: 'pending', ignoreCase: true },
+            ],
+          },
+        },
+      },
+    },
+  )
+  assert.equal(rows.passed, true)
+})
+
 test('a trial sends one request from typed values and defaults', () => {
   const fields = [
     { name: 'status', location: 'body', type: 'string', sample: 'DRAFT', values: [], constraints: {} },
@@ -1549,6 +1635,14 @@ test('a trial sends one request from typed values and defaults', () => {
   assert.equal(item.body.status, 'CONFIRMED')
   assert.equal(item.body.notes, 'Leave at reception')
   assert.equal(item.expect.outcome, 'success')
+
+  const [defaults] = buildTrialCases(fields, { request: {}, omit: [] })
+  assert.equal(defaults.body.status, 'DRAFT')
+  assert.equal(defaults.body.notes, 'Leave at reception')
+
+  const [cleared] = buildTrialCases(fields, { request: { status: '', notes: '' }, omit: [] })
+  assert.equal(cleared.body.status, undefined)
+  assert.equal(cleared.body.notes, undefined)
 })
 
 test('custom cases send request overrides and match response fields', () => {
@@ -2141,4 +2235,36 @@ paths:
   assert.equal(removePlan.consumeSuccess, true)
   assert.equal(removePlan.cleanup.id, remove.id)
   assert.equal(fixturePlan(getOne, operations, {}, ''), null)
+})
+
+test('a saved run without a stored request rebuilds the payload from the case', () => {
+  const cases = buildCases([{
+    name: 'status',
+    location: 'body',
+    type: 'string',
+    enum: true,
+    required: true,
+    vary: true,
+    sample: 'DRAFT',
+    values: ['DRAFT', 'CONFIRMED'],
+    constraints: {},
+  }])
+  assert.ok(cases.length >= 2)
+  const filled = fillRunRequests([{ label: cases[1].label, status: 201, text: '{}' }], cases)
+  assert.equal(filled[0].request.body.status, cases[1].body.status)
+  const kept = fillRunRequests([{ label: cases[1].label, request: { body: { status: 'KEPT' } }, text: '{}' }], cases)
+  assert.equal(kept[0].request.body.status, 'KEPT')
+  const fromLabel = fillRunRequests(
+    [{ label: 'deliveryAddress.region=null', status: 400, text: '{}' }],
+    [],
+    { fields: [{ name: 'deliveryAddress.region', location: 'body', object: true, sample: '@fields' }] },
+    null,
+    [
+      { name: 'status', location: 'body', type: 'string', sample: 'CONFIRMED' },
+      { name: 'deliveryAddress.region', location: 'body', object: true, sample: '@fields' },
+      { name: 'deliveryAddress.region.code', location: 'body', type: 'string', sample: 'C' },
+    ],
+  )
+  assert.equal(fromLabel[0].request.body.status, 'CONFIRMED')
+  assert.equal(fromLabel[0].request.body.deliveryAddress.region, null)
 })

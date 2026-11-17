@@ -81,6 +81,7 @@ import {
   applyPaging,
   collectPaging,
   describeFetched,
+  fillRunRequests,
   firstPageQuery,
   joinUrl,
   judge,
@@ -150,6 +151,7 @@ import {
   parseOauth,
   parseProfiles,
   parseProfilesText,
+  parseRunDocument,
   readDocument,
   profileLabel,
   profilesDocument,
@@ -171,11 +173,31 @@ const EXAMPLES_SEEDED_KEY = 'api-tester.examples-loaded'
 const EXAMPLE_CLIENTS_KEY = 'api-tester.example-clients'
 const PROXY_SPEC = '/api/v3/api-docs.yaml'
 
+function resolvedOperationFields(operation, modeId, defaults, customCases) {
+  const applied = applyDefaults(operation.fields.map((field) => ({ ...field })), operation.id, defaults)
+  return modeId === 'combination'
+    ? withTextCombinationValues(applied, customCases?.values?.[operation.id], defaults?.variables, customCases?.vary?.[operation.id])
+    : applied
+}
+
+function casesForOperation(operation, modeId, defaults, customCases) {
+  if (!operation) return { fields: [], cases: [] }
+  const fields = resolvedOperationFields(operation, modeId, defaults, customCases)
+  return {
+    fields,
+    cases: casesFor(modeId, fields, resolveCases(customCases?.operations?.[operation.id] || [], defaults?.variables), {
+      fieldsets: customCases?.exclusions?.[operation.id]?.fieldsets || [],
+      distinct: customCases?.exclusions?.[operation.id]?.distinct || [],
+      exclusive: operation.exclusive || [],
+    }, customCases?.errors?.[operation.id] || [], customCases?.trials?.[operation.id]),
+  }
+}
+
 const MODES = [
   {
     id: 'combination',
     label: 'Combinations',
-    detail: 'Crosses each selected enum. Clear a field checkbox to keep that field on its default. An optional enum includes null and omit, and a null already in the enum is listed once. With a field checked you can turn off some of its possible values, such as 3 of 5 enum values. An optional object is sent filled, as null, and omitted. Mark an object with children as Composite to send those children as one value. The composite default is the field values, null, or empty; with no try values that default is the only value used. Try values in the Values column are the compositions that are combined; the default is not listed there. An optional composite can also try null, empty, or omit; a required composite does not. An enum that is not crossed uses one selected value. A string or number uses its default plus any other values you add, and can include null and omit when it is optional. Other optional query filters stay off the request. Skip rules are left out. A check passes on a success status, and when each expected response value matches. With a record set uploaded, each check filters that set and compares it with the rows from every page.',
+    detail: 'Crosses each selected enum. Clear a field checkbox to keep that field on its default. The Vary header checkbox clears every field at once. An optional enum includes null and omit, and a null already in the enum is listed once. With a field checked you can turn off some of its possible values, such as 3 of 5 enum values. An optional object is sent filled, as null, and omitted. Mark an object with children as Composite to send those children as one value. The composite default is the field values, null, or empty; with no try values that default is the only value used. Try values in the Values column are the compositions that are combined; the default is not listed there. An optional composite can also try null, empty, or omit; a required composite does not. An enum that is not crossed uses one selected value. A string or number uses its default plus any other values you add, and can include null and omit when it is optional. Other optional query filters stay off the request. Skip rules are left out. A check passes on a success status, and when each expected response value matches. With a record set uploaded, each check filters that set and compares it with the rows from every page.',
   },
   {
     id: 'individual',
@@ -195,7 +217,7 @@ const MODES = [
   {
     id: 'trial',
     label: 'Trial',
-    detail: 'Fill the request and send it once. Blank fields use the defaults. Pagination is not followed. A 2xx status is a pass.',
+    detail: 'Fields start on their defaults. Defaults in the Value header fills every field. Clear empties them. A cleared field is left off the request. Pagination is not followed. A 2xx status is a pass.',
   },
 ]
 
@@ -284,6 +306,13 @@ export default function App() {
   const skippedCombinations = activeMode === 'combination' && selected
     ? Math.max(0, caseCount(resolvedFields) - planned.length)
     : 0
+  const combinationVaryNames = useMemo(
+    () => (activeMode === 'combination' && selected ? combinationVaryTargets(fields, resolvedFields) : []),
+    [activeMode, fields, resolvedFields, selected],
+  )
+  const combinationVarying = combinationVaryNames.filter((name) => resolvedFields.find((item) => item.name === name)?.vary).length
+  const anyCombinationVary = combinationVarying > 0
+  const allCombinationVary = combinationVaryNames.length > 0 && combinationVarying === combinationVaryNames.length
   const savedRecordId = selected ? customCases.ids?.[selected.id] : undefined
   useEffect(() => {
     const id = `${activeId || ''}:${selectedId || ''}`
@@ -634,8 +663,42 @@ export default function App() {
 
   async function openSavedRun(name) {
     try {
-      const document = readDocument(await loadRun(name))
-      setResults(Array.isArray(document?.results) ? document.results : [])
+      const document = parseRunDocument(await loadRun(name))
+      const current = profiles.find((item) => item.id === activeId)
+      const profile = profiles.find((item) => profileLabel(item) === document.client)
+        || (current?.oauth?.clientId === document.clientId ? current : null)
+        || profiles.find((item) => item.oauth?.clientId && item.oauth.clientId === document.clientId)
+      if (profile && profile.id !== activeId) {
+        showProfile(profile)
+      }
+      const sourceDefaults = profile && profile.id !== activeId ? profile.defaults : defaults
+      const sourceCases = profile && profile.id !== activeId ? profile.cases : customCases
+      let loaded = document.results
+      if (document.mode === 'Scenarios') {
+        setShowScenarios(true)
+        const scenarios = sourceCases?.scenarios || []
+        const scenario = scenarios.find((item) => item.name === document.operation)
+        if (scenario) setScenarioId(scenario.id)
+      } else {
+        const nextMode = MODES.find((item) => item.label === document.mode)?.id
+        if (nextMode) setMode(nextMode)
+        const operation = operations.find((item) => item.id === document.operation)
+        if (operation) {
+          setShowScenarios(false)
+          setSelectedId(operation.id)
+          setFields(operation.fields.map((field) => ({ ...field })))
+          setOpenTag(operation.tag || '')
+          const rebuilt = casesForOperation(operation, nextMode || activeMode, sourceDefaults, sourceCases)
+          loaded = fillRunRequests(
+            document.results,
+            rebuilt.cases,
+            operation,
+            sourceCases?.paging?.[operation.id],
+            rebuilt.fields,
+          )
+        }
+      }
+      setResults(loaded)
       setSavedRunName(name)
       setOpenResult(null)
       setOnlyFailed(false)
@@ -823,11 +886,23 @@ export default function App() {
   }
 
   function writeVary(operationId, fieldName, on) {
+    writeVaryNames(operationId, [fieldName], on)
+  }
+
+  function applyCombinationVary(operationId, names, on) {
+    const set = new Set(names)
+    setFields((current) => current.map((field) => (set.has(field.name) ? { ...field, vary: on, textVary: on } : field)))
+    writeVaryNames(operationId, names, on)
+  }
+
+  function writeVaryNames(operationId, names, on) {
     setCustomCases((current) => {
       const vary = { ...(current.vary || {}) }
       const operation = { ...(vary[operationId] || {}) }
-      if (on) delete operation[fieldName]
-      else operation[fieldName] = false
+      for (const fieldName of names) {
+        if (on) delete operation[fieldName]
+        else operation[fieldName] = false
+      }
       if (Object.keys(operation).length === 0) delete vary[operationId]
       else vary[operationId] = operation
       return { ...current, vary }
@@ -1013,7 +1088,6 @@ export default function App() {
       setResults([...next])
     }
     const noteCreate = (response, id, label) => {
-      const request = formatRequestBody(response.request?.body)
       pushResult({
         step: 'before',
         label,
@@ -1021,7 +1095,7 @@ export default function App() {
         passed: id != null,
         detail: id != null ? `Created id ${id}.` : 'Creating a record did not return an id.',
         text: pretty(response.text),
-        ...(request ? { request } : {}),
+        ...(response.request ? { request: response.request } : {}),
       })
     }
     try {
@@ -1095,14 +1169,14 @@ export default function App() {
             if (!ok) verdict.passed = false
           }
         }
-        const request = formatRequestPayload(response.request || { body: item.body, query: item.query, path: item.path })
+        const request = response.request || { body: item.body, query: item.query, path: item.path }
         pushResult({
           label: item.label,
           status: response.status,
           passed: verdict.passed,
           detail: verdict.detail,
           text: response.pages ? response.text : pretty(response.text),
-          pages: response.pages ? response.pages.map((page) => ({ ...page, text: pretty(page.text), request: page.request || '' })) : null,
+          pages: response.pages ? response.pages.map((page) => ({ ...page, text: pretty(page.text), ...(page.request ? { request: page.request } : {}) })) : null,
           ...(response.records?.length ? { records: response.records } : {}),
           ...(request ? { request } : {}),
           ...(enquiry ? { enquiry } : {}),
@@ -1123,6 +1197,7 @@ export default function App() {
             passed: removed,
             detail: removed ? `Removed id ${id}.` : 'The record created for this run could not be removed.',
             text: pretty(response?.text || ''),
+            ...(response?.request ? { request: response.request } : {}),
           })
         }
       }
@@ -1205,14 +1280,13 @@ export default function App() {
           })
           if (!verdict.passed) rowFailed = true
           Object.assign(captured, capturedFrom(step.captures, response.status, response.text, response.location))
-          const request = [formatRequestBody(sent.body), Object.keys(sent.query || {}).length ? formatRequestBody(sent.query) : ''].filter(Boolean).join('\n')
           push({
             label,
             status: response.status,
             passed: verdict.passed,
             detail: verdict.detail,
             text: pretty(response.text),
-            ...(request ? { request } : {}),
+            request: sent,
           })
         }
       }
@@ -1495,7 +1569,7 @@ export default function App() {
                 ) : activeMode === 'trial' ? (
                   <TrialForm
                     operation={selected}
-                    fields={fields}
+                    fields={resolvedFields}
                     defaults={defaults}
                     exclusive={selected.exclusive || []}
                     trial={operationTrial || { request: {}, omit: [] }}
@@ -1513,7 +1587,26 @@ export default function App() {
                         </TableRow>
                       ) : (
                         <TableRow>
-                          <TableCell sx={{ width: 48 }}>Vary</TableCell>
+                          <TableCell sx={{ width: 72, px: 0.75 }}>
+                            {activeMode === 'combination' ? (
+                              <Tooltip title={anyCombinationVary ? 'Uncheck all' : 'Check fields that can vary'}>
+                                <FormControlLabel
+                                  sx={{ mr: 0, ml: -0.75 }}
+                                  control={(
+                                    <Checkbox
+                                      size="small"
+                                      checked={allCombinationVary}
+                                      indeterminate={anyCombinationVary && !allCombinationVary}
+                                      disabled={combinationVaryNames.length === 0}
+                                      inputProps={{ 'aria-label': anyCombinationVary ? 'Uncheck all' : 'Check fields that can vary' }}
+                                      onChange={() => applyCombinationVary(selected.id, combinationVaryNames, !anyCombinationVary)}
+                                    />
+                                  )}
+                                  label="Vary"
+                                />
+                              </Tooltip>
+                            ) : 'Vary'}
+                          </TableCell>
                           <TableCell sx={{ width: activeMode === 'combination' ? 210 : 220 }}>Field</TableCell>
                           {activeMode !== 'combination' && <TableCell sx={{ width: 76 }}>Type</TableCell>}
                           {activeMode !== 'combination' && <TableCell sx={{ width: 120 }}>Constraints</TableCell>}
@@ -1802,6 +1895,7 @@ export default function App() {
                   label="Saved runs"
                   value={savedRuns.some((run) => run.name === savedRunName) ? savedRunName : ''}
                   onChange={(event) => openSavedRun(event.target.value)}
+                  onOpen={() => { listRuns().then(setSavedRuns).catch(() => {}) }}
                   sx={{ minWidth: 280 }}
                 >
                   {savedRuns.map((run) => (
@@ -2003,22 +2097,24 @@ function ToneChip({ label, tone, wide = false }) {
   )
 }
 
-function ExpectedField({ field, status, automatic, stored, hasOverride, objectArray, patterns, onExpected }) {
+function ExpectedField({ field, status, automatic, stored, hasOverride, objectArray, patterns, fields = [], onExpected }) {
   const match = objectArray ? 'equals' : (hasOverride ? (stored.match || 'equals') : 'equals')
   const shown = stored.text
   const ordered = stored.ordered
+  const ignoreCase = stored.ignoreCase === true
+  const rules = stored.rules || []
   const objectArrayError = objectArray ? parseObjectArray(shown)?.error : ''
   const regexIssue = match === 'regex' && shown ? compilePattern(shown).error : ''
   const names = Object.keys(patterns || {})
   const patternOptions = shown && match === 'pattern' && !names.includes(shown) ? [shown, ...names] : names
 
   function write(patch) {
-    const next = { text: shown, ordered, match, ...patch }
+    const next = { text: shown, ordered, match, ignoreCase, rules, ...patch }
     if (objectArray) {
       onExpected(status, field.name, next.ordered || next.text ? storedExpectation({ ...next, match: 'equals' }) : undefined)
       return
     }
-    if (next.match === 'equals' && next.text === automatic && !next.ordered) {
+    if (next.match === 'equals' && next.text === automatic && !next.ordered && !next.ignoreCase) {
       onExpected(status, field.name, undefined)
       return
     }
@@ -2026,81 +2122,334 @@ function ExpectedField({ field, status, automatic, stored, hasOverride, objectAr
   }
 
   return (
-    <Stack direction="row" spacing={0.5} sx={{ alignItems: 'flex-start' }}>
-      {!objectArray && (
-        <TextField
-          select
-          size="small"
-          value={match}
-          onChange={(event) => {
-            const next = event.target.value
-            write({
-              match: next,
-              text: next === match ? shown : (next === 'equals' ? automatic : ''),
-            })
-          }}
-          slotProps={{ htmlInput: { 'aria-label': 'Match' } }}
-          sx={{ width: 108, flexShrink: 0 }}
-        >
-          <MenuItem value="equals">Value</MenuItem>
-          <MenuItem value="pattern">Pattern</MenuItem>
-          <MenuItem value="regex">Regex</MenuItem>
-        </TextField>
-      )}
-      {match === 'pattern' ? (
-        <TextField
-          select
-          size="small"
-          fullWidth
-          value={patternOptions.includes(shown) ? shown : ''}
-          onChange={(event) => write({ match: 'pattern', text: event.target.value })}
-          helperText={names.length === 0 ? 'Add named patterns in Setting.' : undefined}
-          slotProps={{
-            htmlInput: { 'aria-label': 'Pattern' },
-            select: { renderValue: (value) => value || 'Choose a pattern' },
-          }}
-          sx={{ minWidth: 160 }}
-        >
-          <MenuItem value="">Choose a pattern</MenuItem>
-          {patternOptions.map((name) => (
-            <MenuItem key={name} value={name}>
-              <Box sx={{ minWidth: 0 }}>
-                <Typography variant="body2">{name}</Typography>
-                {patterns[name] ? (
-                  <Typography variant="caption" color="text.secondary" noWrap sx={{ display: 'block', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}>
-                    {patterns[name]}
-                  </Typography>
-                ) : null}
-              </Box>
-            </MenuItem>
-          ))}
-        </TextField>
-      ) : (
-        <TextField
-          size="small"
-          fullWidth
-          multiline={objectArray}
-          minRows={objectArray ? 2 : undefined}
-          value={shown}
-          placeholder={
-            objectArray
-              ? '[{"field":"quantity"},{"field":"customerEmail"}]'
-              : (match === 'regex' ? '^[A-Z0-9-]+$' : (hasOverride ? 'Not checked' : (automatic || 'Not checked')))
-          }
-          error={Boolean(objectArrayError || regexIssue)}
-          helperText={objectArrayError || regexIssue || undefined}
-          onChange={(event) => write({ text: event.target.value })}
-          slotProps={{ htmlInput: { 'aria-label': match === 'regex' ? 'Regex' : 'Expected' } }}
-          sx={{ minWidth: 180, '& input, & textarea': { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12.5 } }}
+    <Stack spacing={0.5} sx={{ minWidth: 240 }}>
+      <Stack direction="row" spacing={0.5} sx={{ alignItems: 'flex-start' }}>
+        {!objectArray && (
+          <TextField
+            select
+            size="small"
+            value={match}
+            onChange={(event) => {
+              const next = event.target.value
+              if (next === 'when') {
+                write({
+                  match: 'when',
+                  rules: rules.length > 0 ? rules : [{ when: [], match: 'equals', text: shown || automatic || '', ignoreCase: false }],
+                })
+                return
+              }
+              write({
+                match: next,
+                text: next === match ? shown : (next === 'equals' ? automatic : ''),
+                ignoreCase: next === 'equals' ? ignoreCase : false,
+                rules: [],
+              })
+            }}
+            slotProps={{ htmlInput: { 'aria-label': 'Match' } }}
+            sx={{ width: 118, flexShrink: 0 }}
+          >
+            <MenuItem value="equals">Value</MenuItem>
+            <MenuItem value="pattern">Pattern</MenuItem>
+            <MenuItem value="regex">Regex</MenuItem>
+            <MenuItem value="when">When</MenuItem>
+          </TextField>
+        )}
+        {match !== 'when' && (match === 'pattern' ? (
+          <TextField
+            select
+            size="small"
+            fullWidth
+            value={patternOptions.includes(shown) ? shown : ''}
+            onChange={(event) => write({ match: 'pattern', text: event.target.value })}
+            helperText={names.length === 0 ? 'Add named patterns in Setting.' : undefined}
+            slotProps={{
+              htmlInput: { 'aria-label': 'Pattern' },
+              select: { renderValue: (value) => value || 'Choose a pattern' },
+            }}
+            sx={{ minWidth: 160 }}
+          >
+            <MenuItem value="">Choose a pattern</MenuItem>
+            {patternOptions.map((name) => (
+              <MenuItem key={name} value={name}>
+                <Box sx={{ minWidth: 0 }}>
+                  <Typography variant="body2">{name}</Typography>
+                  {patterns[name] ? (
+                    <Typography variant="caption" color="text.secondary" noWrap sx={{ display: 'block', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}>
+                      {patterns[name]}
+                    </Typography>
+                  ) : null}
+                </Box>
+              </MenuItem>
+            ))}
+          </TextField>
+        ) : (
+          <TextField
+            size="small"
+            fullWidth
+            multiline={objectArray}
+            minRows={objectArray ? 2 : undefined}
+            value={shown}
+            placeholder={
+              objectArray
+                ? '[{"field":"quantity"},{"field":"customerEmail"}]'
+                : (match === 'regex' ? '^[A-Z0-9-]+$' : (hasOverride ? 'Not checked' : (automatic || 'Not checked')))
+            }
+            error={Boolean(objectArrayError || regexIssue)}
+            helperText={objectArrayError || regexIssue || undefined}
+            onChange={(event) => write({ text: event.target.value })}
+            slotProps={{ htmlInput: { 'aria-label': match === 'regex' ? 'Regex' : 'Expected' } }}
+            sx={{ minWidth: 160, '& input, & textarea': { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12.5 } }}
+          />
+        ))}
+        {match === 'equals' && !objectArray && (
+          <Tooltip title="Case sensitive">
+            <FormControlLabel
+              sx={{ mr: 0, ml: 0, flexShrink: 0 }}
+              control={(
+                <Checkbox
+                  size="small"
+                  checked={!ignoreCase}
+                  onChange={(event) => write({ ignoreCase: !event.target.checked })}
+                  inputProps={{ 'aria-label': 'Case sensitive' }}
+                />
+              )}
+              label="Case"
+            />
+          </Tooltip>
+        )}
+        {hasOverride && (
+          <Button size="small" onClick={() => onExpected(status, field.name, undefined)} sx={{ flexShrink: 0, minWidth: 0, color: 'text.secondary' }}>
+            Default
+          </Button>
+        )}
+      </Stack>
+      {match === 'when' && (
+        <ExpectedWhenEditor
+          rules={rules}
+          fields={fields}
+          patterns={patterns}
+          onChange={(next) => write({ match: 'when', rules: next })}
         />
-      )}
-      {hasOverride && (
-        <Button size="small" onClick={() => onExpected(status, field.name, undefined)} sx={{ flexShrink: 0, minWidth: 0, color: 'text.secondary' }}>
-          Default
-        </Button>
       )}
     </Stack>
   )
+}
+
+function ExpectedWhenEditor({ rules, fields, patterns, onChange }) {
+  const names = conditionFieldNames(fields, rules)
+  const listed = rules.length > 0 ? rules : [{ when: [], match: 'equals', text: '', ignoreCase: false }]
+
+  function update(index, patch) {
+    onChange(listed.map((rule, itemIndex) => (itemIndex === index ? { ...emptyWhenRule(rule), ...patch } : emptyWhenRule(rule))))
+  }
+
+  function updateWhen(index, nextWhen) {
+    update(index, { when: nextWhen })
+  }
+
+  return (
+    <Stack spacing={0.75}>
+      {listed.map((rule, index) => {
+        const current = emptyWhenRule(rule)
+        return (
+          <Box key={index} sx={{ border: 1, borderColor: 'divider', borderRadius: 1, p: 0.75 }}>
+            <Stack spacing={0.5}>
+              <Typography variant="caption" color="text.secondary">
+                {current.when.length === 0 ? 'Else' : 'When'}
+              </Typography>
+              {current.when.map((condition, conditionIndex) => (
+                <Stack key={conditionIndex} direction="row" spacing={0.5} sx={{ alignItems: 'center' }}>
+                  <TextField
+                    select
+                    size="small"
+                    value={names.includes(condition.field) ? condition.field : (condition.field || '')}
+                    onChange={(event) => {
+                      const next = [...current.when]
+                      next[conditionIndex] = { ...condition, field: event.target.value }
+                      updateWhen(index, compactWhen(next))
+                    }}
+                    slotProps={{ htmlInput: { 'aria-label': 'When field' } }}
+                    sx={{ minWidth: 140, flex: 1 }}
+                  >
+                    <MenuItem value="">Field</MenuItem>
+                    {names.map((name) => (
+                      <MenuItem key={name} value={name}>{name}</MenuItem>
+                    ))}
+                  </TextField>
+                  <TextField
+                    select
+                    size="small"
+                    value={condition.op || 'eq'}
+                    onChange={(event) => {
+                      const next = [...current.when]
+                      next[conditionIndex] = { ...condition, op: event.target.value }
+                      updateWhen(index, compactWhen(next))
+                    }}
+                    slotProps={{ htmlInput: { 'aria-label': 'When compare' } }}
+                    sx={{ width: 108, flexShrink: 0 }}
+                  >
+                    <MenuItem value="eq">=</MenuItem>
+                    <MenuItem value="null">Null</MenuItem>
+                    <MenuItem value="not-null">Not null</MenuItem>
+                  </TextField>
+                  {condition.op !== 'null' && condition.op !== 'not-null' && (
+                    <TextField
+                      size="small"
+                      value={condition.value || ''}
+                      placeholder="Value"
+                      onChange={(event) => {
+                        const next = [...current.when]
+                        next[conditionIndex] = { ...condition, value: event.target.value }
+                        updateWhen(index, compactWhen(next))
+                      }}
+                      slotProps={{ htmlInput: { 'aria-label': 'When value' } }}
+                      sx={{ minWidth: 90, flex: 1, '& input': { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12.5 } }}
+                    />
+                  )}
+                  <Button
+                    size="small"
+                    onClick={() => updateWhen(index, compactWhen(current.when.filter((_, itemIndex) => itemIndex !== conditionIndex)))}
+                    sx={{ minWidth: 0, flexShrink: 0, color: 'text.secondary' }}
+                  >
+                    Remove
+                  </Button>
+                </Stack>
+              ))}
+              <Button
+                size="small"
+                onClick={() => {
+                  const used = new Set(current.when.map((item) => item.field))
+                  const nextField = names.find((name) => !used.has(name)) || names[0] || ''
+                  updateWhen(index, compactWhen([...current.when, { field: nextField, op: 'eq', value: '' }]))
+                }}
+                sx={{ alignSelf: 'flex-start', minWidth: 0 }}
+              >
+                And
+              </Button>
+              <Stack direction="row" spacing={0.5} sx={{ alignItems: 'flex-start' }}>
+                <TextField
+                  select
+                  size="small"
+                  value={current.match}
+                  onChange={(event) => update(index, { match: event.target.value, text: event.target.value === current.match ? current.text : '' })}
+                  slotProps={{ htmlInput: { 'aria-label': 'Then match' } }}
+                  sx={{ width: 118, flexShrink: 0 }}
+                >
+                  <MenuItem value="equals">Value</MenuItem>
+                  <MenuItem value="pattern">Pattern</MenuItem>
+                  <MenuItem value="regex">Regex</MenuItem>
+                </TextField>
+                <ExpectedThenInput
+                  match={current.match}
+                  text={current.text}
+                  patterns={patterns}
+                  onChange={(text) => update(index, { text })}
+                />
+                {current.match === 'equals' && (
+                  <Tooltip title="Case sensitive">
+                    <FormControlLabel
+                      sx={{ mr: 0, ml: 0, flexShrink: 0 }}
+                      control={(
+                        <Checkbox
+                          size="small"
+                          checked={!current.ignoreCase}
+                          onChange={(event) => update(index, { ignoreCase: !event.target.checked })}
+                          inputProps={{ 'aria-label': 'Case sensitive' }}
+                        />
+                      )}
+                      label="Case"
+                    />
+                  </Tooltip>
+                )}
+              </Stack>
+              {listed.length > 1 && (
+                <Button size="small" onClick={() => onChange(listed.filter((_, itemIndex) => itemIndex !== index).map(emptyWhenRule))} sx={{ alignSelf: 'flex-start', minWidth: 0, color: 'text.secondary' }}>
+                  Remove rule
+                </Button>
+              )}
+            </Stack>
+          </Box>
+        )
+      })}
+      <Button
+        size="small"
+        onClick={() => onChange([...listed.map(emptyWhenRule), { when: [], match: 'equals', text: '', ignoreCase: false }])}
+        sx={{ alignSelf: 'flex-start', minWidth: 0 }}
+      >
+        Add rule
+      </Button>
+    </Stack>
+  )
+}
+
+function ExpectedThenInput({ match, text, patterns, onChange }) {
+  const names = Object.keys(patterns || {})
+  const patternOptions = text && match === 'pattern' && !names.includes(text) ? [text, ...names] : names
+  const regexIssue = match === 'regex' && text ? compilePattern(text).error : ''
+  if (match === 'pattern') {
+    return (
+      <TextField
+        select
+        size="small"
+        fullWidth
+        value={patternOptions.includes(text) ? text : ''}
+        onChange={(event) => onChange(event.target.value)}
+        slotProps={{
+          htmlInput: { 'aria-label': 'Then pattern' },
+          select: { renderValue: (value) => value || 'Choose a pattern' },
+        }}
+        sx={{ minWidth: 140 }}
+      >
+        <MenuItem value="">Choose a pattern</MenuItem>
+        {patternOptions.map((name) => (
+          <MenuItem key={name} value={name}>{name}</MenuItem>
+        ))}
+      </TextField>
+    )
+  }
+  return (
+    <TextField
+      size="small"
+      fullWidth
+      value={text}
+      placeholder={match === 'regex' ? '^[A-Z0-9-]+$' : 'Expected'}
+      error={Boolean(regexIssue)}
+      helperText={regexIssue || undefined}
+      onChange={(event) => onChange(event.target.value)}
+      slotProps={{ htmlInput: { 'aria-label': match === 'regex' ? 'Then regex' : 'Then value' } }}
+      sx={{ minWidth: 140, '& input': { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12.5 } }}
+    />
+  )
+}
+
+function emptyWhenRule(rule) {
+  return {
+    when: Array.isArray(rule?.when) ? rule.when : [],
+    match: rule?.match === 'pattern' || rule?.match === 'regex' ? rule.match : 'equals',
+    text: rule?.text == null ? '' : String(rule.text),
+    ignoreCase: rule?.ignoreCase === true,
+  }
+}
+
+function compactWhen(conditions) {
+  return (conditions || []).filter((item) => String(item.field || '').trim())
+}
+
+function conditionFieldNames(fields, rules) {
+  const names = []
+  for (const field of fields || []) {
+    const type = String(field.type || '')
+    if (type === 'object') continue
+    if (type.startsWith('array of ') && !['string', 'integer', 'number', 'boolean', 'enum'].includes(type.slice('array of '.length))) continue
+    if (field.name) names.push(field.name)
+  }
+  for (const rule of rules || []) {
+    for (const condition of rule.when || []) {
+      const name = String(condition.field || '').trim()
+      if (name && !names.includes(name)) names.push(name)
+    }
+  }
+  return names
 }
 
 function ResponseSchema({ responses, requestNames, expected, patterns = {}, onExpected }) {
@@ -2172,7 +2521,7 @@ function ResponseSchema({ responses, requestNames, expected, patterns = {}, onEx
           ) : (
             <Box sx={{ maxHeight: 280, overflow: 'auto' }}>
               <Typography variant="caption" color="text.secondary" sx={{ display: 'block', px: 1.5, py: 0.75, borderBottom: 1, borderColor: 'divider' }}>
-                {'@{name}'} is the value sent for that request field. A null or omitted request field, including a blank list filter, is treated as any value and is not compared. Text is compared after leading and trailing spaces are removed, and a value that is only spaces is null. A success field with the same name starts as that reference, except nextCursor, which is a new token for the next page. Clear a value to skip it. {'${name}'} still reads a variable. Pattern uses a named regular expression from Setting. Regex accepts a pattern here, optionally written as /pattern/flags. For an array of objects, enter a JSON array. Each object must appear, and only the fields you include are compared. In sequence requires those objects to be the first items, in the order you wrote.
+                {'@{name}'} is the value sent for that request field. A null or omitted request field, including a blank list filter, is treated as any value and is not compared. Text is compared after leading and trailing spaces are removed, and a value that is only spaces is null. A success field with the same name starts as that reference, except nextCursor, which is a new token for the next page. Clear a value to skip it. {'${name}'} still reads a variable. Pattern uses a named regular expression from Setting. Regex accepts a pattern here, optionally written as /pattern/flags. When applies the first matching rule: each rule can require other fields to equal a value, be null, or be not null, then check this field as a value, pattern, or regex. Case keeps a value comparison case sensitive. For an array of objects, enter a JSON array. Each object must appear, and only the fields you include are compared. In sequence requires those objects to be the first items, in the order you wrote.
               </Typography>
               <Table size="small">
                 <TableHead>
@@ -2238,6 +2587,7 @@ function ResponseSchema({ responses, requestNames, expected, patterns = {}, onEx
                               hasOverride={hasOverride}
                               objectArray={objectArray}
                               patterns={patterns}
+                              fields={current.fields}
                               onExpected={onExpected}
                             />
                           )}
@@ -2686,8 +3036,17 @@ function TrialForm({ operation, fields, defaults, exclusive = [], trial, onChang
 
   function updateRequest(name, raw, field) {
     const request = { ...active.request }
-    if (raw === '') delete request[name]
-    else request[name] = coerceFieldValue(field, raw)
+    const inherited = effectiveSample(field, operation.id, defaults)
+    if (field.object) {
+      if (objectChoice(raw) === objectChoice(inherited)) delete request[name]
+      else request[name] = raw
+    } else if (raw === '') {
+      request[name] = ''
+    } else if (String(coerceFieldValue(field, raw)) === String(inherited ?? '')) {
+      delete request[name]
+    } else {
+      request[name] = coerceFieldValue(field, raw)
+    }
     onChange({ request, omit: active.omit || [] })
   }
 
@@ -2698,13 +3057,41 @@ function TrialForm({ operation, fields, defaults, exclusive = [], trial, onChang
     onChange({ request: active.request || {}, omit: [...omit] })
   }
 
+  function fillDefaults() {
+    onChange({ request: {}, omit: [] })
+  }
+
+  function clearValues() {
+    const request = {}
+    const next = { request, omit: [] }
+    for (const field of fields) {
+      if (customAncestorClosed(field.name, fields, next, defaults, operation)) continue
+      request[field.name] = field.object ? OBJECT_EMPTY : ''
+    }
+    onChange(next)
+  }
+
   return (
     <Box sx={{ overflow: 'auto', maxHeight: 'min(440px, calc(100vh - 420px))', border: 1, borderColor: 'divider', borderRadius: 1 }}>
       <Table size="small" stickyHeader sx={{ tableLayout: 'fixed', width: '100%' }}>
         <TableHead>
           <TableRow>
             <TableCell sx={{ width: 210 }}>Field</TableCell>
-            <TableCell>Value</TableCell>
+            <TableCell>
+              <Stack direction="row" spacing={0.5} sx={{ alignItems: 'center' }}>
+                <Box component="span">Value</Box>
+                <Tooltip title="Fill every field with its default">
+                  <Button size="small" onClick={fillDefaults} sx={{ minWidth: 0, py: 0, px: 0.5 }}>
+                    Defaults
+                  </Button>
+                </Tooltip>
+                <Tooltip title="Clear all values">
+                  <Button size="small" onClick={clearValues} sx={{ minWidth: 0, py: 0, px: 0.5 }}>
+                    Clear
+                  </Button>
+                </Tooltip>
+              </Stack>
+            </TableCell>
             <TableCell sx={{ width: 72 }}>Omit</TableCell>
           </TableRow>
         </TableHead>
@@ -2714,6 +3101,7 @@ function TrialForm({ operation, fields, defaults, exclusive = [], trial, onChang
             const omitted = (active.omit || []).includes(field.name)
             const hasValue = Object.prototype.hasOwnProperty.call(active.request || {}, field.name)
             const inherited = effectiveSample(field, operation.id, defaults)
+            const shown = omitted ? '' : (hasValue ? active.request[field.name] : inherited)
             const depth = field.name.split('.').length - 1
             return (
               <TableRow key={`${field.location}-${field.name}`} hover>
@@ -2723,7 +3111,7 @@ function TrialForm({ operation, fields, defaults, exclusive = [], trial, onChang
                 <TableCell sx={{ minWidth: 160 }}>
                   {field.object ? (
                     <ObjectChoice
-                      value={objectChoice(hasValue ? active.request[field.name] : inherited)}
+                      value={objectChoice(shown)}
                       onChange={(mode) => updateRequest(field.name, mode === 'null' ? OBJECT_NULL : mode === 'empty' ? OBJECT_EMPTY : OBJECT_FIELDS, field)}
                     />
                   ) : (
@@ -2731,8 +3119,8 @@ function TrialForm({ operation, fields, defaults, exclusive = [], trial, onChang
                       size="small"
                       fullWidth
                       disabled={omitted}
-                      placeholder={omitted ? 'Omitted' : String(inherited ?? '')}
-                      value={hasValue ? String(active.request[field.name]) : ''}
+                      placeholder={omitted ? 'Omitted' : 'Value'}
+                      value={shown == null ? '' : String(shown)}
                       onChange={(event) => updateRequest(field.name, event.target.value, field)}
                       slotProps={{ htmlInput: { 'aria-label': field.name } }}
                     />
@@ -3956,18 +4344,18 @@ function ResultDialog({ result, onClose }) {
       <DialogContent dividers>
         <Stack spacing={1.25}>
           {result.detail && <Typography variant="body2" color="text.secondary">{result.detail}</Typography>}
-          {result.request && (
-            <PayloadBlock title="Request" text={typeof result.request === 'string' ? result.request : (formatRequestPayload(result.request) || JSON.stringify(result.request, null, 2))} />
+          {displayRequest(result.request) && (
+            <PayloadBlock title="Request" text={displayRequest(result.request)} />
           )}
           {pages.length > 1 && (
             <Stack direction="row" sx={{ justifyContent: 'flex-end' }}>
-              <CopyButton label="Copy all pages" text={pages.map((page) => `${page.label || 'Page'} · HTTP ${page.status}\n${page.request || ''}\n${page.text || ''}`).join('\n\n')} />
+              <CopyButton label="Copy all pages" text={pages.map((page) => `${page.label || 'Page'} · HTTP ${page.status}\n${displayRequest(page.request)}\n${page.text || ''}`).join('\n\n')} />
             </Stack>
           )}
           {pages.map((page, index) => (
             <Stack key={`${page.label}-${index}`} spacing={1.25}>
-              {pages.length > 1 && page.request && page.request !== result.request && (
-                <PayloadBlock title={`${page.label || `Page ${index + 1}`} request`} text={page.request} />
+              {pages.length > 1 && displayRequest(page.request) && displayRequest(page.request) !== displayRequest(result.request) && (
+                <PayloadBlock title={`${page.label || `Page ${index + 1}`} request`} text={displayRequest(page.request)} />
               )}
               <PayloadBlock
                 title={pages.length > 1 ? `${page.label || `Page ${index + 1}`} · HTTP ${page.status}` : 'Response'}
@@ -3990,6 +4378,7 @@ function resultPages(result) {
       label: page.label,
       status: page.status,
       text: pretty(page.text || ''),
+      ...(page.request ? { request: page.request } : {}),
     }))
   }
   if (result?.text) return [{ label: 'Response', status: result.status, text: pretty(result.text) }]
@@ -4289,6 +4678,12 @@ function formatRequestBody(body) {
   } catch {
     return String(body)
   }
+}
+
+function displayRequest(request) {
+  if (request == null || request === '' || request === '[object Object]') return ''
+  if (typeof request === 'string') return request
+  return formatRequestPayload(request) || ''
 }
 
 function formatRequestPayload(request) {
@@ -5016,6 +5411,18 @@ function specThroughProxy(specUrl, apiBase) {
   }
 }
 
+function combinationVaryTargets(fields, resolvedFields) {
+  const names = []
+  for (const field of fields) {
+    if (hiddenByObject(field, resolvedFields)) continue
+    if (underComposite(field.name, resolvedFields)) continue
+    const resolved = resolvedFields.find((item) => item.location === field.location && item.name === field.name) || field
+    if (!field.enum && !resolved.vary && (resolved.values || []).length === 0) continue
+    names.push(field.name)
+  }
+  return names
+}
+
 function hiddenByObject(field, resolvedFields) {
   const parts = field.name.split('.')
   for (let length = 1; length < parts.length; length += 1) {
@@ -5113,7 +5520,7 @@ async function executeCheck(apiBase, idpBase, operation, item, hooks) {
       count: items.length,
       items,
       text: response.text,
-      request: formatRequestPayload({ body: pageSent.body, query: pageSent.query, path: pageSent.path }),
+      request: { body: pageSent.body, query: { ...pageSent.query }, path: { ...pageSent.path } },
       label: stepLabel(pagination, reports.length, pageIndex, paging),
       pageIndex,
       offset: pagination?.request.offset ? Number(paging[pagination.request.offset] ?? 0) : 0,
