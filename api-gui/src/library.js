@@ -24,7 +24,7 @@ export function storedRate(value) {
 }
 
 export function emptyCases() {
-  return { operations: {}, exclusions: {}, values: {}, errors: {}, checks: {}, steps: {}, ids: {}, filters: {}, paging: {}, scenarios: [], trials: {} }
+  return { operations: {}, exclusions: {}, values: {}, vary: {}, errors: {}, checks: {}, steps: {}, ids: {}, filters: {}, paging: {}, scenarios: [], trials: {} }
 }
 
 export function loadStored(key, empty, parse) {
@@ -66,6 +66,7 @@ export function defaultsDocument(defaults) {
 export function casesDocument(cases) {
   const exclusions = cases.exclusions || {}
   const values = cases.values || {}
+  const vary = cases.vary || {}
   const errors = cases.errors || {}
   const checks = cases.checks || {}
   const steps = cases.steps || {}
@@ -80,6 +81,7 @@ export function casesDocument(cases) {
     operations: cases.operations || {},
     ...(Object.keys(exclusions).length > 0 ? { exclusions } : {}),
     ...(Object.keys(values).length > 0 ? { values } : {}),
+    ...(Object.keys(vary).length > 0 ? { vary } : {}),
     ...(Object.keys(errors).length > 0 ? { errors } : {}),
     ...(Object.keys(checks).length > 0 ? { checks } : {}),
     ...(Object.keys(steps).length > 0 ? { steps } : {}),
@@ -123,6 +125,7 @@ export function hasSavedCases(cases) {
   return Object.values(cases?.operations || {}).some((list) => Array.isArray(list) && list.length > 0)
     || Object.keys(cases?.exclusions || {}).length > 0
     || Object.keys(cases?.values || {}).length > 0
+    || Object.keys(cases?.vary || {}).length > 0
     || Object.keys(cases?.steps || {}).length > 0
     || Object.keys(cases?.ids || {}).length > 0
     || Object.keys(cases?.filters || {}).length > 0
@@ -275,6 +278,7 @@ export function parseCases(value) {
     operations,
     exclusions: exclusionMaps(data.exclusions),
     values: combinationValueMaps(data.values),
+    vary: varyMaps(data.vary),
     errors: errorMaps(data.errors),
     checks: errorCheckMaps(data.checks),
     steps: stepMaps(data.steps),
@@ -481,6 +485,20 @@ function normalizeErrorRow(row) {
   const values = errorValueMap(row.values)
   if (!status && Object.keys(values).length === 0) return null
   return { ...(status ? { status } : {}), values }
+}
+
+function varyMaps(source) {
+  const vary = {}
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return vary
+  for (const [operationId, fields] of Object.entries(source)) {
+    if (!fields || typeof fields !== 'object' || Array.isArray(fields)) continue
+    const next = {}
+    for (const [name, value] of Object.entries(fields)) {
+      if (value === false) next[name] = false
+    }
+    if (Object.keys(next).length > 0) vary[operationId] = next
+  }
+  return vary
 }
 
 function combinationValueMaps(source) {

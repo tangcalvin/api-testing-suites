@@ -52,6 +52,7 @@ import {
   caseCount,
   compositeField,
   isOmitted,
+  OMIT,
   casesFor,
   recordId,
   detectPayloadId,
@@ -90,8 +91,11 @@ import {
   OBJECT_FIELDS,
   OBJECT_NULL,
   objectChoice,
+  objectDefaultChoice,
   combinationObjectMode,
+  storedObjectSample,
   descendantScalars,
+  defaultComposition,
   objectHasChildren,
   storedComposition,
   parseSpecText,
@@ -102,6 +106,8 @@ import {
   serverUrl,
   specGaps,
   scalarCombinationField,
+  combinationEnumValues,
+  storedEnumValue,
   underComposite,
   valueText,
   responsesForMode,
@@ -169,7 +175,7 @@ const MODES = [
   {
     id: 'combination',
     label: 'Combinations',
-    detail: 'Crosses each selected enum. An optional enum includes null and omit, and a null already in the enum is listed once. An optional object is sent filled, as null, and omitted. Mark an object with children as Composite to send those children as one value, and add those sets in Values. Composite combinations use only the sets you add. An enum that is not crossed uses one selected value. A string or number uses its default plus any other values you add, and can include null and omit when it is optional. Other optional query filters stay off the request. Skip rules are left out. A check passes on a success status, and when each expected response value matches. With a record set uploaded, each check filters that set and compares it with the rows from every page.',
+    detail: 'Crosses each selected enum. Clear a field checkbox to keep that field on its default. An optional enum includes null and omit, and a null already in the enum is listed once. With a field checked you can turn off some of its possible values, such as 3 of 5 enum values. An optional object is sent filled, as null, and omitted. Mark an object with children as Composite to send those children as one value. The composite default is the field values, null, or empty; with no try values that default is the only value used. Try values in the Values column are the compositions that are combined; the default is not listed there. An optional composite can also try null, empty, or omit; a required composite does not. An enum that is not crossed uses one selected value. A string or number uses its default plus any other values you add, and can include null and omit when it is optional. Other optional query filters stay off the request. Skip rules are left out. A check passes on a success status, and when each expected response value matches. With a record set uploaded, each check filters that set and compares it with the rows from every page.',
   },
   {
     id: 'individual',
@@ -256,8 +262,8 @@ export default function App() {
     if (!selected) return []
     const applied = applyDefaults(fields, selected.id, defaults)
     if (activeMode !== 'combination') return applied
-    return withTextCombinationValues(applied, customCases.values?.[selected.id], defaults.variables)
-  }, [activeMode, customCases.values, defaults, fields, selected])
+    return withTextCombinationValues(applied, customCases.values?.[selected.id], defaults.variables, customCases.vary?.[selected.id])
+  }, [activeMode, customCases.values, customCases.vary, defaults, fields, selected])
   const operationCases = selected ? customCases.operations[selected.id] : undefined
   const operationExclusions = selected ? customCases.exclusions?.[selected.id] : undefined
   const operationErrorCases = selected ? customCases.errors?.[selected.id] : undefined
@@ -730,8 +736,8 @@ export default function App() {
   }
 
   function writeObject(field, mode) {
-    if (mode === 'composite') {
-      writeEndpoint(field, OBJECT_COMPOSITE)
+    if (mode === 'composite' || compositeField(field, fields)) {
+      writeEndpoint(field, storedObjectSample(field, mode, fields))
       return
     }
     if (mode === 'fields') {
@@ -813,6 +819,18 @@ export default function App() {
       if (untouched) delete checks[operationId]
       else checks[operationId] = { columns, rows }
       return { ...current, checks }
+    })
+  }
+
+  function writeVary(operationId, fieldName, on) {
+    setCustomCases((current) => {
+      const vary = { ...(current.vary || {}) }
+      const operation = { ...(vary[operationId] || {}) }
+      if (on) delete operation[fieldName]
+      else operation[fieldName] = false
+      if (Object.keys(operation).length === 0) delete vary[operationId]
+      else vary[operationId] = operation
+      return { ...current, vary }
     })
   }
 
@@ -1077,14 +1095,14 @@ export default function App() {
             if (!ok) verdict.passed = false
           }
         }
-        const request = formatRequestBody(response.request?.body ?? item.body)
+        const request = formatRequestPayload(response.request || { body: item.body, query: item.query, path: item.path })
         pushResult({
           label: item.label,
           status: response.status,
           passed: verdict.passed,
           detail: verdict.detail,
           text: response.pages ? response.text : pretty(response.text),
-          pages: response.pages ? response.pages.map((page) => ({ ...page, text: pretty(page.text) })) : null,
+          pages: response.pages ? response.pages.map((page) => ({ ...page, text: pretty(page.text), request: page.request || '' })) : null,
           ...(response.records?.length ? { records: response.records } : {}),
           ...(request ? { request } : {}),
           ...(enquiry ? { enquiry } : {}),
@@ -1545,8 +1563,12 @@ export default function App() {
                                 <Checkbox
                                   size="small"
                                   checked={nestedComposite ? false : resolved.vary}
-                                  disabled={activeMode !== 'combination' || nestedComposite || resolved.values.length === 0}
-                                  onChange={(event) => updateField(field.name, { vary: event.target.checked, textVary: event.target.checked })}
+                                  disabled={activeMode !== 'combination' || nestedComposite || (!resolved.vary && resolved.values.length === 0 && !field.enum)}
+                                  onChange={(event) => {
+                                    const on = event.target.checked
+                                    updateField(field.name, { vary: on, textVary: on })
+                                    writeVary(selected.id, field.name, on)
+                                  }}
                                 />
                               )}
                               label={resolved.values.length > 1 ? String(resolved.values.length) : ''}
@@ -1575,11 +1597,13 @@ export default function App() {
                               resolved={resolved}
                               source={source}
                               hidden={nestedComposite || ((field.enum || (field.object && !field.required && !objectHasChildren(field, resolvedFields))) && resolved.vary)}
-                              objectComposite={activeMode === 'combination' && objectHasChildren(field, resolvedFields)}
+                              objectComposite={activeMode === 'combination' && objectHasChildren(field, resolvedFields) && !composite}
                               objectMode={activeMode === 'combination' ? combinationObjectMode(resolved, resolvedFields) : undefined}
+                              childFields={composite ? descendantScalars(resolved, resolvedFields) : []}
                               onChange={(sample) => writeEndpoint(field, sample)}
                               onInherit={() => writeEndpoint(field, '', true)}
                               onObject={(next) => writeObject(field, next)}
+                              onChild={(child, sample) => writeEndpoint(child, sample)}
                             />
                           </TableCell>
                           {activeMode === 'combination' && (
@@ -1593,7 +1617,14 @@ export default function App() {
                                   values={customCases.values?.[selected.id]?.[field.name] || []}
                                   onChange={(list) => writeCombinationValues(selected.id, field.name, list)}
                                 />
-                              ) : (field.enum || (field.object && !field.required)) && resolved.vary ? (
+                              ) : field.enum ? (
+                                <CombinationEnumEditor
+                                  field={resolved}
+                                  disabled={!resolved.vary}
+                                  values={customCases.values?.[selected.id]?.[field.name]}
+                                  onChange={(list) => writeCombinationValues(selected.id, field.name, list)}
+                                />
+                              ) : (field.object && !field.required) && resolved.vary ? (
                                 <Stack direction="row" spacing={0.5} useFlexGap sx={{ flexWrap: 'wrap', alignItems: 'center' }}>
                                   {resolved.values.map((value, index) => <Chip key={`${valueText(value)}-${index}`} label={loopLabel(value)} size="small" />)}
                                 </Stack>
@@ -1808,7 +1839,10 @@ export default function App() {
                     <TableRow
                       key={result.index}
                       hover
-                      onClick={() => setOpenResult(result.index)}
+                      onClick={() => {
+                        if (ignoreResultOpen()) return
+                        setOpenResult(result.index)
+                      }}
                       sx={{
                         cursor: 'pointer',
                         boxShadow: result.passed || result.skipped ? 'none' : 'inset 3px 0 0 #b42318',
@@ -1829,7 +1863,7 @@ export default function App() {
                       <TableCell sx={{ fontVariantNumeric: 'tabular-nums', fontWeight: 650 }}>{result.status || '—'}</TableCell>
                       <TableCell>{result.label}</TableCell>
                       <TableCell sx={{ color: 'text.secondary' }}>{result.detail}</TableCell>
-                      <TableCell>
+                      <TableCell onClick={(event) => event.stopPropagation()} onMouseDown={(event) => event.stopPropagation()}>
                         <ResponsePreview result={result} />
                       </TableCell>
                     </TableRow>
@@ -3182,6 +3216,16 @@ function PaginationSetting({ operations, selectedId, paging, onPaging }) {
           {form.mode === 'detected' && (
             <Typography variant="body2" color="text.secondary">{paginationSummary(resolvePagination(operation?.pagination, null))}</Typography>
           )}
+          {form.mode !== 'none' && (
+            <TextField
+              size="small"
+              label="Response records path"
+              value={form.response.items}
+              onChange={(event) => write({ response: { ...form.response, items: event.target.value } })}
+              helperText="Dot path to the array of records, such as data.page.content. Leave blank to use the detected path."
+              fullWidth
+            />
+          )}
           {form.mode === 'none' && (
             <Typography variant="body2" color="text.secondary">Each check sends one request.</Typography>
           )}
@@ -3913,19 +3957,23 @@ function ResultDialog({ result, onClose }) {
         <Stack spacing={1.25}>
           {result.detail && <Typography variant="body2" color="text.secondary">{result.detail}</Typography>}
           {result.request && (
-            <PayloadBlock title="Request" text={typeof result.request === 'string' ? result.request : (formatRequestBody(result.request) || JSON.stringify(result.request, null, 2))} />
+            <PayloadBlock title="Request" text={typeof result.request === 'string' ? result.request : (formatRequestPayload(result.request) || JSON.stringify(result.request, null, 2))} />
           )}
           {pages.length > 1 && (
             <Stack direction="row" sx={{ justifyContent: 'flex-end' }}>
-              <CopyButton label="Copy all pages" text={pages.map((page) => `${page.label || 'Page'} · HTTP ${page.status}\n${page.text || ''}`).join('\n\n')} />
+              <CopyButton label="Copy all pages" text={pages.map((page) => `${page.label || 'Page'} · HTTP ${page.status}\n${page.request || ''}\n${page.text || ''}`).join('\n\n')} />
             </Stack>
           )}
           {pages.map((page, index) => (
-            <PayloadBlock
-              key={`${page.label}-${index}`}
-              title={pages.length > 1 ? `${page.label || `Page ${index + 1}`} · HTTP ${page.status}` : 'Response'}
-              text={page.text || ''}
-            />
+            <Stack key={`${page.label}-${index}`} spacing={1.25}>
+              {pages.length > 1 && page.request && page.request !== result.request && (
+                <PayloadBlock title={`${page.label || `Page ${index + 1}`} request`} text={page.request} />
+              )}
+              <PayloadBlock
+                title={pages.length > 1 ? `${page.label || `Page ${index + 1}`} · HTTP ${page.status}` : 'Response'}
+                text={page.text || ''}
+              />
+            </Stack>
           ))}
           {result.enquiry && (
             <PayloadBlock title={`Enquiry ${result.enquiry.label} · HTTP ${result.enquiry.status}`} text={result.enquiry.text || ''} />
@@ -4042,13 +4090,32 @@ function hasRecordList(result) {
   return Array.isArray(result?.pages) && result.pages.some((page) => page.count > 0)
 }
 
+let resultOpenGuard = 0
+
+function suppressResultOpen() {
+  resultOpenGuard += 1
+  setTimeout(() => {
+    resultOpenGuard = Math.max(0, resultOpenGuard - 1)
+  }, 250)
+}
+
+function ignoreResultOpen() {
+  return resultOpenGuard > 0
+}
+
 function RecordsTableButton({ result }) {
   const [open, setOpen] = useState(false)
+  const close = (event) => {
+    event?.stopPropagation?.()
+    suppressResultOpen()
+    setOpen(false)
+  }
   return (
     <>
       <Button
         size="small"
         variant="outlined"
+        onMouseDown={(event) => event.stopPropagation()}
         onClick={(event) => {
           event.stopPropagation()
           setOpen(true)
@@ -4057,11 +4124,22 @@ function RecordsTableButton({ result }) {
       >
         Table
       </Button>
-      {open && (
-        <Dialog open onClose={() => setOpen(false)} maxWidth="xl" fullWidth>
-          <RecordsDialog result={result} onClose={() => setOpen(false)} />
-        </Dialog>
-      )}
+      <Dialog
+        open={open}
+        onClose={close}
+        onClick={(event) => event.stopPropagation()}
+        onMouseDown={(event) => event.stopPropagation()}
+        maxWidth="xl"
+        fullWidth
+        slotProps={{
+          backdrop: {
+            onClick: (event) => event.stopPropagation(),
+            onMouseDown: (event) => event.stopPropagation(),
+          },
+        }}
+      >
+        <RecordsDialog result={result} onClose={close} />
+      </Dialog>
     </>
   )
 }
@@ -4075,7 +4153,15 @@ function RecordsDialog({ result, onClose }) {
     <>
       <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
         <Box sx={{ flex: 1 }}>{records.length} records</Box>
-        <Button onClick={onClose}>Close</Button>
+        <Button
+          onMouseDown={(event) => event.stopPropagation()}
+          onClick={(event) => {
+            event.stopPropagation()
+            onClose(event)
+          }}
+        >
+          Close
+        </Button>
       </DialogTitle>
       <DialogContent dividers sx={{ p: 0 }}>
         <Box sx={{ overflow: 'auto', maxHeight: '70vh' }}>
@@ -4205,6 +4291,29 @@ function formatRequestBody(body) {
   }
 }
 
+function formatRequestPayload(request) {
+  if (request == null) return ''
+  if (typeof request === 'string') return request
+  if (typeof request !== 'object' || Array.isArray(request)) return formatRequestBody(request)
+  const parts = []
+  const path = request.path && typeof request.path === 'object' ? omitEmptyMap(request.path) : null
+  const query = request.query && typeof request.query === 'object' ? omitEmptyMap(request.query) : null
+  if (path && Object.keys(path).length > 0) parts.push(formatRequestBody(path))
+  if (query && Object.keys(query).length > 0) parts.push(formatRequestBody(query))
+  const body = formatRequestBody(request.body)
+  if (body) parts.push(body)
+  return parts.join('\n\n')
+}
+
+function omitEmptyMap(source) {
+  const next = {}
+  for (const [name, value] of Object.entries(source || {})) {
+    if (isOmitted(value) || value === undefined) continue
+    next[name] = value
+  }
+  return next
+}
+
 function PaginationHelp({ pagination }) {
   const [anchor, setAnchor] = useState(null)
   return (
@@ -4278,7 +4387,8 @@ function paginationSummary(pagination) {
       ? `, last when ${pathName(pagination.response.nextCursor)} is ${pagination.lastCursor.type === 'null' ? 'null' : pagination.lastCursor.value}`
       : ''
     const total = pagination.response.total ? `, until ${pathName(pagination.response.total)} is reached` : ''
-    return `This operation is treated as cursor pagination via ${pagination.request.cursor}${size}${first}${last}${total}.`
+    const items = pagination.response.items ? `, records at ${pathName(pagination.response.items)}` : ''
+    return `This operation is treated as cursor pagination via ${pagination.request.cursor}${size}${first}${last}${total}${items}.`
   }
   if (pagination.style === 'offset') {
     return `This operation is treated as offset pagination via ${pagination.request.offset}${pagination.request.size ? ` and ${pagination.request.size}` : ''}.`
@@ -4319,15 +4429,38 @@ function FieldSummary({ field, depth, exclusive }) {
   )
 }
 
-function DefaultValue({ field, resolved, source, hidden = false, objectComposite = false, objectMode, onChange, onInherit, onObject }) {
+function DefaultValue({ field, resolved, source, hidden = false, objectComposite = false, objectMode, childFields = [], onChange, onInherit, onObject, onChild }) {
   if (hidden) return null
   if (field.object) {
+    const choice = objectMode || objectChoice(resolved.sample)
+    const fieldsDefault = choice === 'fields' || choice === 'composite'
     return (
-      <ObjectChoice
-        value={objectMode || objectChoice(resolved.sample)}
-        composite={objectComposite}
-        onChange={onObject}
-      />
+      <Stack spacing={0.75}>
+        <ObjectChoice
+          value={choice === 'composite' ? 'fields' : choice}
+          composite={objectComposite}
+          optional={!field.required}
+          onChange={onObject}
+        />
+        {fieldsDefault && childFields.length > 0 && (
+          <Stack direction="row" spacing={0.75} useFlexGap sx={{ flexWrap: 'wrap', alignItems: 'center' }}>
+            {childFields.map((child) => {
+              const leaf = child.name.split('.').pop()
+              return (
+                <TextField
+                  key={child.name}
+                  size="small"
+                  placeholder={leaf}
+                  value={child.sample ?? ''}
+                  onChange={(event) => onChild?.(child, coerceSample(child, event.target.value))}
+                  slotProps={{ htmlInput: { 'aria-label': child.name } }}
+                  sx={{ width: '100%', maxWidth: 120, flex: '1 1 88px' }}
+                />
+              )
+            })}
+          </Stack>
+        )}
+      </Stack>
     )
   }
   if (hidden) return null
@@ -4496,22 +4629,78 @@ function CombinationDefault({ field, onChange }) {
   )
 }
 
+function CombinationEnumEditor({ field, values, disabled = false, onChange }) {
+  const loop = combinationEnumValues(field)
+  const saved = Array.isArray(values) ? values.map((item) => parseSavedEnum(field, item)).filter((item) => item !== undefined) : null
+  const chosen = saved && saved.length > 0 ? saved : loop
+  const choiceSx = (on) => ({
+    height: 22,
+    borderColor: on ? 'primary.main' : 'divider',
+    bgcolor: on ? 'rgba(15, 39, 68, 0.06)' : 'transparent',
+    color: on ? 'primary.main' : 'text.secondary',
+    pointerEvents: disabled ? 'none' : 'auto',
+    opacity: disabled ? 0.55 : 1,
+    '& .MuiChip-label': { px: 0.75, fontSize: 12, fontWeight: on ? 650 : 500 },
+  })
+  const toggle = (value) => {
+    if (disabled) return
+    const on = chosen.some((item) => storedEnumValue(item) === storedEnumValue(value))
+    const next = on ? chosen.filter((item) => storedEnumValue(item) !== storedEnumValue(value)) : [...chosen, value]
+    if (next.length === 0) return
+    if (next.length === loop.length && loop.every((item) => next.some((current) => storedEnumValue(current) === storedEnumValue(item)))) {
+      onChange([])
+      return
+    }
+    onChange(next.map((item) => storedEnumValue(item)))
+  }
+  return (
+    <Stack direction="row" spacing={0.5} useFlexGap sx={{ flexWrap: 'wrap', alignItems: 'center' }}>
+      {loop.map((value, index) => {
+        const on = chosen.some((item) => storedEnumValue(item) === storedEnumValue(value))
+        return (
+          <Chip
+            key={`${storedEnumValue(value)}-${index}`}
+            size="small"
+            variant="outlined"
+            label={loopLabel(value)}
+            onClick={() => toggle(value)}
+            sx={choiceSx(on)}
+          />
+        )
+      })}
+    </Stack>
+  )
+}
+
+function parseSavedEnum(field, extra) {
+  if (isOmitted(extra) || extra === '@omit') return field.required ? undefined : OMIT
+  if (extra === null || extra === '@null') return extra === '@null' || extra === null ? null : undefined
+  const text = String(extra ?? '').trim()
+  if (!text) return undefined
+  const matched = (field.members || []).find((value) => value != null && String(value) === text)
+  return matched === undefined ? undefined : matched
+}
+
+function sameStoredComposition(left, right) {
+  return JSON.stringify(storedComposition(left) || null) === JSON.stringify(storedComposition(right) || null)
+}
+
 function CompositionSetsEditor({ field, fields, values, onChange }) {
   const children = descendantScalars(field, fields)
   const prefix = `${field.name}.`
   const emptyDraft = () => Object.fromEntries(children.map((child) => [child.name.slice(prefix.length), '']))
   const [draft, setDraft] = useState(emptyDraft)
-  const compositions = (values || []).filter((item) => item && typeof item === 'object' && !Array.isArray(item))
-  const tokens = (values || []).filter((item) => item === '@null' || item === '@omit')
-  const extrasOn = compositions.length > 0 || tokens.length > 0
+  const held = objectDefaultChoice(field) === 'fields' ? defaultComposition(field, fields) : null
+  const compositions = (values || []).filter((item) => item && typeof item === 'object' && !Array.isArray(item) && !sameStoredComposition(item, held))
+  const tokens = (values || []).filter((item) => item === '@null' || item === '@empty' || item === '@omit')
   const filled = storedComposition(draft)
-  const taken = compositions.some((item) => JSON.stringify(storedComposition(item)) === JSON.stringify(filled))
+  const taken = !filled || sameStoredComposition(filled, held) || compositions.some((item) => sameStoredComposition(item, filled))
   const add = () => {
-    if (!filled || taken) return
+    if (taken) return
     onChange([...(values || []), filled])
     setDraft(emptyDraft())
   }
-  const toggle = (token) => onChange(values.includes(token) ? values.filter((item) => item !== token) : [...values, token])
+  const toggle = (token) => onChange((values || []).includes(token) ? (values || []).filter((item) => item !== token) : [...(values || []), token])
   const choiceSx = (on) => ({
     height: 22,
     borderColor: on ? 'primary.main' : 'divider',
@@ -4530,16 +4719,11 @@ function CompositionSetsEditor({ field, fields, values, onChange }) {
             onDelete={() => onChange(values.filter((item) => item !== value))}
           />
         ))}
-        {!field.required && extrasOn && (
+        {!field.required && (
           <>
             <Chip size="small" variant="outlined" label="Null" onClick={() => toggle('@null')} sx={choiceSx(tokens.includes('@null'))} />
+            <Chip size="small" variant="outlined" label="Empty" onClick={() => toggle('@empty')} sx={choiceSx(tokens.includes('@empty'))} />
             <Chip size="small" variant="outlined" label="Omit" onClick={() => toggle('@omit')} sx={choiceSx(tokens.includes('@omit'))} />
-          </>
-        )}
-        {!field.required && !extrasOn && (
-          <>
-            <Chip size="small" label="Null" />
-            <Chip size="small" label="Omit" />
           </>
         )}
       </Stack>
@@ -4872,7 +5056,7 @@ function proxiedApiUrl(apiBase, pathOrUrl) {
   return new URL(joinUrl('/api', pathOrUrl), window.location.origin)
 }
 
-function ObjectChoice({ value, onChange, composite = false }) {
+function ObjectChoice({ value, onChange, composite = false, optional = true }) {
   const selected = value === 'null' || value === 'empty' || value === 'composite' ? value : 'fields'
   return (
     <ToggleButtonGroup
@@ -4886,8 +5070,8 @@ function ObjectChoice({ value, onChange, composite = false }) {
     >
       <ToggleButton value="fields">Fields</ToggleButton>
       {composite && <ToggleButton value="composite">Composite</ToggleButton>}
-      <ToggleButton value="null">Null</ToggleButton>
-      <ToggleButton value="empty">Empty</ToggleButton>
+      {optional && <ToggleButton value="null">Null</ToggleButton>}
+      {optional && <ToggleButton value="empty">Empty</ToggleButton>}
     </ToggleButtonGroup>
   )
 }
@@ -4929,6 +5113,7 @@ async function executeCheck(apiBase, idpBase, operation, item, hooks) {
       count: items.length,
       items,
       text: response.text,
+      request: formatRequestPayload({ body: pageSent.body, query: pageSent.query, path: pageSent.path }),
       label: stepLabel(pagination, reports.length, pageIndex, paging),
       pageIndex,
       offset: pagination?.request.offset ? Number(paging[pagination.request.offset] ?? 0) : 0,
@@ -4959,6 +5144,7 @@ async function executeCheck(apiBase, idpBase, operation, item, hooks) {
       status: report.status,
       count: report.count,
       text: report.text,
+      request: report.request,
     })),
   }
 }

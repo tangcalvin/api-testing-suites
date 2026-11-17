@@ -233,8 +233,6 @@ function combinationPlans(fields, parent = '') {
       const listed = field.vary && Array.isArray(field.values) ? field.values : []
       if (listed.length > 0) {
         axes.push(listed.map((value) => compositionPairs(field, value, fields)))
-      } else if (!field.required && field.location === 'body') {
-        axes.push([[[field.name, OBJECT_FIELDS]], [[field.name, null]], [[field.name, OMIT]]])
       }
       continue
     }
@@ -273,16 +271,26 @@ export function objectHasChildren(field, fields = []) {
 
 export function compositeField(field, fields = []) {
   if (!objectHasChildren(field, fields)) return false
-  if (field.sample === OBJECT_COMPOSITE) return true
-  if (field.sample === OBJECT_FIELDS) return false
+  if (compositeMarked(field.sample)) return true
   return String(field.name || '').includes('.')
 }
 
 export function combinationObjectMode(field, fields = []) {
+  if (compositeField(field, fields)) return objectDefaultChoice(field)
   const choice = objectChoice(field?.sample)
   if (choice === 'null' || choice === 'empty' || choice === 'composite') return choice
   if (field?.sample === OBJECT_FIELDS) return 'fields'
-  return compositeField(field, fields) ? 'composite' : 'fields'
+  return 'fields'
+}
+
+export function objectDefaultChoice(field) {
+  const choice = objectChoice(field?.sample)
+  if (choice === 'null' || choice === 'empty') return choice
+  return 'fields'
+}
+
+function compositeMarked(value) {
+  return value === OBJECT_COMPOSITE || value === OBJECT_COMPOSITE_NULL || value === OBJECT_COMPOSITE_EMPTY
 }
 
 export function underComposite(name, fields = []) {
@@ -300,11 +308,22 @@ export function descendantScalars(parent, fields = []) {
   return (fields || []).filter((field) => !field?.object && String(field?.name || '').startsWith(prefix))
 }
 
+export function defaultComposition(field, fields = []) {
+  const prefix = `${field?.name}.`
+  const stored = {}
+  for (const child of descendantScalars(field, fields)) {
+    const text = String(child?.sample ?? '').trim()
+    if (!text) continue
+    stored[child.name.slice(prefix.length)] = text
+  }
+  return Object.keys(stored).length > 0 ? stored : null
+}
+
 function compositionPairs(field, value, fields) {
   if (!isComposition(value)) return [[field.name, value]]
   const prefix = `${field.name}.`
   const flat = flattenComposition(value)
-  const pairs = []
+  const pairs = [[field.name, OBJECT_FIELDS]]
   for (const child of descendantScalars(field, fields)) {
     const relative = child.name.slice(prefix.length)
     if (!Object.prototype.hasOwnProperty.call(flat, relative)) continue
@@ -312,7 +331,7 @@ function compositionPairs(field, value, fields) {
     if (typed === undefined) continue
     pairs.push([child.name, typed])
   }
-  return pairs.length > 0 ? pairs : [[field.name, OBJECT_FIELDS]]
+  return pairs
 }
 
 export function flattenComposition(value, prefix = '') {
@@ -357,11 +376,19 @@ function typedCompositionValue(field, raw) {
   return raw
 }
 
-function sameCompositeCombination(left, right) {
-  if (isComposition(left) && isComposition(right)) {
-    return JSON.stringify(flattenComposition(left)) === JSON.stringify(flattenComposition(right))
+function expandedCompositeValue(value, field, fields) {
+  if (value === OBJECT_FIELDS || value === OBJECT_COMPOSITE) return defaultComposition(field, fields)
+  if (isComposition(value)) return storedComposition(value)
+  return value
+}
+
+function sameCompositeCombination(left, right, field, fields) {
+  const a = expandedCompositeValue(left, field, fields)
+  const b = expandedCompositeValue(right, field, fields)
+  if (isComposition(a) && isComposition(b)) {
+    return JSON.stringify(flattenComposition(a)) === JSON.stringify(flattenComposition(b))
   }
-  return sameCombinationValue(left, right)
+  return sameCombinationValue(a, b)
 }
 
 function substituteComposition(value, variables) {
@@ -416,12 +443,27 @@ export const OBJECT_NULL = '@null'
 export const OBJECT_EMPTY = '@empty'
 export const OBJECT_FIELDS = '@fields'
 export const OBJECT_COMPOSITE = '@composite'
+export const OBJECT_COMPOSITE_NULL = '@composite-null'
+export const OBJECT_COMPOSITE_EMPTY = '@composite-empty'
 
 export function objectChoice(value) {
-  if (value === OBJECT_NULL || value === null) return 'null'
-  if (value === OBJECT_EMPTY) return 'empty'
+  if (value === OBJECT_NULL || value === OBJECT_COMPOSITE_NULL || value === null) return 'null'
+  if (value === OBJECT_EMPTY || value === OBJECT_COMPOSITE_EMPTY) return 'empty'
   if (value === OBJECT_COMPOSITE) return 'composite'
   return 'fields'
+}
+
+export function storedObjectSample(field, mode, fields = []) {
+  const composite = compositeField(field, fields) || mode === 'composite'
+  if (mode === 'composite') return OBJECT_COMPOSITE
+  if (composite) {
+    if (mode === 'null') return String(field?.name || '').includes('.') ? OBJECT_NULL : OBJECT_COMPOSITE_NULL
+    if (mode === 'empty') return String(field?.name || '').includes('.') ? OBJECT_EMPTY : OBJECT_COMPOSITE_EMPTY
+    return OBJECT_COMPOSITE
+  }
+  if (mode === 'null') return OBJECT_NULL
+  if (mode === 'empty') return OBJECT_EMPTY
+  return OBJECT_FIELDS
 }
 
 export function sendsObjectFields(value) {
@@ -435,6 +477,8 @@ export function valueText(value) {
   if (value === OBJECT_FIELDS) return 'fields'
   if (value === OBJECT_EMPTY) return 'empty'
   if (value === OBJECT_COMPOSITE) return 'composite'
+  if (value === OBJECT_COMPOSITE_NULL) return 'null'
+  if (value === OBJECT_COMPOSITE_EMPTY) return 'empty'
   if (plainObject(value)) {
     const parts = Object.entries(flattenComposition(value)).map(([name, item]) => `${name}=${item}`)
     return parts.length > 0 ? parts.join(', ') : 'composite'
@@ -490,9 +534,9 @@ function sameCombinationValue(left, right) {
   return Object.is(left, right)
 }
 
-export function withTextCombinationValues(fields, saved, variables) {
+export function withTextCombinationValues(fields, saved, variables, held) {
   const source = saved && typeof saved === 'object' && !Array.isArray(saved) ? saved : {}
-  return fields.map((field) => {
+  const mapped = fields.map((field) => {
     if (scalarCombinationField(field)) {
       const raw = Array.isArray(source[field.name]) ? source[field.name] : []
       const extras = raw.map((item) => {
@@ -504,11 +548,56 @@ export function withTextCombinationValues(fields, saved, variables) {
       return { ...field, values, vary: field.textVary === false ? false : true }
     }
     if (field.object) return withObjectCombinationValues(field, fields, source[field.name], variables)
+    if (field.enum) return withEnumCombinationValues(field, source[field.name])
     return field
   })
+  if (!held || typeof held !== 'object' || Array.isArray(held)) return mapped
+  return mapped.map((field) => (held[field.name] === false ? { ...field, vary: false, textVary: false } : field))
+}
+
+export function combinationEnumValues(field) {
+  if (!field?.enum) return []
+  return enumLoopValues(uniqueMembers(field.members || []), field.required)
+}
+
+export function storedEnumValue(value) {
+  if (isOmitted(value)) return '@omit'
+  if (value == null) return '@null'
+  return String(value)
+}
+
+function withEnumCombinationValues(field, raw) {
+  const listed = Array.isArray(raw) ? raw : null
+  if (!listed) return field
+  const values = []
+  for (const item of listed) {
+    const parsed = parseEnumCombination(field, item)
+    if (parsed === undefined) continue
+    if (values.some((value) => sameCombinationValue(value, parsed))) continue
+    values.push(parsed)
+  }
+  if (values.length === 0) return { ...field, values: field.values || [], vary: false }
+  return { ...field, values, vary: field.textVary === false ? false : true }
+}
+
+function parseEnumCombination(field, extra) {
+  if (isOmitted(extra) || extra === '@omit') return field.required ? undefined : OMIT
+  if (extra === null || extra === '@null') {
+    const members = field.members || []
+    if (members.some((value) => value == null) || !field.required) return null
+    return undefined
+  }
+  const text = String(extra ?? '').trim()
+  if (!text) return undefined
+  if (text === '@omit') return field.required ? undefined : OMIT
+  if (text === '@null') return parseEnumCombination(field, null)
+  const members = field.members || []
+  const matched = members.find((value) => value != null && String(value) === text)
+  return matched === undefined ? undefined : matched
 }
 
 function withObjectCombinationValues(field, fields, raw, variables) {
+  if (!compositeField(field, fields)) return field
   const list = Array.isArray(raw) ? raw : []
   const extras = []
   for (const item of list) {
@@ -518,16 +607,19 @@ function withObjectCombinationValues(field, fields, raw, variables) {
       continue
     }
     const text = String(item ?? '').trim()
-    if (text === '@null' && !field.required) extras.push(null)
-    else if ((text === '@omit' || text === OMIT) && !field.required) extras.push(OMIT)
+    if (field.required) continue
+    if (text === '@null' || text === OBJECT_NULL) extras.push(null)
+    else if (text === '@empty' || text === OBJECT_EMPTY) extras.push(OBJECT_EMPTY)
+    else if (text === '@omit' || text === OMIT) extras.push(OMIT)
   }
-  if (extras.length === 0) return field
   const values = []
-  for (const extra of extras) {
-    if (values.some((item) => sameCompositeCombination(item, extra))) continue
-    values.push(extra)
+  const push = (value) => {
+    if (value === undefined) return
+    if (values.some((item) => sameCompositeCombination(item, value, field, fields))) return
+    values.push(value)
   }
-  if (values.length === 0) return field
+  for (const extra of extras) push(extra)
+  if (values.length === 0) return { ...field, values: [], vary: false }
   return { ...field, values, vary: field.textVary === false ? false : true }
 }
 
@@ -2299,13 +2391,12 @@ function findField(fields, keys) {
 }
 
 function findItems(fields) {
+  const arrays = (fields || []).filter((field) => field.schema?.type === 'array' || field.schema?.items)
   for (const name of ITEM_NAMES) {
-    const found = fields.find((field) => field.key === name && (field.schema.type === 'array' || field.schema.items))
-    if (found) {
-      return found
-    }
+    const found = arrays.find((field) => field.key === name)
+    if (found) return found
   }
-  return fields.find((field) => field.schema.type === 'array' || field.schema.items) || null
+  return arrays[0] || null
 }
 
 function exclusiveGroups(spec, operation) {

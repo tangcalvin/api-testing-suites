@@ -44,7 +44,7 @@ export function storedPaging(value) {
 export function normalizePaging(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
   const mode = String(value.mode || '').trim()
-  if (!['none', 'cursor', 'page', 'offset', 'link'].includes(mode)) return null
+  if (!['none', 'detected', 'cursor', 'page', 'offset', 'link'].includes(mode)) return null
   const request = value.request && typeof value.request === 'object' && !Array.isArray(value.request) ? value.request : {}
   const response = value.response && typeof value.response === 'object' && !Array.isArray(value.response) ? value.response : {}
   const pageBase = Number(value.pageBase)
@@ -105,6 +105,12 @@ export function resolvePagination(detected, override) {
   const saved = normalizePaging(override)
   if (!saved) return detected || null
   if (saved.mode === 'none') return null
+  if (saved.mode === 'detected') {
+    if (!detected) return null
+    const items = fieldPath(saved.response.items)
+    if (!items) return detected
+    return { ...detected, response: { ...detected.response, items } }
+  }
   const base = detected && detected.style === saved.mode ? detected : emptyDetected(saved.mode)
   const request = {
     page: saved.request.page || base.request?.page || null,
@@ -198,6 +204,10 @@ function compactPaging(item) {
   const next = { mode: item.mode }
   const request = filledMap(item.request)
   const response = filledMap(item.response)
+  if (item.mode === 'detected') {
+    if (!response.items) return null
+    return { mode: 'detected', response: { items: response.items } }
+  }
   if (Object.keys(request).length > 0) next.request = request
   if (Object.keys(response).length > 0) next.response = response
   if (item.mode === 'cursor') {

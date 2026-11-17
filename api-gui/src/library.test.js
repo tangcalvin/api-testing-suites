@@ -125,6 +125,15 @@ test('defaults and custom cases import as separate files', () => {
     { code: 'A', name: 'RegA' },
   )
   assert.equal(casesDocument(parseCases('{"kind":"cases","operations":{}}')).values, undefined)
+  const withVary = parseCases(JSON.stringify({
+    kind: 'cases',
+    operations: {},
+    vary: { 'GET /api/orders': { status: false, priority: true } },
+  }))
+  assert.equal(withVary.vary['GET /api/orders'].status, false)
+  assert.equal(withVary.vary['GET /api/orders'].priority, undefined)
+  assert.equal(casesDocument(withVary).vary['GET /api/orders'].status, false)
+  assert.equal(casesDocument(parseCases('{"kind":"cases","operations":{}}')).vary, undefined)
   assert.equal(casesDocument(parseCases('{"kind":"cases","operations":{}}')).checks, undefined)
   const withTrial = parseCases(JSON.stringify({
     kind: 'cases',

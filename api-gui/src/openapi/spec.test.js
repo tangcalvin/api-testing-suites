@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { OMIT, OBJECT_COMPOSITE, OBJECT_FIELDS, applyPaging, collectPaging, individualChoices, buildIndividualCases, applyErrorOverrides, applyErrorRowToGroup, assignFixture, buildCases, buildCustomCases, buildCustomErrorCases, buildErrorCases, buildTrialCases, caseCount, combinationObjectMode, compilePattern, compositeField, detectPagination, enquiryShouldMiss, enquiryTarget, firstPageQuery, fixtureEnabled, fixtureNote, fixturePlan, fixtureRequest, fixtureSteps, judge, listOperations, operationGroups, operationRole, parseSpecText, planContinuation, readCreatedId, recordId, detectPayloadId, idNameRank, resolvedId, readExpectation, responseChecks, responseViews, responsesForMode, sampleCall, scalarCombinationField, specGaps, storedExpectation, textCombinationField, underComposite, viewsWithStatuses, withFixtureId, withTextCombinationValues } from './spec.js'
+import { OMIT, OBJECT_COMPOSITE, OBJECT_FIELDS, applyPaging, collectPaging, individualChoices, buildIndividualCases, applyErrorOverrides, applyErrorRowToGroup, assignFixture, buildCases, buildCustomCases, buildCustomErrorCases, buildErrorCases, buildTrialCases, caseCount, combinationObjectMode, compilePattern, compositeField, detectPagination, enquiryShouldMiss, enquiryTarget, firstPageQuery, fixtureEnabled, fixtureNote, fixturePlan, fixtureRequest, fixtureSteps, judge, listOperations, operationGroups, operationRole, parseSpecText, planContinuation, readCreatedId, readItems, recordId, detectPayloadId, idNameRank, resolvedId, readExpectation, responseChecks, responseViews, responsesForMode, sampleCall, scalarCombinationField, specGaps, storedExpectation, textCombinationField, underComposite, viewsWithStatuses, withFixtureId, withTextCombinationValues } from './spec.js'
 import { resolvePagination, storedPaging } from './pagination.js'
 
 const SPEC = `
@@ -459,12 +459,12 @@ paths:
                         name: { type: string, example: Island }
 `))[0].fields
   const region = fields.find((field) => field.name === 'deliveryAddress.region')
-  assert.equal(combinationObjectMode(region, fields), 'composite')
+  assert.equal(combinationObjectMode(region, fields), 'fields')
   const marked = fields.map((field) => field.name === 'deliveryAddress' ? { ...field, sample: OBJECT_COMPOSITE } : field)
   assert.equal(compositeField(marked.find((field) => field.name === 'deliveryAddress'), marked), true)
   assert.equal(underComposite('deliveryAddress.city', marked), true)
   const independent = fields.map((field) => field.name === 'deliveryAddress.region' ? { ...field, sample: OBJECT_FIELDS } : field)
-  assert.equal(compositeField(independent.find((field) => field.name === 'deliveryAddress.region'), independent), false)
+  assert.equal(compositeField(independent.find((field) => field.name === 'deliveryAddress.region'), independent), true)
   const crossed = withTextCombinationValues(fields, {
     'deliveryAddress.region': [
       { code: 'A', name: 'RegA' },
@@ -477,10 +477,92 @@ paths:
   const cases = buildCases(crossed)
   assert.equal(cases.length, 4)
   assert.deepEqual(
-    cases.map((item) => [item.body.deliveryAddress.region.code, item.body.deliveryAddress.region.name]).sort(),
-    [['A', 'RegA'], ['A', 'RegA'], ['B', 'RegB'], ['B', 'RegB']],
+    [...new Set(cases.map((item) => `${item.body.deliveryAddress.region.code}|${item.body.deliveryAddress.region.name}`))].sort(),
+    ['A|RegA', 'B|RegB'],
   )
-  assert.ok(cases.every((item) => item.varied['deliveryAddress.region.code'] && item.varied['deliveryAddress.region.name']))
+})
+
+test('a composite without try values uses the default only', () => {
+  const fields = listOperations(parseSpecText(`
+openapi: 3.1.0
+paths:
+  /api/orders:
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [deliveryAddress]
+              properties:
+                deliveryAddress:
+                  type: object
+                  properties:
+                    region:
+                      type: object
+                      properties:
+                        code: { type: string, example: HK-IS }
+                        name: { type: string, example: Island }
+`))[0].fields
+  const region = fields.find((field) => field.name === 'deliveryAddress.region')
+  assert.equal(compositeField(region, fields), true)
+  const untouched = withTextCombinationValues(fields, {}, {})
+  assert.equal(untouched.find((field) => field.name === 'deliveryAddress.region').vary, false)
+  const cases = buildCases(untouched)
+  assert.equal(cases.length, 1)
+  assert.equal(cases[0].body.deliveryAddress.region.code, 'HK-IS')
+  assert.equal(cases[0].body.deliveryAddress.region.name, 'Island')
+  const withNull = withTextCombinationValues(fields, { 'deliveryAddress.region': ['@null', '@empty', '@omit'] }, {})
+  assert.equal(withNull.find((field) => field.name === 'deliveryAddress.region').values.length, 3)
+  const mixed = buildCases(withNull)
+  assert.equal(mixed.filter((item) => item.body.deliveryAddress?.region?.code === 'HK-IS').length, 0)
+  assert.equal(mixed.filter((item) => item.body.deliveryAddress?.region === null).length, 1)
+  assert.equal(mixed.filter((item) => item.body.deliveryAddress?.region && Object.keys(item.body.deliveryAddress.region).length === 0).length, 1)
+  assert.equal(mixed.filter((item) => item.varied['deliveryAddress.region'] === OMIT).length, 1)
+})
+
+test('a composite default is not counted again as a try value', () => {
+  const fields = listOperations(parseSpecText(`
+openapi: 3.1.0
+paths:
+  /api/orders:
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [deliveryAddress]
+              properties:
+                deliveryAddress:
+                  type: object
+                  required: [region]
+                  properties:
+                    region:
+                      type: object
+                      required: [code, name]
+                      properties:
+                        code: { type: string, example: HK-IS }
+                        name: { type: string, example: Island }
+`))[0].fields
+  const crossed = withTextCombinationValues(fields, {
+    'deliveryAddress.region': [
+      { code: 'HK-IS', name: 'Island' },
+      { code: 'B', name: 'RegB' },
+      '@null',
+      '@empty',
+      '@omit',
+    ],
+  }, {})
+  const region = crossed.find((field) => field.name === 'deliveryAddress.region')
+  assert.equal(region.vary, true)
+  assert.equal(region.values.length, 2)
+  const cases = buildCases(crossed)
+  assert.equal(cases.length, 2)
+  assert.deepEqual(
+    [...new Set(cases.map((item) => `${item.body.deliveryAddress.region.code}|${item.body.deliveryAddress.region.name}`))].sort(),
+    ['B|RegB', 'HK-IS|Island'],
+  )
 })
 
 test('response schema lists nested fields for each status', () => {
@@ -668,6 +750,72 @@ paths:
   assert.deepEqual(priority.members, [null, 'LOW'])
   assert.deepEqual(priority.values, [null, 'LOW'])
   assert.deepEqual(buildCases([status]).map((item) => item.label), ['status=null', 'status=DRAFT', 'status=omit'])
+})
+
+test('combination enums can hold a subset of values or skip the field', () => {
+  const fields = listOperations(parseSpecText(`
+openapi: 3.1.0
+paths:
+  /api/orders:
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status:
+                  type: string
+                  enum: [DRAFT, CONFIRMED, CANCELLED, FAILED, CLOSED]
+`))[0].fields
+  const subset = withTextCombinationValues(fields, { status: ['DRAFT', 'CONFIRMED', 'FAILED'] }, {})
+  const status = subset.find((field) => field.name === 'status')
+  assert.equal(status.vary, true)
+  assert.deepEqual(status.values, ['DRAFT', 'CONFIRMED', 'FAILED'])
+  assert.equal(buildCases(subset).length, 3)
+  const held = withTextCombinationValues(fields, { status: ['DRAFT', 'CONFIRMED'] }, {}, { status: false })
+  assert.equal(held.find((field) => field.name === 'status').vary, false)
+  assert.equal(buildCases(held).length, 1)
+  assert.equal(buildCases(held)[0].body.status, 'DRAFT')
+})
+
+test('a nested records path can be read and overridden', () => {
+  const operation = listOperations(parseSpecText(`
+openapi: 3.1.0
+paths:
+  /api/orders:
+    get:
+      parameters:
+        - name: page
+          in: query
+          schema: { type: integer }
+        - name: size
+          in: query
+          schema: { type: integer }
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      page:
+                        type: object
+                        properties:
+                          content: { type: array, items: { type: object } }
+                  totalPages: { type: integer }
+`))[0]
+  assert.equal(operation.pagination.style, 'page')
+  const overlay = storedPaging({ mode: 'detected', response: { items: 'data.page.content' } })
+  const pagination = resolvePagination(operation.pagination, overlay)
+  assert.deepEqual(pagination.response.items, ['data', 'page', 'content'])
+  const rows = readItems({ data: { page: { content: [{ id: 1 }, { id: 2 }] } } }, pagination)
+  assert.equal(rows.length, 2)
+  assert.equal(rows[0].id, 1)
 })
 
 test('list combinations do not send saved query filters that are not being varied', () => {
