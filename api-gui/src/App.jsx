@@ -68,8 +68,11 @@ import {
   sampleCall,
   withFixtureId,
   applyErrorOverrides,
+  applyErrorInclude,
   applyErrorRowToGroup,
   errorCheckKey,
+  errorMatchType,
+  includedErrorCases,
   errorColumnDefault,
   createPacer,
   compilePattern,
@@ -207,12 +210,12 @@ const MODES = [
   {
     id: 'error',
     label: 'Error',
-    detail: 'Sends requests that should be rejected. A required field sent as null is a disallowed value. Choose the HTTP status, then add a column for each response field you want to compare. Use for all copies the values you set on one row to the rest of that category.',
+    detail: 'Sends requests that should be rejected. Include a row to run it. Each column is a response field and how that field is compared.',
   },
   {
     id: 'custom',
     label: 'Custom',
-    detail: 'Runs the cases saved for this operation. Blank request fields use the defaults. A check passes on the HTTP status. A response field with an expected value uses that value. Any other field is compared with the same request field when that value was sent.',
+    detail: 'Runs the cases saved for this operation. Blank request fields use the defaults. A check passes on the HTTP status. Each expected response field has its own comparison: Value, Expression, Contains, Pattern, or Regex. Any other field is compared with the same request field when that value was sent.',
   },
   {
     id: 'trial',
@@ -299,12 +302,16 @@ export default function App() {
     }, operationErrorCases || [], operationTrial) : []),
     [activeMode, defaults.variables, operationCases, operationErrorCases, operationExclusions, operationTrial, resolvedFields, selected],
   )
-  const planned = useMemo(
-    () => applyErrorOverrides(builtCases, operationErrorChecks || {}),
-    [builtCases, operationErrorChecks],
-  )
+  const planned = useMemo(() => {
+    const cases = applyErrorOverrides(builtCases, operationErrorChecks || {})
+    if (activeMode !== 'error') return cases
+    return includedErrorCases(cases, operationErrorChecks || {})
+  }, [activeMode, builtCases, operationErrorChecks])
   const skippedCombinations = activeMode === 'combination' && selected
     ? Math.max(0, caseCount(resolvedFields) - planned.length)
+    : 0
+  const skippedErrors = activeMode === 'error'
+    ? Math.max(0, builtCases.length - planned.length)
     : 0
   const combinationVaryNames = useMemo(
     () => (activeMode === 'combination' && selected ? combinationVaryTargets(fields, resolvedFields) : []),
@@ -878,9 +885,14 @@ export default function App() {
       const checks = { ...(current.checks || {}) }
       const columns = Array.isArray(next?.columns) ? next.columns : ['exceptions[].code']
       const rows = next?.rows && typeof next.rows === 'object' ? next.rows : {}
-      const untouched = columns.length === 1 && columns[0] === 'exceptions[].code' && Object.keys(rows).length === 0
+      const matches = {}
+      for (const column of columns) {
+        const match = errorMatchType(next?.matches?.[column])
+        if (match !== 'equals') matches[column] = match
+      }
+      const untouched = columns.length === 1 && columns[0] === 'exceptions[].code' && Object.keys(rows).length === 0 && Object.keys(matches).length === 0
       if (untouched) delete checks[operationId]
-      else checks[operationId] = { columns, rows }
+      else checks[operationId] = { columns, rows, ...(Object.keys(matches).length > 0 ? { matches } : {}) }
       return { ...current, checks }
     })
   }
@@ -1565,6 +1577,7 @@ export default function App() {
                     onChecks={(next) => writeErrorChecks(selected.id, next)}
                     custom={operationErrorCases || []}
                     onChange={(list) => writeErrorCases(selected.id, list)}
+                    patterns={defaults.patterns || {}}
                   />
                 ) : activeMode === 'trial' ? (
                   <TrialForm
@@ -1805,13 +1818,15 @@ export default function App() {
                     <Typography variant="body2" color="text.secondary" sx={{ flex: 1 }}>
                       {planned.length === 0 && skippedCombinations > 0
                           ? 'Every combination is excluded.'
+                          : planned.length === 0 && skippedErrors > 0
+                            ? 'Every error check is excluded.'
                           : planned.length === 0
                             ? 'This operation has no checks in the selected mode.'
                             : running
                               ? `${finishedChecks} of ${planned.length} complete${activity ? ` · ${activity}` : ''}`
                               : activeMode === 'trial'
                               ? 'Sends one request at this rate. Pagination is not followed.'
-                            : `List checks follow the spec. Requests stay within this rate.${skippedCombinations > 0 ? ` ${skippedCombinations} combinations skipped.` : ''}${activeMode === 'combination' && datasets[selected?.id]?.rows?.length ? ` ${datasets[selected.id].rows.length} uploaded ${datasets[selected.id].rows.length === 1 ? 'record is' : 'records are'} filtered for each check.` : ''}`}
+                            : `List checks follow the spec. Requests stay within this rate.${skippedCombinations > 0 ? ` ${skippedCombinations} combinations skipped.` : ''}${skippedErrors > 0 ? ` ${skippedErrors} error ${skippedErrors === 1 ? 'check is' : 'checks are'} skipped.` : ''}${activeMode === 'combination' && datasets[selected?.id]?.rows?.length ? ` ${datasets[selected.id].rows.length} uploaded ${datasets[selected.id].rows.length === 1 ? 'record is' : 'records are'} filtered for each check.` : ''}`}
                     </Typography>
                     <PaginationHelp pagination={selectedPaging} />
                   </Stack>
@@ -2140,8 +2155,8 @@ function ExpectedField({ field, status, automatic, stored, hasOverride, objectAr
               }
               write({
                 match: next,
-                text: next === match ? shown : (next === 'equals' ? automatic : ''),
-                ignoreCase: next === 'equals' ? ignoreCase : false,
+                text: next === match ? shown : (next === 'equals' || next === 'expression' ? automatic : ''),
+                ignoreCase: next === 'equals' || next === 'expression' ? ignoreCase : false,
                 rules: [],
               })
             }}
@@ -2149,6 +2164,7 @@ function ExpectedField({ field, status, automatic, stored, hasOverride, objectAr
             sx={{ width: 118, flexShrink: 0 }}
           >
             <MenuItem value="equals">Value</MenuItem>
+            <MenuItem value="expression">Expression</MenuItem>
             <MenuItem value="pattern">Pattern</MenuItem>
             <MenuItem value="regex">Regex</MenuItem>
             <MenuItem value="when">When</MenuItem>
@@ -2192,7 +2208,7 @@ function ExpectedField({ field, status, automatic, stored, hasOverride, objectAr
             placeholder={
               objectArray
                 ? '[{"field":"quantity"},{"field":"customerEmail"}]'
-                : (match === 'regex' ? '^[A-Z0-9-]+$' : (hasOverride ? 'Not checked' : (automatic || 'Not checked')))
+                : (match === 'regex' ? '^[A-Z0-9-]+$' : match === 'expression' ? (automatic || '@{name}') : (hasOverride ? 'Not checked' : (automatic || 'Not checked')))
             }
             error={Boolean(objectArrayError || regexIssue)}
             helperText={objectArrayError || regexIssue || undefined}
@@ -2201,7 +2217,7 @@ function ExpectedField({ field, status, automatic, stored, hasOverride, objectAr
             sx={{ minWidth: 160, '& input, & textarea': { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12.5 } }}
           />
         ))}
-        {match === 'equals' && !objectArray && (
+        {(match === 'equals' || match === 'expression') && !objectArray && (
           <Tooltip title="Case sensitive">
             <FormControlLabel
               sx={{ mr: 0, ml: 0, flexShrink: 0 }}
@@ -2336,6 +2352,7 @@ function ExpectedWhenEditor({ rules, fields, patterns, onChange }) {
                   sx={{ width: 118, flexShrink: 0 }}
                 >
                   <MenuItem value="equals">Value</MenuItem>
+                  <MenuItem value="expression">Expression</MenuItem>
                   <MenuItem value="pattern">Pattern</MenuItem>
                   <MenuItem value="regex">Regex</MenuItem>
                 </TextField>
@@ -2345,7 +2362,7 @@ function ExpectedWhenEditor({ rules, fields, patterns, onChange }) {
                   patterns={patterns}
                   onChange={(text) => update(index, { text })}
                 />
-                {current.match === 'equals' && (
+                {(current.match === 'equals' || current.match === 'expression') && (
                   <Tooltip title="Case sensitive">
                     <FormControlLabel
                       sx={{ mr: 0, ml: 0, flexShrink: 0 }}
@@ -2412,7 +2429,7 @@ function ExpectedThenInput({ match, text, patterns, onChange }) {
       size="small"
       fullWidth
       value={text}
-      placeholder={match === 'regex' ? '^[A-Z0-9-]+$' : 'Expected'}
+      placeholder={match === 'regex' ? '^[A-Z0-9-]+$' : match === 'expression' ? 'Missing field: @{leaf}' : 'Expected'}
       error={Boolean(regexIssue)}
       helperText={regexIssue || undefined}
       onChange={(event) => onChange(event.target.value)}
@@ -2425,7 +2442,7 @@ function ExpectedThenInput({ match, text, patterns, onChange }) {
 function emptyWhenRule(rule) {
   return {
     when: Array.isArray(rule?.when) ? rule.when : [],
-    match: rule?.match === 'pattern' || rule?.match === 'regex' ? rule.match : 'equals',
+    match: rule?.match === 'pattern' || rule?.match === 'regex' || rule?.match === 'expression' ? rule.match : 'equals',
     text: rule?.text == null ? '' : String(rule.text),
     ignoreCase: rule?.ignoreCase === true,
   }
@@ -2627,14 +2644,14 @@ function errorResponseFields(views) {
       names.push(field.name)
     }
   }
-  for (const name of ['status', 'exceptions[].field', 'exceptions[].code', 'exceptions[].message']) {
+  for (const name of ['status', 'code', 'message', 'exceptions[].field', 'exceptions[].code', 'exceptions[].message', 'exception[].type', 'exception[].code', 'exception[].message']) {
     if (!names.includes(name)) names.push(name)
   }
   return names
 }
 
 function nextErrorColumn(columns, fields) {
-  const preferred = ['exceptions[].code', 'exceptions[].message', 'exceptions[].field', 'status']
+  const preferred = ['exceptions[].code', 'exception[].code', 'exceptions[].message', 'exception[].message', 'exceptions[].field', 'exception[].type', 'status']
   return [...preferred, ...fields].find((name) => name && !columns.includes(name)) || ''
 }
 
@@ -2658,7 +2675,7 @@ function customResponseFields(views) {
     const list = /^[45]/.test(String(view.status)) ? error : content
     for (const field of view.fields || []) add(list, field)
   }
-  for (const name of ['exceptions[].field', 'exceptions[].code', 'exceptions[].message', 'status']) {
+  for (const name of ['exceptions[].field', 'exceptions[].code', 'exceptions[].message', 'exception[].type', 'exception[].code', 'exception[].message', 'status']) {
     if (seen.has(name)) continue
     seen.add(name)
     error.push(name)
@@ -2671,17 +2688,26 @@ function nextCustomField(used, content, error, status) {
   return preferred.find((name) => name && !used.has(name)) || ''
 }
 
-function ErrorCases({ fields, responses, cases, checks, onChecks, custom, onChange }) {
+const ERROR_GROUPS = [
+  ['malformed', 'Malformed JSON', 'The body cannot be read.'],
+  ['missing', 'Missing fields', 'A required field is left out. Text expects NotBlank. Other fields expect NotNull.'],
+  ['disallowed', 'Disallowed value', 'A required field is null, or the value is outside the enum, pattern, length, or numeric range. Null expects NotNull.'],
+  ['type', 'Invalid data type', 'A number, boolean, date, or timestamp is sent in the wrong form.'],
+]
+
+const ERROR_TABLE_SX = {
+  width: '100%',
+  '& th, & td': { py: 0.55, px: 1, verticalAlign: 'middle' },
+  '& th': { bgcolor: 'background.paper', color: 'text.secondary', fontSize: 12, fontWeight: 600, borderBottomColor: 'divider' },
+}
+
+function ErrorCases({ fields, responses, cases, checks, onChecks, custom, onChange, patterns = {} }) {
   const responseFields = errorResponseFields(responses)
   const columns = Array.isArray(checks.columns) ? checks.columns : [DEFAULT_ERROR_COLUMN]
   const rows = checks.rows && typeof checks.rows === 'object' ? checks.rows : {}
-  const groups = [
-    ['malformed', 'Malformed JSON', 'The body cannot be read.'],
-    ['missing', 'Missing fields', 'A required field is left out. Text expects NotBlank. Other fields expect NotNull.'],
-    ['disallowed', 'Disallowed value', 'A required field is null, or the value is outside the enum, pattern, length, or numeric range. Null expects NotNull.'],
-    ['type', 'Invalid data type', 'A number, boolean, date, or timestamp is sent in the wrong form.'],
-  ]
-  const publish = (nextColumns, nextRows) => onChecks({ columns: nextColumns, rows: nextRows })
+  const matches = checks.matches && typeof checks.matches === 'object' ? checks.matches : {}
+  const [openGroups, setOpenGroups] = useState({ malformed: true, missing: true, disallowed: true, type: true, custom: true })
+  const publish = (nextColumns, nextRows, nextMatches = matches) => onChecks({ columns: nextColumns, rows: nextRows, matches: nextMatches })
   const changeColumn = (index, name) => {
     const previous = columns[index]
     if (!name || name === previous || columns.includes(name)) return
@@ -2695,7 +2721,18 @@ function ErrorCases({ fields, responses, cases, checks, onChecks, custom, onChan
       }
       nextRows[key] = { ...row, values }
     }
-    publish(nextColumns, nextRows)
+    const nextMatches = { ...matches }
+    if (Object.prototype.hasOwnProperty.call(nextMatches, previous)) {
+      nextMatches[name] = nextMatches[previous]
+      delete nextMatches[previous]
+    }
+    publish(nextColumns, nextRows, nextMatches)
+  }
+  const changeMatch = (column, match) => {
+    const nextMatches = { ...matches }
+    if (errorMatchType(match) === 'equals') delete nextMatches[column]
+    else nextMatches[column] = errorMatchType(match)
+    publish(columns, rows, nextMatches)
   }
   const addColumn = () => {
     const name = nextErrorColumn(columns, responseFields)
@@ -2710,7 +2747,9 @@ function ErrorCases({ fields, responses, cases, checks, onChecks, custom, onChan
       const next = { ...row, values }
       if (next.status || Object.keys(values).length > 0) nextRows[key] = next
     }
-    publish(columns.filter((_, columnIndex) => columnIndex !== index), nextRows)
+    const nextMatches = { ...matches }
+    delete nextMatches[name]
+    publish(columns.filter((_, columnIndex) => columnIndex !== index), nextRows, nextMatches)
   }
   const commit = (row, patch) => {
     const key = errorCheckKey(row)
@@ -2721,117 +2760,319 @@ function ErrorCases({ fields, responses, cases, checks, onChecks, custom, onChan
     const baseline = String(row.expect?.status || 400)
     const stored = {}
     for (const column of columns) {
-      const value = Object.prototype.hasOwnProperty.call(values, column) ? values[column] : errorColumnDefault(row, column)
-      if (value !== errorColumnDefault(row, column)) stored[column] = value
+      const match = errorMatchType(matches[column])
+      const fallback = match === 'equals' ? errorColumnDefault(row, column) : ''
+      const value = Object.prototype.hasOwnProperty.call(values, column) ? values[column] : fallback
+      if (String(value ?? '') !== String(fallback ?? '')) stored[column] = value
     }
+    const next = {}
+    if (status !== baseline) next.status = status
+    if (Object.keys(stored).length > 0) next.values = stored
+    if (saved.include === false) next.include = false
     const nextRows = { ...rows }
-    if (status !== baseline || Object.keys(stored).length > 0) nextRows[key] = { ...(status !== baseline ? { status } : {}), values: stored }
+    if (Object.keys(next).length > 0) nextRows[key] = next
     else delete nextRows[key]
     publish(columns, nextRows)
   }
   const applyCategory = (row) => publish(columns, applyErrorRowToGroup(rows, cases, row))
+  const applyInclude = (groupRows, included) => publish(columns, applyErrorInclude(rows, groupRows, included))
+  const listed = ERROR_GROUPS.map(([id, title, detail]) => ({
+    id,
+    title,
+    detail,
+    rows: cases.filter((item) => item.group === id),
+  }))
+  const emptyTitles = listed.filter((group) => group.rows.length === 0).map((group) => group.title)
   return (
-    <Stack spacing={2}>
-      <Typography variant="caption" color="text.secondary">
-        Choose the HTTP status. Each other column is a response field: select it in the header, and type the expected value in the row. Use for all copies the values set on that row to every other check in the category. @{'{field}'} is the field this check sends, and @{'{name}'} is a value sent on the request.
-      </Typography>
-      {groups.map(([id, title, detail]) => {
-        const groupRows = cases.filter((item) => item.group === id)
-        return (
-          <Box key={id}>
-            <Typography variant="subtitle2">{title}</Typography>
-            <Typography variant="caption" color="text.secondary">{detail}</Typography>
-            {groupRows.length === 0 ? (
-              <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>No checks for this operation.</Typography>
-            ) : (
-              <ErrorTable
-                rows={groupRows}
-                columns={columns}
-                saved={rows}
-                responseFields={responseFields}
-                onColumn={changeColumn}
-                onAdd={addColumn}
-                onRemove={removeColumn}
-                onCommit={commit}
-                onApply={applyCategory}
-              />
-            )}
-          </Box>
-        )
-      })}
-      <CustomErrorEditor fields={fields} columns={columns} cases={custom} onChange={onChange} />
+    <Stack spacing={1.25}>
+      <ErrorColumnBar
+        columns={columns}
+        matches={matches}
+        responseFields={responseFields}
+        onColumn={changeColumn}
+        onMatch={changeMatch}
+        onAdd={addColumn}
+        onRemove={removeColumn}
+      />
+      {emptyTitles.length > 0 && (
+        <Typography variant="caption" color="text.secondary">
+          {emptyTitles.join(' and ')} {emptyTitles.length === 1 ? 'is' : 'are'} not generated for this operation.
+        </Typography>
+      )}
+      {listed.filter((group) => group.rows.length > 0).map((group) => (
+        <ErrorGroupCard
+          key={group.id}
+          title={group.title}
+          open={openGroups[group.id] !== false}
+          onToggle={() => setOpenGroups((current) => ({ ...current, [group.id]: current[group.id] === false }))}
+          rows={group.rows}
+          saved={rows}
+          onInclude={applyInclude}
+        >
+          <ErrorTable
+            rows={group.rows}
+            columns={columns}
+            matches={matches}
+            saved={rows}
+            patterns={patterns}
+            onCommit={commit}
+            onApply={applyCategory}
+            onInclude={applyInclude}
+          />
+        </ErrorGroupCard>
+      ))}
+      <CustomErrorEditor
+        fields={fields}
+        columns={columns}
+        matches={matches}
+        patterns={patterns}
+        cases={custom}
+        open={openGroups.custom !== false}
+        onToggle={() => setOpenGroups((current) => ({ ...current, custom: current.custom === false }))}
+        onChange={onChange}
+      />
     </Stack>
   )
 }
 
-function ErrorTable({ rows, columns, saved, responseFields, onColumn, onAdd, onRemove, onCommit, onApply }) {
+function ErrorColumnBar({ columns, matches, responseFields, onColumn, onMatch, onAdd, onRemove }) {
   const unused = nextErrorColumn(columns, responseFields)
   return (
+    <Stack spacing={0.75} sx={{ border: 1, borderColor: 'divider', borderRadius: 1, px: 1.25, py: 1 }}>
+      <Stack direction="row" spacing={0.75} sx={{ alignItems: 'center', justifyContent: 'space-between' }}>
+        <Stack direction="row" spacing={0.5} sx={{ alignItems: 'center', minWidth: 0 }}>
+          <Typography variant="subtitle2">Response fields</Typography>
+          <ErrorHelp />
+        </Stack>
+        <Button size="small" onClick={onAdd} disabled={!unused} sx={{ minWidth: 0 }}>Add field</Button>
+      </Stack>
+      <Stack direction="row" spacing={0.75} useFlexGap sx={{ flexWrap: 'wrap' }}>
+        {columns.map((column, index) => (
+          <Stack
+            key={`${column}-${index}`}
+            direction="row"
+            spacing={0.5}
+            sx={{
+              alignItems: 'center',
+              border: 1,
+              borderColor: 'divider',
+              borderRadius: 1,
+              pl: 1,
+              pr: 0.25,
+              py: 0.25,
+              minWidth: 0,
+            }}
+          >
+            <TextField
+              select
+              variant="standard"
+              size="small"
+              value={column}
+              onChange={(event) => onColumn(index, event.target.value)}
+              slotProps={{ htmlInput: { 'aria-label': `Response field ${index + 1}` }, input: { disableUnderline: true } }}
+              sx={{ minWidth: 132, '& .MuiSelect-select': { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12.5, py: 0.5 } }}
+            >
+              {responseFields.map((name) => (
+                <MenuItem key={name} value={name} disabled={columns.includes(name) && name !== column}>{name}</MenuItem>
+              ))}
+            </TextField>
+            <TextField
+              select
+              variant="standard"
+              size="small"
+              value={errorMatchType(matches?.[column])}
+              onChange={(event) => onMatch(column, event.target.value)}
+              slotProps={{ htmlInput: { 'aria-label': `${column} comparison` }, input: { disableUnderline: true } }}
+              sx={{ minWidth: 92, '& .MuiSelect-select': { fontSize: 12.5, py: 0.5, color: 'text.secondary' } }}
+            >
+              <MenuItem value="equals">Value</MenuItem>
+              <MenuItem value="expression">Expression</MenuItem>
+              <MenuItem value="contains">Contains</MenuItem>
+              <MenuItem value="pattern">Pattern</MenuItem>
+              <MenuItem value="regex">Regex</MenuItem>
+            </TextField>
+            <IconButton size="small" aria-label="Remove column" onClick={() => onRemove(index)} sx={{ color: 'text.secondary' }}>
+              <CloseIcon sx={{ fontSize: 16 }} />
+            </IconButton>
+          </Stack>
+        ))}
+      </Stack>
+    </Stack>
+  )
+}
+
+function ErrorHelp() {
+  const [anchor, setAnchor] = useState(null)
+  return (
+    <>
+      <IconButton
+        size="small"
+        aria-label="How error checks are compared"
+        onClick={(event) => setAnchor(event.currentTarget)}
+        sx={{ color: 'text.secondary' }}
+      >
+        <HelpOutlineIcon fontSize="small" />
+      </IconButton>
+      <Popover
+        open={Boolean(anchor)}
+        anchorEl={anchor}
+        onClose={() => setAnchor(null)}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'left' }}
+        transformOrigin={{ vertical: 'top', horizontal: 'left' }}
+      >
+        <Box sx={{ width: { xs: 320, sm: 440 }, p: 2 }}>
+          <Typography variant="subtitle2" sx={{ mb: 0.75 }}>Error checks</Typography>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 1.25 }}>
+            Include a row to run it. The checkbox in a category header selects or clears every row in that category. Copy on a row applies that row’s expected values to the rest of the category.
+          </Typography>
+          <Stack spacing={1}>
+            <Box>
+              <Typography variant="body2" sx={{ fontWeight: 700 }}>Comparison</Typography>
+              <Typography variant="body2" color="text.secondary">
+                Value is an exact literal. Expression is an exact match after placeholders. Contains finds the text inside the response. Pattern uses a named regular expression from Setting. Regex accepts a pattern here.
+              </Typography>
+            </Box>
+            <Box>
+              <Typography variant="body2" sx={{ fontWeight: 700 }}>Placeholders</Typography>
+              <Typography variant="body2" color="text.secondary">
+                @{'{leaf}'} is the field name, @{'{field}'} is the full path, and @{'{name}'} is a value sent on the request. Missing field: @{'{leaf}'} becomes Missing field: reference.
+              </Typography>
+            </Box>
+            {ERROR_GROUPS.map(([id, title, detail]) => (
+              <Box key={id}>
+                <Typography variant="body2" sx={{ fontWeight: 700 }}>{title}</Typography>
+                <Typography variant="body2" color="text.secondary">{detail}</Typography>
+              </Box>
+            ))}
+          </Stack>
+        </Box>
+      </Popover>
+    </>
+  )
+}
+
+function ErrorGroupCard({ title, open, onToggle, rows, saved, onInclude, children }) {
+  const includedCount = rows.filter((row) => saved[errorCheckKey(row)]?.include !== false).length
+  const anyIncluded = includedCount > 0
+  const allIncluded = rows.length > 0 && includedCount === rows.length
+  return (
+    <Box sx={{ border: 1, borderColor: 'divider', borderRadius: 1, overflow: 'hidden' }}>
+      <Stack
+        direction="row"
+        spacing={0.75}
+        sx={{ alignItems: 'center', px: 1, py: 0.5, cursor: 'pointer', bgcolor: 'action.hover' }}
+        onClick={onToggle}
+      >
+        <ExpandMoreIcon sx={{ fontSize: 20, color: 'text.secondary', transform: open ? 'rotate(0deg)' : 'rotate(-90deg)', transition: 'transform 0.15s' }} />
+        <Typography variant="subtitle2">{title}</Typography>
+        <Typography variant="caption" color="text.secondary">
+          {includedCount === rows.length ? rows.length : `${includedCount} of ${rows.length}`}
+        </Typography>
+        <Box sx={{ flex: 1 }} />
+        <Tooltip title={anyIncluded ? 'Uncheck all' : 'Check all'}>
+          <FormControlLabel
+            sx={{ mr: 0.25, ml: 0 }}
+            onClick={(event) => event.stopPropagation()}
+            control={(
+              <Checkbox
+                size="small"
+                checked={allIncluded}
+                indeterminate={anyIncluded && !allIncluded}
+                disabled={rows.length === 0}
+                inputProps={{ 'aria-label': anyIncluded ? 'Uncheck all' : 'Check all' }}
+                onChange={() => onInclude(rows, !anyIncluded)}
+              />
+            )}
+            label={<Typography variant="caption" color="text.secondary">All</Typography>}
+          />
+        </Tooltip>
+      </Stack>
+      <Collapse in={open} unmountOnExit={false}>
+        {children}
+      </Collapse>
+    </Box>
+  )
+}
+
+function ErrorTable({ rows, columns, matches, saved, patterns, onCommit, onApply, onInclude }) {
+  return (
     <Box sx={{ overflow: 'auto' }}>
-      <Table size="small" sx={{ mt: 0.5 }}>
+      <Table size="small" stickyHeader sx={ERROR_TABLE_SX}>
         <TableHead>
           <TableRow>
-            <TableCell>Check</TableCell>
-            <TableCell sx={{ width: 108 }}>Status</TableCell>
+            <TableCell sx={{ minWidth: 220 }}>Check</TableCell>
+            <TableCell sx={{ width: 88 }}>Status</TableCell>
             {columns.map((column, index) => (
-              <TableCell key={`${column}-${index}`} sx={{ minWidth: 180 }}>
-                <Stack direction="row" spacing={0.5} sx={{ alignItems: 'center' }}>
-                  <TextField select size="small" value={column} onChange={(event) => onColumn(index, event.target.value)} sx={{ minWidth: 160, flex: 1 }}>
-                    {responseFields.map((name) => (
-                      <MenuItem key={name} value={name} disabled={columns.includes(name) && name !== column}>{name}</MenuItem>
-                    ))}
-                  </TextField>
-                  <IconButton size="small" aria-label="Remove column" onClick={() => onRemove(index)}>
-                    <CloseIcon fontSize="small" />
-                  </IconButton>
-                </Stack>
+              <TableCell key={`${column}-${index}`} sx={{ minWidth: 168 }}>
+                <Typography variant="body2" sx={{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12, color: 'text.primary', fontWeight: 500, lineHeight: 1.3 }}>
+                  {column}
+                </Typography>
+                <Typography variant="caption" color="text.secondary">{errorMatchLabel(matches[column])}</Typography>
               </TableCell>
             ))}
-            <TableCell sx={{ width: 118 }}>
-              <Button size="small" onClick={onAdd} disabled={!unused}>Add</Button>
-            </TableCell>
+            <TableCell sx={{ width: 44 }} />
           </TableRow>
         </TableHead>
         <TableBody>
           {rows.map((row) => {
             const key = errorCheckKey(row)
             const rowSaved = saved[key] || {}
+            const included = rowSaved.include !== false
             const status = rowSaved.status || String(row.expect?.status || 400)
+            const canApply = Boolean(rowSaved.status) || Object.keys(rowSaved.values || {}).length > 0
             return (
-              <TableRow key={key}>
+              <TableRow key={key} hover sx={{ opacity: included ? 1 : 0.48 }}>
                 <TableCell>
-                  <Typography variant="body2">{row.label}</Typography>
+                  <FormControlLabel
+                    sx={{ mr: 0, ml: 0, alignItems: 'center', width: '100%', '& .MuiFormControlLabel-label': { minWidth: 0, flex: 1 } }}
+                    control={(
+                      <Checkbox
+                        size="small"
+                        checked={included}
+                        inputProps={{ 'aria-label': `Include ${row.label}` }}
+                        onChange={() => onInclude([row], !included)}
+                      />
+                    )}
+                    label={<Typography variant="body2" title={row.label} sx={{ lineHeight: 1.3 }}>{row.label}</Typography>}
+                  />
                 </TableCell>
                 <TableCell>
-                  <TextField select size="small" value={status} onChange={(event) => onCommit(row, { status: event.target.value })} sx={{ width: 96 }}>
+                  <TextField select size="small" value={status} onChange={(event) => onCommit(row, { status: event.target.value })} sx={{ width: 76 }}>
                     {errorStatusOptions(status).map((code) => <MenuItem key={code} value={code}>{code}</MenuItem>)}
                   </TextField>
                 </TableCell>
                 {columns.map((column) => {
                   const values = rowSaved.values || {}
-                  const value = Object.prototype.hasOwnProperty.call(values, column) ? values[column] : errorColumnDefault(row, column)
+                  const match = errorMatchType(matches?.[column])
+                  const fallback = match === 'equals' ? errorColumnDefault(row, column) : ''
+                  const value = Object.prototype.hasOwnProperty.call(values, column) ? values[column] : fallback
                   return (
                     <TableCell key={column}>
-                      <TextField
-                        size="small"
-                        placeholder="Expected"
+                      <ErrorExpectedInput
+                        match={match}
                         value={value}
-                        onChange={(event) => onCommit(row, { column, value: event.target.value })}
-                        sx={{ width: '100%', minWidth: 120 }}
+                        patterns={patterns}
+                        ariaLabel={`${row.label} ${column}`}
+                        onChange={(next) => onCommit(row, { column, value: next })}
                       />
                     </TableCell>
                   )
                 })}
                 <TableCell>
-                  <Button
-                    size="small"
-                    color="inherit"
-                    disabled={!rowSaved.status && Object.keys(rowSaved.values || {}).length === 0}
-                    onClick={() => onApply(row)}
-                    sx={{ minWidth: 0, px: 0.5, whiteSpace: 'nowrap' }}
-                  >
-                    Use for all
-                  </Button>
+                  <Tooltip title="Copy this row to the rest of the category">
+                    <span>
+                      <IconButton
+                        size="small"
+                        color="inherit"
+                        disabled={!canApply}
+                        aria-label="Use for all"
+                        onClick={() => onApply(row)}
+                        sx={{ color: 'text.secondary' }}
+                      >
+                        <ContentCopyOutlinedIcon sx={{ fontSize: 16 }} />
+                      </IconButton>
+                    </span>
+                  </Tooltip>
                 </TableCell>
               </TableRow>
             )
@@ -2844,12 +3085,110 @@ function ErrorTable({ rows, columns, saved, responseFields, onColumn, onAdd, onR
 
 function customExpected(item, column) {
   if (item.values && Object.prototype.hasOwnProperty.call(item.values, column)) return item.values[column]
-  if (column === 'exceptions[].code') return item.code || ''
-  if (column === 'exceptions[].message') return item.message || ''
+  if (column === 'exceptions[].code' || column === 'exception[].code' || column === 'code') return item.code || ''
+  if (column === 'exceptions[].message' || column === 'exception[].message' || column === 'message') return item.message || ''
   return ''
 }
 
-function CustomErrorEditor({ fields, columns, cases, onChange }) {
+function errorMatchLabel(raw) {
+  const match = errorMatchType(raw)
+  if (match === 'expression') return 'Expression'
+  if (match === 'contains') return 'Contains'
+  if (match === 'pattern') return 'Pattern'
+  if (match === 'regex') return 'Regex'
+  return 'Value'
+}
+
+function insertPlaceholder(shown, token) {
+  if (String(shown || '').includes(token)) return shown
+  return `${shown || ''}${token}`
+}
+
+function ErrorToken({ token, onClick }) {
+  return (
+    <Box
+      component="button"
+      type="button"
+      onClick={onClick}
+      title={`Insert ${token}`}
+      sx={{
+        border: 0,
+        bgcolor: 'transparent',
+        color: 'text.secondary',
+        cursor: 'pointer',
+        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+        fontSize: 10.5,
+        lineHeight: 1.2,
+        px: 0.25,
+        '&:hover': { color: 'primary.main' },
+      }}
+    >
+      {token}
+    </Box>
+  )
+}
+
+function ErrorExpectedInput({ match, value, patterns = {}, ariaLabel, placeholder, onChange }) {
+  const names = Object.keys(patterns)
+  const shown = value == null ? '' : String(value)
+  const patternOptions = shown && match === 'pattern' && !names.includes(shown) ? [shown, ...names] : names
+  const regexIssue = match === 'regex' && shown ? compilePattern(shown).error : ''
+  if (match === 'pattern') {
+    return (
+      <TextField
+        select
+        size="small"
+        fullWidth
+        value={patternOptions.includes(shown) ? shown : ''}
+        onChange={(event) => onChange(event.target.value)}
+        slotProps={{
+          htmlInput: { 'aria-label': ariaLabel || 'Pattern', title: names.length === 0 ? 'Add named patterns in Setting.' : undefined },
+          select: { renderValue: (selected) => selected || 'Pattern' },
+        }}
+        sx={{ minWidth: 120 }}
+      >
+        <MenuItem value="">Pattern</MenuItem>
+        {patternOptions.map((name) => (
+          <MenuItem key={name} value={name}>
+            <Box sx={{ minWidth: 0 }}>
+              <Typography variant="body2">{name}</Typography>
+              {patterns[name] ? (
+                <Typography variant="caption" color="text.secondary" noWrap sx={{ display: 'block', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}>
+                  {patterns[name]}
+                </Typography>
+              ) : null}
+            </Box>
+          </MenuItem>
+        ))}
+      </TextField>
+    )
+  }
+  return (
+    <TextField
+      size="small"
+      fullWidth
+      value={shown}
+        placeholder={placeholder || (match === 'regex' || match === 'expression' ? 'Missing field: @{leaf}' : match === 'contains' ? '@{leaf}' : 'Expected')}
+      error={Boolean(regexIssue)}
+      helperText={regexIssue || undefined}
+      onChange={(event) => onChange(event.target.value)}
+      slotProps={{
+        htmlInput: { 'aria-label': ariaLabel || (match === 'regex' ? 'Regex' : match === 'expression' ? 'Expression' : 'Expected') },
+        input: match === 'expression' ? {
+          endAdornment: (
+            <InputAdornment position="end" sx={{ gap: 0, mr: -0.5 }}>
+              <ErrorToken token="@{leaf}" onClick={() => onChange(insertPlaceholder(shown, '@{leaf}'))} />
+              <ErrorToken token="@{field}" onClick={() => onChange(insertPlaceholder(shown, '@{field}'))} />
+            </InputAdornment>
+          ),
+        } : undefined,
+      }}
+      sx={{ minWidth: 120, '& input': { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12.5 } }}
+    />
+  )
+}
+
+function CustomErrorEditor({ fields, columns, matches = {}, patterns = {}, cases, open = true, onToggle, onChange }) {
   const [draft, setDraft] = useState({ name: '', status: '400', field: 'body', value: '', omit: false })
   const names = []
   for (const field of fields || []) {
@@ -2857,6 +3196,22 @@ function CustomErrorEditor({ fields, columns, cases, onChange }) {
   }
   if (!names.includes('body')) names.push('body')
   const updateCase = (id, patch) => onChange(cases.map((item) => (item.id === id ? { ...item, ...patch } : item)))
+  const includedCount = cases.filter((item) => item.include !== false).length
+  const anyIncluded = includedCount > 0
+  const allIncluded = cases.length > 0 && includedCount === cases.length
+  const setInclude = (ids, included) => {
+    const selected = new Set(ids)
+    onChange(cases.map((item) => {
+      if (!selected.has(item.id)) return item
+      if (included) {
+        if (item.include !== false) return item
+        const rest = { ...item }
+        delete rest.include
+        return rest
+      }
+      return { ...item, include: false }
+    }))
+  }
   const updateValue = (item, column, value) => {
     const values = { ...(item.values || {}) }
     if (column === 'exceptions[].code' && !item.values && item.code) values['exceptions[].code'] = item.code
@@ -2880,75 +3235,142 @@ function CustomErrorEditor({ fields, columns, cases, onChange }) {
     setDraft({ name: '', status: '400', field: draft.field, value: '', omit: false })
   }
   return (
-    <Box>
-      <Typography variant="subtitle2">Custom</Typography>
-      <Typography variant="caption" color="text.secondary">The send field is the request field this check changes. Expected values go in the response columns.</Typography>
-      {cases.length > 0 && (
-        <Box sx={{ overflow: 'auto' }}>
-          <Table size="small" sx={{ mt: 0.5 }}>
-            <TableHead>
-              <TableRow>
-                <TableCell>Check</TableCell>
-                <TableCell sx={{ width: 108 }}>Status</TableCell>
-                {columns.map((column) => <TableCell key={column}>{column}</TableCell>)}
-                <TableCell sx={{ width: 48 }} />
-              </TableRow>
-            </TableHead>
-            <TableBody>
-              {cases.map((item) => (
-                <TableRow key={item.id}>
-                  <TableCell>
-                    <Typography variant="body2">{item.name}</Typography>
-                    <Typography variant="caption" color="text.secondary">{item.omit ? `${item.field} omitted` : item.field || 'body'}</Typography>
-                  </TableCell>
-                  <TableCell>
-                    <TextField select size="small" value={item.status || '400'} onChange={(event) => updateCase(item.id, { status: event.target.value })} sx={{ width: 96 }}>
-                      {errorStatusOptions(item.status).map((code) => <MenuItem key={code} value={code}>{code}</MenuItem>)}
-                    </TextField>
-                  </TableCell>
+    <Box sx={{ border: 1, borderColor: 'divider', borderRadius: 1, overflow: 'hidden' }}>
+      <Stack
+        direction="row"
+        spacing={0.75}
+        sx={{ alignItems: 'center', px: 1, py: 0.5, cursor: 'pointer', bgcolor: 'action.hover' }}
+        onClick={onToggle}
+      >
+        <ExpandMoreIcon sx={{ fontSize: 20, color: 'text.secondary', transform: open ? 'rotate(0deg)' : 'rotate(-90deg)', transition: 'transform 0.15s' }} />
+        <Typography variant="subtitle2">Custom</Typography>
+        <Typography variant="caption" color="text.secondary">{cases.length || 'None'}</Typography>
+        <Box sx={{ flex: 1 }} />
+        {cases.length > 0 && (
+          <Tooltip title={anyIncluded ? 'Uncheck all' : 'Check all'}>
+            <FormControlLabel
+              sx={{ mr: 0.25, ml: 0 }}
+              onClick={(event) => event.stopPropagation()}
+              control={(
+                <Checkbox
+                  size="small"
+                  checked={allIncluded}
+                  indeterminate={anyIncluded && !allIncluded}
+                  inputProps={{ 'aria-label': anyIncluded ? 'Uncheck all' : 'Check all' }}
+                  onChange={() => setInclude(cases.map((item) => item.id), !anyIncluded)}
+                />
+              )}
+              label={<Typography variant="caption" color="text.secondary">All</Typography>}
+            />
+          </Tooltip>
+        )}
+      </Stack>
+      <Collapse in={open} unmountOnExit={false}>
+        {cases.length > 0 && (
+          <Box sx={{ overflow: 'auto' }}>
+            <Table size="small" stickyHeader sx={ERROR_TABLE_SX}>
+              <TableHead>
+                <TableRow>
+                  <TableCell sx={{ minWidth: 220 }}>Check</TableCell>
+                  <TableCell sx={{ width: 88 }}>Status</TableCell>
                   {columns.map((column) => (
-                    <TableCell key={column}>
-                      <TextField size="small" placeholder="Expected" value={customExpected(item, column)} onChange={(event) => updateValue(item, column, event.target.value)} sx={{ width: '100%', minWidth: 120 }} />
+                    <TableCell key={column} sx={{ minWidth: 168 }}>
+                      <Typography variant="body2" sx={{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12, color: 'text.primary', fontWeight: 500, lineHeight: 1.3 }}>
+                        {column}
+                      </Typography>
+                      <Typography variant="caption" color="text.secondary">{errorMatchLabel(matches[column])}</Typography>
                     </TableCell>
                   ))}
-                  <TableCell>
-                    <Button size="small" color="inherit" onClick={() => onChange(cases.filter((candidate) => candidate.id !== item.id))} sx={{ minWidth: 0, px: 0.5 }}>
-                      Remove
-                    </Button>
-                  </TableCell>
+                  <TableCell sx={{ width: 44 }} />
                 </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        </Box>
-      )}
-      <Stack direction={{ xs: 'column', md: 'row' }} spacing={1} useFlexGap sx={{ alignItems: { md: 'center' }, flexWrap: 'wrap', mt: 1 }}>
-        <TextField size="small" label="Name" value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} sx={{ width: 150 }} />
-        <TextField select size="small" label="Status" value={draft.status} onChange={(event) => setDraft({ ...draft, status: event.target.value })} sx={{ width: 110 }}>
-          {errorStatusOptions(draft.status).map((code) => <MenuItem key={code} value={code}>{code}</MenuItem>)}
-        </TextField>
-        <TextField select size="small" label="Send field" value={draft.field} onChange={(event) => setDraft({ ...draft, field: event.target.value, omit: false })} sx={{ width: 170 }}>
-          <MenuItem value="">Any</MenuItem>
-          {names.map((name) => <MenuItem key={name} value={name}>{name}</MenuItem>)}
-        </TextField>
-        <TextField size="small" label={draft.field === 'body' ? 'Body text' : 'Value'} value={draft.value} disabled={draft.omit && draft.field !== 'body'} onChange={(event) => setDraft({ ...draft, value: event.target.value })} sx={{ width: 160 }} />
-        {draft.field !== 'body' && draft.field !== '' && (
-          <FormControlLabel
-            control={<Checkbox size="small" checked={draft.omit} onChange={(event) => setDraft({ ...draft, omit: event.target.checked })} />}
-            label="Omit"
-          />
+              </TableHead>
+              <TableBody>
+                {cases.map((item) => (
+                  <TableRow key={item.id} hover sx={{ opacity: item.include === false ? 0.48 : 1 }}>
+                    <TableCell>
+                      <FormControlLabel
+                        sx={{ mr: 0, ml: 0, alignItems: 'flex-start', width: '100%', '& .MuiFormControlLabel-label': { minWidth: 0, flex: 1 } }}
+                        control={(
+                          <Checkbox
+                            size="small"
+                            checked={item.include !== false}
+                            inputProps={{ 'aria-label': `Include ${item.name}` }}
+                            onChange={() => setInclude([item.id], item.include === false)}
+                          />
+                        )}
+                        label={(
+                          <Box sx={{ minWidth: 0 }}>
+                            <Typography variant="body2" noWrap title={item.name}>{item.name}</Typography>
+                            <Typography variant="caption" color="text.secondary" noWrap>{item.omit ? `${item.field} omitted` : item.field || 'body'}</Typography>
+                          </Box>
+                        )}
+                      />
+                    </TableCell>
+                    <TableCell>
+                      <TextField select size="small" value={item.status || '400'} onChange={(event) => updateCase(item.id, { status: event.target.value })} sx={{ width: 76 }}>
+                        {errorStatusOptions(item.status).map((code) => <MenuItem key={code} value={code}>{code}</MenuItem>)}
+                      </TextField>
+                    </TableCell>
+                    {columns.map((column) => (
+                      <TableCell key={column}>
+                        <ErrorExpectedInput
+                          match={errorMatchType(matches[column])}
+                          value={customExpected(item, column)}
+                          patterns={patterns}
+                          ariaLabel={`${item.name} ${column}`}
+                          onChange={(next) => updateValue(item, column, next)}
+                        />
+                      </TableCell>
+                    ))}
+                    <TableCell>
+                      <Tooltip title="Remove">
+                        <IconButton size="small" aria-label="Remove" onClick={() => onChange(cases.filter((candidate) => candidate.id !== item.id))} sx={{ color: 'text.secondary' }}>
+                          <CloseIcon sx={{ fontSize: 16 }} />
+                        </IconButton>
+                      </Tooltip>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </Box>
         )}
-        <Button size="small" variant="outlined" onClick={add}>Add</Button>
-      </Stack>
+        <Stack direction="row" spacing={0.75} useFlexGap sx={{ alignItems: 'center', flexWrap: 'wrap', px: 1, py: 1, borderTop: 1, borderColor: 'divider' }}>
+          <TextField size="small" placeholder="Name" value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} sx={{ width: 140 }} />
+          <TextField select size="small" value={draft.status} onChange={(event) => setDraft({ ...draft, status: event.target.value })} sx={{ width: 88 }} slotProps={{ htmlInput: { 'aria-label': 'Status' } }}>
+            {errorStatusOptions(draft.status).map((code) => <MenuItem key={code} value={code}>{code}</MenuItem>)}
+          </TextField>
+          <TextField select size="small" value={draft.field} onChange={(event) => setDraft({ ...draft, field: event.target.value, omit: false })} sx={{ width: 150 }} slotProps={{ htmlInput: { 'aria-label': 'Send field' } }}>
+            <MenuItem value="">Any</MenuItem>
+            {names.map((name) => <MenuItem key={name} value={name}>{name}</MenuItem>)}
+          </TextField>
+          <TextField size="small" placeholder={draft.field === 'body' ? 'Body text' : 'Value'} value={draft.value} disabled={draft.omit && draft.field !== 'body'} onChange={(event) => setDraft({ ...draft, value: event.target.value })} sx={{ width: 140 }} />
+          {draft.field !== 'body' && draft.field !== '' && (
+            <FormControlLabel
+              sx={{ mr: 0, ml: 0 }}
+              control={<Checkbox size="small" checked={draft.omit} onChange={(event) => setDraft({ ...draft, omit: event.target.checked })} />}
+              label={<Typography variant="caption">Omit</Typography>}
+            />
+          )}
+          <Button size="small" variant="outlined" onClick={add}>Add</Button>
+        </Stack>
+      </Collapse>
     </Box>
   )
 }
 
-function CustomExpected({ responses, status, fields, onChange }) {
+function CustomExpected({ responses, status, fields, patterns = {}, onChange }) {
   const { content, error, objectArrays } = customResponseFields(responses)
   const used = new Set(fields.map((field) => field.path))
   const next = nextCustomField(used, content, error, status)
-  const write = (index, patch) => onChange(fields.map((field, fieldIndex) => (fieldIndex === index ? { ...field, ...patch } : field)))
+  const write = (index, patch) => onChange(fields.map((field, fieldIndex) => {
+    if (fieldIndex !== index) return field
+    const nextField = { ...field, ...patch }
+    if (errorMatchType(nextField.match) === 'equals') delete nextField.match
+    else nextField.match = errorMatchType(nextField.match)
+    if (!nextField.ordered) delete nextField.ordered
+    return nextField
+  }))
   const optionsFor = (current) => {
     const known = new Set([...content, ...error])
     const extra = current && !known.has(current) ? [current] : []
@@ -2958,7 +3380,7 @@ function CustomExpected({ responses, status, fields, onChange }) {
     <Box>
       <Typography variant="subtitle2">Expected response</Typography>
       <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 0.75 }}>
-        Add a field from the error, such as exceptions[].code, or from the content that comes back. {'@{name}'} is the value sent for that request field. Several exceptions[] fields must match the same exception. A field you leave out is compared with the same request field when that value was sent.
+        Each row is a response field and how it is compared. Value is exact. Expression fills @{'{ }'} then matches exactly — Missing field: @{'{leaf}'} uses the omitted request field. Contains finds the text. Pattern uses a named regular expression from Setting. Regex accepts a pattern here. Several exceptions[] fields must match the same exception.
       </Typography>
       {fields.length > 0 && (
         <Box sx={{ overflow: 'auto', border: 1, borderColor: 'divider', borderRadius: 1 }}>
@@ -2966,17 +3388,19 @@ function CustomExpected({ responses, status, fields, onChange }) {
             <TableHead>
               <TableRow>
                 <TableCell sx={{ width: 220 }}>Response field</TableCell>
+                <TableCell sx={{ width: 128 }}>Compare</TableCell>
                 <TableCell>Expected</TableCell>
-                <TableCell sx={{ width: 72 }} />
+                <TableCell sx={{ width: 44 }} />
               </TableRow>
             </TableHead>
             <TableBody>
               {fields.map((field, index) => {
                 const options = optionsFor(field.path)
                 const objectArray = objectArrays.has(field.path)
+                const match = objectArray ? 'equals' : errorMatchType(field.match)
                 const arrayError = objectArray ? parseObjectArray(field.equals)?.error : ''
                 return (
-                  <TableRow key={`${field.path}-${index}`}>
+                  <TableRow key={`${field.path}-${index}`} hover>
                     <TableCell>
                       <TextField select size="small" value={field.path} onChange={(event) => write(index, { path: event.target.value })} sx={{ width: '100%', minWidth: 180 }}>
                         {options.content.length > 0 && <ListSubheader>Returned content</ListSubheader>}
@@ -2990,19 +3414,50 @@ function CustomExpected({ responses, status, fields, onChange }) {
                       </TextField>
                     </TableCell>
                     <TableCell>
-                      <Stack spacing={0.25}>
+                      {objectArray ? (
+                        <Typography variant="body2" color="text.secondary">Value</Typography>
+                      ) : (
                         <TextField
+                          select
                           size="small"
-                          fullWidth
-                          multiline={objectArray}
-                          minRows={objectArray ? 2 : undefined}
-                          placeholder={objectArray ? '[{"field":"quantity"}]' : '@{name}'}
-                          value={field.equals || ''}
-                          error={Boolean(arrayError)}
-                          helperText={arrayError || undefined}
-                          onChange={(event) => write(index, { equals: event.target.value })}
-                          sx={{ '& input, & textarea': { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12.5 } }}
-                        />
+                          value={match}
+                          onChange={(event) => write(index, { match: event.target.value })}
+                          slotProps={{ htmlInput: { 'aria-label': `${field.path} comparison` } }}
+                          sx={{ width: 118 }}
+                        >
+                          <MenuItem value="equals">Value</MenuItem>
+                          <MenuItem value="expression">Expression</MenuItem>
+                          <MenuItem value="contains">Contains</MenuItem>
+                          <MenuItem value="pattern">Pattern</MenuItem>
+                          <MenuItem value="regex">Regex</MenuItem>
+                        </TextField>
+                      )}
+                    </TableCell>
+                    <TableCell>
+                      <Stack spacing={0.25}>
+                        {objectArray ? (
+                          <TextField
+                            size="small"
+                            fullWidth
+                            multiline
+                            minRows={2}
+                            placeholder='[{"field":"quantity"}]'
+                            value={field.equals || ''}
+                            error={Boolean(arrayError)}
+                            helperText={arrayError || undefined}
+                            onChange={(event) => write(index, { equals: event.target.value })}
+                            sx={{ '& textarea': { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12.5 } }}
+                          />
+                        ) : (
+                          <ErrorExpectedInput
+                            match={match}
+                            value={field.equals || ''}
+                            patterns={patterns}
+                            placeholder={match === 'equals' ? '@{name}' : undefined}
+                            ariaLabel={`${field.path} expected`}
+                            onChange={(equals) => write(index, { equals })}
+                          />
+                        )}
                         {objectArray && (
                           <FormControlLabel
                             control={<Checkbox size="small" checked={Boolean(field.ordered)} onChange={(event) => write(index, { ordered: event.target.checked || undefined })} />}
@@ -3013,9 +3468,11 @@ function CustomExpected({ responses, status, fields, onChange }) {
                       </Stack>
                     </TableCell>
                     <TableCell>
-                      <Button size="small" color="inherit" onClick={() => onChange(fields.filter((_, fieldIndex) => fieldIndex !== index))} sx={{ minWidth: 0, px: 0.5 }}>
-                        Remove
-                      </Button>
+                      <Tooltip title="Remove">
+                        <IconButton size="small" aria-label="Remove" onClick={() => onChange(fields.filter((_, fieldIndex) => fieldIndex !== index))} sx={{ color: 'text.secondary' }}>
+                          <CloseIcon sx={{ fontSize: 16 }} />
+                        </IconButton>
+                      </Tooltip>
                     </TableCell>
                   </TableRow>
                 )
@@ -3278,6 +3735,7 @@ function CustomCases({ operation, fields, defaults, exclusive = [], responses = 
               responses={responses}
               status={active.expect?.status || ''}
               fields={active.expect?.fields || []}
+              patterns={defaults.patterns || {}}
               onChange={(next) => update({ expect: { ...active.expect, fields: next } })}
             />
           </Stack>

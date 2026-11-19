@@ -22,7 +22,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @AutoConfigureMockMvc
 class ShipmentApiTest {
 
-    private static final String VALID_SHIPMENT = """
+    private static final String VALID_DATA = """
             {
               "reference": "SHP-1001",
               "recipient": "Ada Lovelace",
@@ -49,54 +49,64 @@ class ShipmentApiTest {
     void createsReadsUpdatesAndDeletesAShipmentByPost() throws Exception {
         MvcResult created = mockMvc.perform(post("/api/shipments/createShipment")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content(VALID_SHIPMENT))
+                        .content(call(VALID_DATA)))
                 .andExpect(status().isCreated())
-                .andExpect(jsonPath("$.reference").value("SHP-1001"))
-                .andExpect(jsonPath("$.destination").value("HK"))
-                .andExpect(jsonPath("$.insured").value(true))
+                .andExpect(jsonPath("$.userId").value("user-ada"))
+                .andExpect(jsonPath("$.code").value("0"))
+                .andExpect(jsonPath("$.message").value(""))
+                .andExpect(jsonPath("$.exception").isEmpty())
+                .andExpect(jsonPath("$.data.reference").value("SHP-1001"))
+                .andExpect(jsonPath("$.data.destination").value("HK"))
+                .andExpect(jsonPath("$.data.insured").value(true))
                 .andReturn();
-        Number id = JsonPath.read(created.getResponse().getContentAsString(), "$.id");
+        Number id = JsonPath.read(created.getResponse().getContentAsString(), "$.data.id");
 
         mockMvc.perform(post("/api/shipments/getShipment")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"id\":" + id + "}"))
+                        .content(call("{\"id\":" + id + "}")))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.recipient").value("Ada Lovelace"));
+                .andExpect(jsonPath("$.code").value("0"))
+                .andExpect(jsonPath("$.data.recipient").value("Ada Lovelace"));
 
         mockMvc.perform(post("/api/shipments/queryShipments")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"nextCursor\":\"0\",\"size\":20,\"reference\":\"SHP\"}"))
+                        .content(call("{\"nextCursor\":\"0\",\"size\":20,\"reference\":\"SHP\"}")))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.content[0].id").value(id))
-                .andExpect(jsonPath("$.totalSize").value(1))
-                .andExpect(jsonPath("$.nextCursor").value("0"))
-                .andExpect(jsonPath("$.totalElements").doesNotExist());
+                .andExpect(jsonPath("$.data.content[0].id").value(id))
+                .andExpect(jsonPath("$.data.totalSize").value(1))
+                .andExpect(jsonPath("$.data.nextCursor").value("0"))
+                .andExpect(jsonPath("$.data.totalElements").doesNotExist());
 
-        String updated = VALID_SHIPMENT.replace("\"status\": \"DRAFT\"", "\"status\": \"BOOKED\"");
+        String updated = VALID_DATA.replace("\"status\": \"DRAFT\"", "\"status\": \"BOOKED\"");
         mockMvc.perform(post("/api/shipments/updateShipment")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content(updated.replaceFirst("\\{", "{\"id\":" + id + ",")))
+                        .content(call(updated.replaceFirst("\\{", "{\"id\":" + id + ","))))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.status").value("BOOKED"));
+                .andExpect(jsonPath("$.data.status").value("BOOKED"));
 
         mockMvc.perform(post("/api/shipments/deleteShipment")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"id\":" + id + "}"))
-                .andExpect(status().isNoContent());
+                        .content(call("{\"id\":" + id + "}")))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value("0"))
+                .andExpect(jsonPath("$.data.id").value(id));
 
         mockMvc.perform(post("/api/shipments/getShipment")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"id\":" + id + "}"))
+                        .content(call("{\"id\":" + id + "}")))
                 .andExpect(status().isNotFound())
-                .andExpect(jsonPath("$.exceptions[0].field").value("id"))
-                .andExpect(jsonPath("$.exceptions[0].code").value("NotFound"));
+                .andExpect(jsonPath("$.code").value("ERR004"))
+                .andExpect(jsonPath("$.message").value("Not found"))
+                .andExpect(jsonPath("$.exception[0].type").value("E"))
+                .andExpect(jsonPath("$.exception[0].code").value("ERR004"))
+                .andExpect(jsonPath("$.exception[0].message").value("Not found: id"));
     }
 
     @Test
     void storesDateTimeAndEmptyPackaging() throws Exception {
         mockMvc.perform(post("/api/shipments/createShipment")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("""
+                        .content(call("""
                                 {
                                   "reference": "SHP-2002",
                                   "recipient": "Ada Lovelace",
@@ -110,43 +120,89 @@ class ShipmentApiTest {
                                   "bookedAt": "2026-03-01T10:15:30Z",
                                   "packaging": {}
                                 }
-                                """))
+                                """)))
                 .andExpect(status().isCreated())
-                .andExpect(jsonPath("$.readyDate").value("2026-03-01"))
-                .andExpect(jsonPath("$.cutoffTime").value("18:30:00"))
-                .andExpect(jsonPath("$.bookedAt").value("2026-03-01T10:15:30Z"))
-                .andExpect(jsonPath("$.packaging").isMap())
-                .andExpect(jsonPath("$.packaging").isEmpty());
+                .andExpect(jsonPath("$.data.readyDate").value("2026-03-01"))
+                .andExpect(jsonPath("$.data.cutoffTime").value("18:30:00"))
+                .andExpect(jsonPath("$.data.bookedAt").value("2026-03-01T10:15:30Z"))
+                .andExpect(jsonPath("$.data.packaging").isMap())
+                .andExpect(jsonPath("$.data.packaging").isEmpty());
     }
 
     @Test
     void queryPagesWithHashedCursorAndPageSize() throws Exception {
         mockMvc.perform(post("/api/shipments/createShipment")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content(VALID_SHIPMENT))
+                        .content(call(VALID_DATA)))
                 .andExpect(status().isCreated());
         mockMvc.perform(post("/api/shipments/createShipment")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content(VALID_SHIPMENT.replace("SHP-1001", "SHP-1002")))
+                        .content(call(VALID_DATA.replace("SHP-1001", "SHP-1002"))))
                 .andExpect(status().isCreated());
 
         MvcResult first = mockMvc.perform(post("/api/shipments/queryShipments")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"nextCursor\":\"0\",\"size\":1}"))
+                        .content(call("{\"nextCursor\":\"0\",\"size\":1}")))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.content.length()").value(1))
-                .andExpect(jsonPath("$.totalSize").value(1))
-                .andExpect(jsonPath("$.nextCursor").value(not("0")))
+                .andExpect(jsonPath("$.data.content.length()").value(1))
+                .andExpect(jsonPath("$.data.totalSize").value(1))
+                .andExpect(jsonPath("$.data.nextCursor").value(not("0")))
                 .andReturn();
-        String next = JsonPath.read(first.getResponse().getContentAsString(), "$.nextCursor");
+        String next = JsonPath.read(first.getResponse().getContentAsString(), "$.data.nextCursor");
 
         mockMvc.perform(post("/api/shipments/queryShipments")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"nextCursor\":\"" + next + "\",\"size\":1}"))
+                        .content(call("{\"nextCursor\":\"" + next + "\",\"size\":1}")))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.content.length()").value(1))
-                .andExpect(jsonPath("$.totalSize").value(1))
-                .andExpect(jsonPath("$.nextCursor").value("0"));
+                .andExpect(jsonPath("$.data.content.length()").value(1))
+                .andExpect(jsonPath("$.data.totalSize").value(1))
+                .andExpect(jsonPath("$.data.nextCursor").value("0"));
+    }
+
+    @Test
+    void reportsMissingAndInvalidFieldsInTheEnvelope() throws Exception {
+        mockMvc.perform(post("/api/shipments/createShipment")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {
+                                  "userId": "user-ada",
+                                  "data": {
+                                    "reference": "SHP-1001",
+                                    "recipient": "Ada Lovelace",
+                                    "destination": "HK",
+                                    "weightKg": "heavy",
+                                    "priority": "NORMAL",
+                                    "status": "DRAFT",
+                                    "insured": true
+                                  }
+                                }
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("ERR002"))
+                .andExpect(jsonPath("$.message").value("Schema validation error"))
+                .andExpect(jsonPath("$.exception[0].type").value("E"))
+                .andExpect(jsonPath("$.exception[0].code").value("ERR002"))
+                .andExpect(jsonPath("$.exception[0].message").value("Invalid data type: weightKg"));
+
+        mockMvc.perform(post("/api/shipments/createShipment")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {
+                                  "userId": "user-ada",
+                                  "data": {
+                                    "recipient": "Ada Lovelace",
+                                    "destination": "HK",
+                                    "weightKg": 1.25,
+                                    "priority": "NORMAL",
+                                    "status": "DRAFT",
+                                    "insured": true
+                                  }
+                                }
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.userId").value("user-ada"))
+                .andExpect(jsonPath("$.code").value("ERR001"))
+                .andExpect(jsonPath("$.exception[0].message").value("Missing field: reference"));
     }
 
     @Test
@@ -167,6 +223,14 @@ class ShipmentApiTest {
                 .andExpect(jsonPath("$.components.schemas.ShipmentRequest.properties.cutoffTime").exists())
                 .andExpect(jsonPath("$.components.schemas.ShipmentRequest.properties.bookedAt").exists())
                 .andExpect(jsonPath("$.components.schemas.ShipmentRequest.properties.packaging").exists())
+                .andExpect(jsonPath("$.components.schemas.CreateCall.properties.userId").exists())
+                .andExpect(jsonPath("$.components.schemas.CreateCall.properties.data").exists())
+                .andExpect(jsonPath("$.components.schemas.ItemReply.properties.code").exists())
+                .andExpect(jsonPath("$.components.schemas.ItemReply.properties.exception").exists())
                 .andExpect(jsonPath("$.components.schemas.ShipmentId.required", hasItem("id")));
+    }
+
+    private static String call(String data) {
+        return "{\"userId\":\"user-ada\",\"data\":" + data + "}";
     }
 }

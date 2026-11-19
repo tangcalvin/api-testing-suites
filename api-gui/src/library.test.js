@@ -103,6 +103,18 @@ test('defaults and custom cases import as separate files', () => {
   assert.deepEqual(saved.omit, ['notes'])
   assert.equal(saved.expect.status, '201')
   assert.equal(saved.expect.fields.length, 1)
+  const withCustomMatch = parseCases(JSON.stringify({
+    kind: 'cases',
+    operations: {
+      'POST /api/orders': [{
+        name: 'Missing',
+        omit: ['customerEmail'],
+        expect: { status: '400', fields: [{ path: 'exceptions[].message', equals: 'Missing field: @{leaf}', match: 'expression' }] },
+      }],
+    },
+  }))
+  assert.equal(withCustomMatch.operations['POST /api/orders'][0].expect.fields[0].match, 'expression')
+  assert.equal(casesDocument(withCustomMatch).operations['POST /api/orders'][0].expect.fields[0].match, 'expression')
   const withExclusions = parseCases(JSON.stringify({
     kind: 'cases',
     operations: {},
@@ -175,6 +187,36 @@ test('defaults and custom cases import as separate files', () => {
   assert.equal(withChecks.checks['GET /api/orders'].rows['disallowed:status is not an allowed value'].status, '422')
   assert.equal(withChecks.errors['GET /api/orders'][0].message, 'no @{field}')
   assert.equal(casesDocument(withChecks).checks['GET /api/orders'].columns[1], 'exceptions[].message')
+  const withMatches = parseCases(JSON.stringify({
+    kind: 'cases',
+    operations: {},
+    checks: { 'POST /api/shipments/createShipment': { columns: ['exception[].code', 'exception[].message'], matches: { 'exception[].message': 'contains', 'exception[].code': 'equals' }, rows: { 'missing:omit reference': { values: { 'exception[].message': '@{leaf}' } } } } },
+  }))
+  assert.equal(withMatches.checks['POST /api/shipments/createShipment'].matches['exception[].message'], 'contains')
+  assert.equal(withMatches.checks['POST /api/shipments/createShipment'].matches['exception[].code'], undefined)
+  assert.equal(casesDocument(withMatches).checks['POST /api/shipments/createShipment'].matches['exception[].message'], 'contains')
+  const withExpression = parseCases(JSON.stringify({
+    kind: 'cases',
+    operations: {},
+    checks: { 'POST /api/shipments/createShipment': { columns: ['exception[].message'], matches: { 'exception[].message': 'expression' }, rows: { 'missing:omit reference': { values: { 'exception[].message': 'Missing field: @{leaf}' } } } } },
+  }))
+  assert.equal(withExpression.checks['POST /api/shipments/createShipment'].matches['exception[].message'], 'expression')
+  assert.equal(casesDocument(withExpression).checks['POST /api/shipments/createShipment'].matches['exception[].message'], 'expression')
+  const withSkipped = parseCases(JSON.stringify({
+    kind: 'cases',
+    operations: {},
+    checks: { 'GET /api/orders': { columns: ['exceptions[].code'], rows: { 'missing:omit status': { include: false } } } },
+    errors: { 'GET /api/orders': [{ name: 'Skip', include: false, status: '404', field: 'id' }] },
+  }))
+  assert.equal(withSkipped.checks['GET /api/orders'].rows['missing:omit status'].include, false)
+  assert.equal(withSkipped.errors['GET /api/orders'][0].include, false)
+  assert.equal(casesDocument(withSkipped).checks['GET /api/orders'].rows['missing:omit status'].include, false)
+  assert.equal(casesDocument(withSkipped).errors['GET /api/orders'][0].include, false)
+  assert.equal(parseCases(JSON.stringify({
+    kind: 'cases',
+    operations: {},
+    errors: { 'GET /api/orders': [{ name: 'Keep', include: true, status: '400' }] },
+  })).errors['GET /api/orders'][0].include, undefined)
   const withSteps = parseCases(JSON.stringify({
     kind: 'cases',
     operations: {},

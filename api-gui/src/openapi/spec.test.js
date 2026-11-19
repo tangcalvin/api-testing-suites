@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { OMIT, OBJECT_COMPOSITE, OBJECT_FIELDS, applyPaging, collectPaging, individualChoices, buildIndividualCases, applyErrorOverrides, applyErrorRowToGroup, assignFixture, buildCases, buildCustomCases, buildCustomErrorCases, buildErrorCases, buildTrialCases, caseCount, combinationObjectMode, compilePattern, compositeField, detectPagination, enquiryShouldMiss, enquiryTarget, fillRunRequests, firstPageQuery, fixtureEnabled, fixtureNote, fixturePlan, fixtureRequest, fixtureSteps, judge, listOperations, operationGroups, operationRole, parseSpecText, planContinuation, readCreatedId, readItems, recordId, detectPayloadId, idNameRank, resolvedId, readExpectation, responseChecks, responseViews, responsesForMode, sampleCall, scalarCombinationField, specGaps, storedExpectation, textCombinationField, underComposite, viewsWithStatuses, withFixtureId, withTextCombinationValues } from './spec.js'
+import { OMIT, OBJECT_COMPOSITE, OBJECT_FIELDS, applyPaging, collectPaging, individualChoices, buildIndividualCases, applyErrorOverrides, applyErrorInclude, applyErrorRowToGroup, assignFixture, buildCases, buildCustomCases, buildCustomErrorCases, buildErrorCases, buildTrialCases, caseCount, combinationObjectMode, compilePattern, compositeField, detectPagination, enquiryShouldMiss, enquiryTarget, fillRunRequests, firstPageQuery, fixtureEnabled, fixtureNote, fixturePlan, fixtureRequest, fixtureSteps, includedErrorCases, judge, listOperations, operationGroups, operationRole, parseSpecText, planContinuation, readCreatedId, readItems, recordId, detectPayloadId, idNameRank, resolvedId, readExpectation, responseChecks, responseViews, responsesForMode, sampleCall, scalarCombinationField, specGaps, storedExpectation, textCombinationField, underComposite, viewsWithStatuses, withFixtureId, withTextCombinationValues } from './spec.js'
 import { resolvePagination, storedPaging } from './pagination.js'
 
 const SPEC = `
@@ -297,6 +297,57 @@ paths:
   assert.equal(paged.body.size, 20)
   assert.equal(paged.body.reference, 'SHP')
   assert.equal(paged.query.nextCursor, undefined)
+
+  const wrapped = listOperations(parseSpecText(`
+openapi: 3.1.0
+paths:
+  /api/shipments/queryShipments:
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                userId: { type: string }
+                data:
+                  type: object
+                  properties:
+                    nextCursor: { type: string, default: "0", example: "0" }
+                    size: { type: integer }
+                    reference: { type: string }
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  userId: { type: string }
+                  code: { type: string }
+                  data:
+                    type: object
+                    properties:
+                      content: { type: array, items: { type: object } }
+                      nextCursor: { type: string }
+                      totalSize: { type: integer }
+`))[0]
+  assert.equal(wrapped.pagination.style, 'cursor')
+  assert.equal(wrapped.pagination.request.cursor, 'data.nextCursor')
+  assert.equal(wrapped.pagination.request.size, 'data.size')
+  assert.deepEqual(wrapped.pagination.response.items, ['data', 'content'])
+  assert.deepEqual(wrapped.pagination.response.nextCursor, ['data', 'nextCursor'])
+  assert.deepEqual(wrapped.pagination.response.size, ['data', 'totalSize'])
+  const nested = applyPaging(
+    { query: {}, body: { userId: 'user-ada', data: { reference: 'SHP', size: 20 } } },
+    wrapped.pagination,
+    firstPageQuery(wrapped.pagination, collectPaging({ query: {}, body: { userId: 'user-ada', data: { reference: 'SHP', size: 20 } } }, wrapped.pagination)),
+    wrapped.fields,
+  )
+  assert.equal(nested.body.userId, 'user-ada')
+  assert.equal(nested.body.data.nextCursor, '0')
+  assert.equal(nested.body.data.size, 20)
+  assert.equal(nested.body.data.reference, 'SHP')
 })
 
 test('a composite body field is sent as one nested object', () => {
@@ -1185,6 +1236,99 @@ test('an expected value can be copied to the rest of its category', () => {
   assert.equal(next['missing:omit quantity'], undefined)
 })
 
+test('error checks can be left out and restored as a group', () => {
+  const rows = [
+    { group: 'disallowed', label: 'quantity is null' },
+    { group: 'disallowed', label: 'customerEmail is null' },
+    { group: 'missing', label: 'omit quantity' },
+  ]
+  const saved = {
+    'disallowed:quantity is null': { status: '422', include: false },
+    'disallowed:customerEmail is null': { values: { 'exceptions[].code': 'Size' } },
+  }
+  const copied = applyErrorRowToGroup(saved, rows, rows[1])
+  assert.equal(copied['disallowed:quantity is null'].include, false)
+  assert.equal(copied['disallowed:quantity is null'].values['exceptions[].code'], 'Size')
+  const cleared = applyErrorInclude(saved, rows.filter((item) => item.group === 'disallowed'), false)
+  assert.equal(cleared['disallowed:quantity is null'].include, false)
+  assert.equal(cleared['disallowed:customerEmail is null'].include, false)
+  assert.equal(cleared['missing:omit quantity'], undefined)
+  const restored = applyErrorInclude(cleared, rows.filter((item) => item.group === 'disallowed'), true)
+  assert.equal(restored['disallowed:quantity is null'].status, '422')
+  assert.equal(restored['disallowed:quantity is null'].include, undefined)
+  assert.equal(restored['disallowed:customerEmail is null'].include, undefined)
+  const cases = [
+    { group: 'disallowed', label: 'quantity is null', expect: { outcome: 'error' } },
+    { group: 'custom', label: 'Missing order', include: false, expect: { outcome: 'error' } },
+    { group: 'custom', label: 'Conflict', include: true, expect: { outcome: 'error' } },
+  ]
+  const selected = includedErrorCases(cases, { rows: { 'disallowed:quantity is null': { include: false } } })
+  assert.deepEqual(selected.map((item) => item.label), ['Conflict'])
+  const custom = buildCustomErrorCases([{ name: 'status', location: 'body', type: 'string', sample: 'DRAFT', values: [], constraints: {} }], [
+    { name: 'Skip me', include: false, field: 'status', value: 'NOPE', status: '409' },
+  ])
+  assert.equal(custom[0].include, false)
+  assert.equal(includedErrorCases(custom).length, 0)
+})
+
+test('error columns can compare messages with contains, regex, and @{leaf}', () => {
+  const [item] = applyErrorOverrides([{
+    group: 'missing',
+    label: 'omit reference',
+    expect: { outcome: 'error', status: 400, field: 'data.reference', code: 'ERR001' },
+  }], {
+    columns: ['exception[].code', 'exception[].message'],
+    matches: { 'exception[].message': 'contains' },
+    rows: { 'missing:omit reference': { values: { 'exception[].message': '@{leaf}' } } },
+  })
+  assert.equal(item.expect.values['exception[].code'], 'ERR001')
+  assert.equal(item.expect.values['exception[].message'].match, 'contains')
+  assert.equal(item.expect.values['exception[].message'].value, '@{leaf}')
+  const body = JSON.stringify({
+    code: 'ERR001',
+    message: 'Schema validation error',
+    exception: [{ type: 'E', code: 'ERR001', message: 'Missing field: reference' }],
+  })
+  assert.equal(judge(item.expect, 400, body).passed, true)
+  const otherField = JSON.stringify({
+    code: 'ERR001',
+    exception: [{ type: 'E', code: 'ERR001', message: 'Missing field: weightKg' }],
+  })
+  assert.equal(judge(item.expect, 400, otherField).passed, false)
+  const regex = {
+    outcome: 'error',
+    status: 400,
+    subject: 'data.reference',
+    values: { 'exception[].message': { regex: '^Missing field: @{leaf}$' } },
+  }
+  assert.equal(judge(regex, 400, body).passed, true)
+  const named = {
+    outcome: 'error',
+    status: 400,
+    subject: 'data.reference',
+    values: { 'exception[].message': { pattern: 'missing-field' } },
+  }
+  assert.equal(judge(named, 400, body, { patterns: { 'missing-field': 'Missing field: @{leaf}' } }).passed, true)
+  assert.equal(readExpectation({ match: 'contains', value: '@{leaf}' }).match, 'contains')
+  assert.equal(storedExpectation({ match: 'contains', text: '@{leaf}' }).match, 'contains')
+  const [exact] = applyErrorOverrides([{
+    group: 'missing',
+    label: 'omit reference',
+    expect: { outcome: 'error', status: 400, field: 'data.reference', code: 'ERR001' },
+  }], {
+    columns: ['exception[].message'],
+    matches: { 'exception[].message': 'expression' },
+    rows: { 'missing:omit reference': { values: { 'exception[].message': 'Missing field: @{leaf}' } } },
+  })
+  assert.equal(exact.expect.values['exception[].message'].match, 'expression')
+  assert.equal(judge(exact.expect, 400, body).passed, true)
+  const extra = JSON.stringify({
+    exception: [{ type: 'E', code: 'ERR001', message: 'Missing field: reference (required)' }],
+  })
+  assert.equal(judge(exact.expect, 400, extra).passed, false)
+  assert.equal(readExpectation({ match: 'expression', value: 'Missing field: @{leaf}' }).match, 'expression')
+})
+
 const LIST_BOUNDS = `
 openapi: 3.1.0
 paths:
@@ -1771,6 +1915,31 @@ test('a custom case checks its own error code and returned content', () => {
     '{"content":[{"orderNumber":"ORD-1","status":"DRAFT"}]}',
   )
   assert.equal(listed.passed, true)
+
+  const body = JSON.stringify({ exception: [{ type: 'E', code: 'ERR001', message: 'Missing field: reference' }] })
+  const exact = {
+    outcome: 'custom',
+    status: '400',
+    omit: ['data.reference'],
+    fields: [{ path: 'exception[].message', equals: 'Missing field: @{leaf}', match: 'expression' }],
+  }
+  assert.equal(judge(exact, 400, body).passed, true)
+  const extra = JSON.stringify({ exception: [{ type: 'E', code: 'ERR001', message: 'Missing field: reference (required)' }] })
+  assert.equal(judge(exact, 400, extra).passed, false)
+  const contains = {
+    outcome: 'custom',
+    status: '400',
+    omit: ['data.reference'],
+    fields: [{ path: 'exception[].message', equals: '@{leaf}', match: 'contains' }],
+  }
+  assert.equal(judge(contains, 400, extra).passed, true)
+  const regex = {
+    outcome: 'custom',
+    status: '400',
+    omit: ['data.reference'],
+    fields: [{ path: 'exception[].message', equals: '^Missing field: @{leaf}$', match: 'regex' }],
+  }
+  assert.equal(judge(regex, 400, body).passed, true)
 })
 
 test('an array of objects matches each listed object', () => {
@@ -2072,7 +2241,8 @@ test('a payload id accepts names such as instructionNumber and can be changed', 
   assert.equal(idNameRank('paid'), null)
   assert.equal(idNameRank('number'), null)
   assert.equal(idNameRank('piano'), null)
-  assert.equal(idNameRank('delivery.instructionNumber'), null)
+  assert.equal(idNameRank('delivery.instructionNumber'), 3)
+  assert.equal(idNameRank('data.id'), 0)
 
   const read = {
     role: 'read',
@@ -2116,6 +2286,19 @@ test('a payload id accepts names such as instructionNumber and can be changed', 
   }
   assert.equal(resolvedId(pathOp, 'other').source, 'path')
   assert.equal(detectPayloadId(pathOp), null)
+
+  const wrapped = {
+    role: 'read',
+    method: 'POST',
+    path: '/api/shipments/getShipment',
+    fields: [
+      { name: 'userId', location: 'body', type: 'string', required: true },
+      { name: 'data', location: 'body', type: 'object', required: true },
+      { name: 'data.id', location: 'body', type: 'integer', required: true },
+    ],
+  }
+  assert.equal(detectPayloadId(wrapped).name, 'data.id')
+  assert.equal(readCreatedId(201, JSON.stringify({ userId: 'user-ada', code: '0', data: { id: 42, reference: 'SHP-1' } })), 42)
 })
 
 test('an all-POST read, update, or delete can create and remove the record around the run', () => {

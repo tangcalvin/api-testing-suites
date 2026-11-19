@@ -381,6 +381,23 @@ function trialMaps(source) {
 }
 
 const FILTER_MODES = new Set(['equals', 'equalsIgnoreCase', 'contains', 'starts', 'ends', 'minimum', 'maximum', 'greater', 'less', 'in', 'not', 'empty', 'present', 'compare', 'bounds', 'skip'])
+const EXPECT_MATCHES = new Set(['contains', 'pattern', 'regex', 'expression'])
+
+function expectedMatch(raw) {
+  const match = String(raw || '').trim()
+  return EXPECT_MATCHES.has(match) ? match : ''
+}
+
+function normalizeExpectedField(field) {
+  if (!field || typeof field.path !== 'string' || !field.path.trim()) return null
+  const match = expectedMatch(field.match)
+  return {
+    path: field.path.trim(),
+    equals: field.equals === undefined || field.equals === null ? '' : String(field.equals),
+    ...(match ? { match } : {}),
+    ...(field.ordered ? { ordered: true } : {}),
+  }
+}
 
 function filterMaps(source) {
   const filters = {}
@@ -441,14 +458,7 @@ function normalizeScenarioStep(item) {
       path: typeof entry.path === 'string' ? entry.path : '',
     })
   }
-  const fields = (Array.isArray(item.expect?.fields) ? item.expect.fields : []).map((field) => {
-    if (!field || typeof field.path !== 'string' || !field.path.trim()) return null
-    return {
-      path: field.path.trim(),
-      equals: field.equals == null ? '' : String(field.equals),
-      ...(field.ordered ? { ordered: true } : {}),
-    }
-  }).filter(Boolean)
+  const fields = (Array.isArray(item.expect?.fields) ? item.expect.fields : []).map(normalizeExpectedField).filter(Boolean)
   return {
     id: typeof item.id === 'string' && item.id ? item.id : newId(),
     operationId: typeof item.operationId === 'string' ? item.operationId : '',
@@ -518,6 +528,7 @@ function normalizeErrorCase(item) {
     values: errorValueMap(item.values),
     value: item.value === undefined || item.value === null ? '' : String(item.value),
     omit: Boolean(item.omit),
+    ...(item.include === false ? { include: false } : {}),
   }
 }
 
@@ -552,16 +563,24 @@ function normalizeErrorChecks(item) {
     const next = normalizeErrorRow(row)
     if (next) rows[key] = next
   }
-  if (columns.length === 0 && Object.keys(rows).length === 0 && !Array.isArray(item.columns)) return null
-  return { columns, rows }
+  const matches = {}
+  const sourceMatches = item.matches && typeof item.matches === 'object' && !Array.isArray(item.matches) ? item.matches : {}
+  for (const [path, raw] of Object.entries(sourceMatches)) {
+    const match = String(raw || '').trim()
+    if (match === 'contains' || match === 'pattern' || match === 'regex' || match === 'expression') matches[path] = match
+  }
+  if (columns.length === 0 && Object.keys(rows).length === 0 && Object.keys(matches).length === 0 && !Array.isArray(item.columns)) return null
+  return { columns, rows, ...(Object.keys(matches).length > 0 ? { matches } : {}) }
 }
 
 function normalizeErrorRow(row) {
   if (!row || typeof row !== 'object' || Array.isArray(row)) return null
   const status = row.status === undefined || row.status === null ? '' : String(row.status).replace(/\D/g, '').slice(0, 3)
   const values = errorValueMap(row.values)
-  if (!status && Object.keys(values).length === 0) return null
-  return { ...(status ? { status } : {}), values }
+  const include = row.include === false
+  if (!status && Object.keys(values).length === 0 && !include) return null
+  if (include && !status && Object.keys(values).length === 0) return { include: false }
+  return { ...(status ? { status } : {}), values, ...(include ? { include: false } : {}) }
 }
 
 function varyMaps(source) {
@@ -799,6 +818,7 @@ export function resolveCases(cases, variables) {
       fields: (item.expect?.fields || []).map((field) => ({
         path: field.path,
         equals: substitute(field.equals, variables),
+        ...(expectedMatch(field.match) ? { match: expectedMatch(field.match) } : {}),
         ...(field.ordered ? { ordered: true } : {}),
       })),
     },
@@ -1112,11 +1132,7 @@ function normalizeCase(item) {
     omit,
     expect: {
       status: expect.status === undefined || expect.status === null ? '' : String(expect.status),
-      fields: fields.map((field) => ({
-        path: field.path.trim(),
-        equals: field.equals === undefined || field.equals === null ? '' : String(field.equals),
-        ...(field.ordered ? { ordered: true } : {}),
-      })),
+      fields: fields.map(normalizeExpectedField).filter(Boolean),
     },
   }
 }

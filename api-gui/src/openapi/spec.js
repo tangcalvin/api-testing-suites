@@ -639,9 +639,40 @@ export function applyErrorRowToGroup(rows, cases, source) {
     const stored = {}
     if (status) stored.status = status
     if (Object.keys(values).length > 0) stored.values = values
-    if (stored.status || stored.values) next[key] = stored
+    if (current.include === false) stored.include = false
+    if (stored.status || stored.values || stored.include === false) next[key] = stored
   }
   return next
+}
+
+export function applyErrorInclude(rows, cases, included) {
+  const next = rows && typeof rows === 'object' ? { ...rows } : {}
+  for (const item of cases || []) {
+    if (!item) continue
+    const key = errorCheckKey(item)
+    const current = next[key] && typeof next[key] === 'object' ? next[key] : {}
+    if (included) {
+      if (current.include !== false) continue
+      const rest = { ...current }
+      delete rest.include
+      if (rest.status || Object.keys(rest.values || {}).length > 0) next[key] = rest
+      else delete next[key]
+    } else if (current.include !== false) {
+      next[key] = { ...current, include: false }
+    }
+  }
+  return next
+}
+
+export function errorCaseIncluded(item, saved = {}) {
+  if (!item) return false
+  if (item.group === 'custom') return item.include !== false
+  const rows = saved.rows && typeof saved.rows === 'object' ? saved.rows : {}
+  return rows[errorCheckKey(item)]?.include !== false
+}
+
+export function includedErrorCases(cases, saved = {}) {
+  return (cases || []).filter((item) => errorCaseIncluded(item, saved))
 }
 
 export function errorCheckKey(item) {
@@ -649,22 +680,40 @@ export function errorCheckKey(item) {
 }
 
 export function errorColumnDefault(item, column) {
-  if (column === 'exceptions[].code' || column === 'code') return item?.expect?.code || ''
+  if (column === 'exceptions[].code' || column === 'exception[].code' || column === 'code') return item?.expect?.code || ''
   return ''
+}
+
+export function errorMatchType(raw) {
+  const match = String(raw || '').trim()
+  if (match === 'contains' || match === 'pattern' || match === 'regex' || match === 'expression') return match
+  return 'equals'
 }
 
 export function applyErrorOverrides(cases, saved = {}) {
   const columns = Array.isArray(saved.columns) ? saved.columns : ['exceptions[].code']
   const rows = saved.rows && typeof saved.rows === 'object' ? saved.rows : {}
+  const matches = saved.matches && typeof saved.matches === 'object' ? saved.matches : {}
   return (cases || []).map((item) => {
-    if (!item || item.group === 'custom') return item
+    if (!item) return item
+    if (item.group === 'custom') {
+      const current = item.expect?.values && typeof item.expect.values === 'object' ? item.expect.values : {}
+      const values = {}
+      for (const [path, raw] of Object.entries(current)) {
+        const stored = storedErrorExpectation(raw, matches[path])
+        if (stored != null) values[path] = stored
+      }
+      return { ...item, expect: { ...item.expect, values } }
+    }
     const row = rows[errorCheckKey(item)] || {}
     const values = {}
     for (const column of columns) {
+      const match = errorMatchType(matches[column])
       const typed = row.values && Object.prototype.hasOwnProperty.call(row.values, column)
         ? row.values[column]
-        : errorColumnDefault(item, column)
-      if (String(typed ?? '').trim()) values[column] = String(typed)
+        : (match === 'equals' ? errorColumnDefault(item, column) : '')
+      const stored = storedErrorExpectation(typed, match)
+      if (stored != null) values[column] = stored
     }
     const expect = { ...item.expect }
     const subject = expect.field || ''
@@ -676,6 +725,13 @@ export function applyErrorOverrides(cases, saved = {}) {
     if (Object.keys(values).length > 0) expect.values = values
     return { ...item, expect }
   })
+}
+
+function storedErrorExpectation(raw, columnMatch) {
+  const expectation = readExpectation(raw)
+  const next = { ...expectation, match: errorMatchType(columnMatch || expectation.match) }
+  if (!String(next.text ?? '').trim()) return null
+  return storedExpectation(next)
 }
 
 export function recordId(operation) {
@@ -697,13 +753,13 @@ const PAYLOAD_ID_SUFFIXES = [
 
 export function payloadIdFields(operation) {
   return (operation?.fields || []).filter((field) => (
-    field.location === 'body' && field.type !== 'object' && !String(field.name).includes('.')
+    field.location === 'body' && field.type !== 'object'
   ))
 }
 
 export function idNameRank(name) {
-  const token = String(name || '')
-  if (!token || token.includes('.')) return null
+  const token = idLeaf(String(name || ''))
+  if (!token) return null
   if (token.toLowerCase() === 'id') return 0
   let best = null
   for (const [word, rank] of PAYLOAD_ID_SUFFIXES) {
@@ -741,6 +797,11 @@ export function resolvedId(operation, saved) {
   const detected = detectPayloadId(operation)
   if (!detected) return null
   return { name: detected.name, field: detected, source: 'detected' }
+}
+
+function idLeaf(name) {
+  const parts = String(name || '').split('.').filter(Boolean)
+  return parts[parts.length - 1] || ''
 }
 
 function endsWithIdWord(token, word) {
@@ -928,7 +989,12 @@ export function readCreatedId(status, text, location) {
   } else if (text && typeof text === 'object') {
     body = text
   }
-  if (body && typeof body === 'object' && !Array.isArray(body) && body.id != null && body.id !== '') return body.id
+  if (body && typeof body === 'object' && !Array.isArray(body)) {
+    if (body.id != null && body.id !== '') return body.id
+    if (body.data && typeof body.data === 'object' && !Array.isArray(body.data) && body.data.id != null && body.data.id !== '') {
+      return body.data.id
+    }
+  }
   const header = String(location || '').trim()
   if (!header) return null
   let path = header
@@ -1028,8 +1094,10 @@ export function buildCustomCases(fields, cases) {
         fields: checks.map((check) => ({
           path: String(check.path).trim(),
           equals: check.equals === undefined || check.equals === null ? '' : String(check.equals),
+          ...(errorMatchType(check.match) !== 'equals' ? { match: errorMatchType(check.match) } : {}),
           ...(check.ordered ? { ordered: true } : {}),
         })),
+        omit: Array.isArray(item.omit) ? item.omit.filter((name) => typeof name === 'string' && name) : [],
       },
       varied: {},
       ...assemble(fields, overrides),
@@ -1282,6 +1350,7 @@ export function buildCustomErrorCases(fields, cases) {
       ...(code ? { code } : {}),
       ...(message ? { message } : {}),
     }
+    const include = item.include !== false
     if (fieldName === 'body') {
       const assembled = assemble(fields, {})
       return {
@@ -1289,6 +1358,7 @@ export function buildCustomErrorCases(fields, cases) {
         group: 'custom',
         label: name,
         expect,
+        include,
         varied: { body: '(custom)' },
         body: {},
         rawBody: item.value == null ? '' : String(item.value),
@@ -1303,11 +1373,12 @@ export function buildCustomErrorCases(fields, cases) {
         group: 'custom',
         label: name,
         expect,
+        include,
         varied: {},
         ...assemble(fields, {}),
       }
     }
-    return { ...single(fields, field, item.omit ? OMIT : item.value, 'error', name, expect), group: 'custom' }
+    return { ...single(fields, field, item.omit ? OMIT : item.value, 'error', name, expect), group: 'custom', include }
   })
 }
 
@@ -1337,7 +1408,7 @@ export function readExpectation(raw) {
     if (typeof raw.regex === 'string') {
       return { text: raw.regex, ordered: Boolean(raw.ordered), match: 'regex', ignoreCase: false, rules: [] }
     }
-    if (raw.match === 'pattern' || raw.match === 'regex') {
+    if (raw.match === 'pattern' || raw.match === 'regex' || raw.match === 'contains' || raw.match === 'expression') {
       return { text: raw.value == null ? '' : String(raw.value), ordered: Boolean(raw.ordered), match: raw.match, ignoreCase: false, rules: [] }
     }
     return { text: raw.value == null ? '' : String(raw.value), ordered: Boolean(raw.ordered), match: 'equals', ignoreCase, rules: [] }
@@ -1395,6 +1466,8 @@ export function storedExpectation(expectation) {
     return name ? { pattern: name } : { match: 'pattern' }
   }
   if (match === 'regex') return text ? { regex: String(text) } : { match: 'regex' }
+  if (match === 'contains') return text ? { match: 'contains', value: String(text) } : { match: 'contains' }
+  if (match === 'expression') return text ? { match: 'expression', value: String(text) } : { match: 'expression' }
   if (expectation.ordered || ignoreCase) {
     const stored = { value: text }
     if (expectation.ordered) stored.ordered = true
@@ -1536,7 +1609,7 @@ function judgeOutcome(expect, status, text, context = {}) {
   } catch {
     parsed = null
   }
-  const exceptions = parsed && Array.isArray(parsed.exceptions) ? parsed.exceptions : []
+  const exceptions = errorItems(parsed)
   const expectedStatus = Number(expect.status) || 400
   if (expect.values && typeof expect.values === 'object') {
     if (status !== expectedStatus) {
@@ -1592,8 +1665,16 @@ function judgeOutcome(expect, status, text, context = {}) {
   return { passed: false, detail: `Expected at least ${expect.minCount} field errors` }
 }
 
+function errorItems(parsed) {
+  if (!parsed || typeof parsed !== 'object') return []
+  if (Array.isArray(parsed.exceptions)) return parsed.exceptions
+  if (Array.isArray(parsed.exception)) return parsed.exception
+  return []
+}
+
 function resolveErrorMessage(template, fieldName, request, variables) {
-  const withField = String(template).replaceAll('@{field}', fieldName || '')
+  const leaf = String(fieldName || '').split('.').filter(Boolean).pop() || ''
+  const withField = String(template).replaceAll('@{field}', fieldName || '').replaceAll('@{leaf}', leaf)
   return resolveRequestTemplate(withField, request, variables)
 }
 
@@ -1601,39 +1682,68 @@ function matchResponseValues(parsed, values, subject, context) {
   const groups = new Map()
   const scalars = []
   for (const [path, raw] of Object.entries(values || {})) {
-    if (!String(raw ?? '').trim()) continue
-    const resolved = resolveErrorMessage(raw, subject, context.request, context.variables)
-    if (resolved.skip || !String(resolved.value ?? '').trim()) {
-      return { ok: false, detail: 'Expected value could not be filled' }
-    }
-    const expected = String(resolved.value)
+    const expectation = readExpectation(raw)
+    if (!String(expectation.text ?? '').trim() && expectation.match === 'equals') continue
+    if (!String(expectation.text ?? '').trim()) continue
     const nested = String(path).match(/^(.*)\[\]\.(.+)$/)
     if (nested) {
       const list = groups.get(nested[1]) || []
-      list.push([nested[2], expected])
+      list.push([nested[2], expectation, path])
       groups.set(nested[1], list)
       continue
     }
-    scalars.push([path, expected])
+    scalars.push([path, expectation])
   }
   if (scalars.length === 0 && groups.size === 0) return { ok: true }
   if (!parsed || typeof parsed !== 'object') return { ok: false, detail: 'Response was not JSON' }
-  for (const [path, expected] of scalars) {
+  for (const [path, expectation] of scalars) {
     const found = valueAt(parsed, path)
-    if (!found.present || String(found.value) !== expected) {
-      return { ok: false, detail: `${path} expected ${expected}` }
+    const compared = matchErrorActual(found.present ? found.value : undefined, expectation, subject, context)
+    if (compared.skip) return { ok: false, detail: 'Expected value could not be filled' }
+    if (!found.present || !compared.ok) {
+      return { ok: false, detail: compared.detail ? `${path} ${compared.detail}` : `${path} expected ${describeExpected(expectation.text)}` }
     }
   }
   for (const [prefix, props] of groups) {
     const found = valueAt(parsed, prefix)
     const items = found.present && Array.isArray(found.value) ? found.value : []
-    const hit = items.some((item) => item && typeof item === 'object' && props.every(([name, expected]) => String(item[name] ?? '') === expected))
+    const hit = items.some((item) => (
+      item && typeof item === 'object'
+      && props.every(([name, expectation]) => matchErrorActual(item[name], expectation, subject, context).ok)
+    ))
     if (!hit) {
-      const detail = props.map(([name, expected]) => `${prefix}[].${name} expected ${expected}`).join(', ')
+      const detail = props.map(([, expectation, path]) => `${path} expected ${describeExpected(expectation.text)}`).join(', ')
       return { ok: false, detail }
     }
   }
   return { ok: true }
+}
+
+function matchErrorActual(actual, expectation, subject, context) {
+  const filled = {
+    ...expectation,
+    text: String(expectation?.text ?? '').replaceAll('@{field}', subject || '').replaceAll(
+      '@{leaf}',
+      String(subject || '').split('.').filter(Boolean).pop() || '',
+    ),
+  }
+  if (filled.match === 'regex' || filled.match === 'pattern') {
+    const prepared = resolvePatternExpectation(filled, { ...context, subject })
+    if (prepared.skip) return { skip: true }
+    if (prepared.error) return { ok: false, detail: prepared.error }
+    prepared.regex.lastIndex = 0
+    if (prepared.regex.test(actualText(actual))) return { ok: true }
+    return { ok: false, detail: `expected to match ${describeExpected(prepared.source)}, got ${describeActual(actual)}` }
+  }
+  const resolved = resolveErrorMessage(filled.text, subject, context.request, context.variables)
+  if (resolved.skip || !String(resolved.value ?? '').trim()) return { skip: true }
+  const expected = String(resolved.value)
+  if (filled.match === 'contains') {
+    if (actualText(actual).includes(expected)) return { ok: true }
+    return { ok: false, detail: `expected to contain ${describeExpected(expected)}, got ${describeActual(actual)}` }
+  }
+  if (sameValue(actual, expected, filled.ignoreCase)) return { ok: true }
+  return { ok: false, detail: `expected ${describeExpected(expected)}, got ${describeActual(actual)}` }
 }
 
 function judgeExpectedValues(context, status, text) {
@@ -1747,7 +1857,7 @@ function storedText(value) {
 }
 
 function sentValue(request, name) {
-  for (const source of [request?.body, request?.path, request?.query]) {
+  for (const source of [request?.body, request?.path, request?.query, request?.body?.data]) {
     const found = valueAt(source, name)
     if (!found.present) continue
     if (found.value === undefined || found.value === null || found.value === '') return { sent: false }
@@ -1787,6 +1897,11 @@ function resolvePatternExpectation(expectation, context) {
     source = context.patterns[name]
   }
   if (!String(source ?? '').trim()) return { skip: true }
+  const fieldName = context.subject || context.field || ''
+  if (fieldName) {
+    const leaf = String(fieldName).split('.').filter(Boolean).pop() || ''
+    source = String(source).replaceAll('@{field}', fieldName).replaceAll('@{leaf}', leaf)
+  }
   const resolved = resolveRequestTemplate(String(source), context.request, context.variables)
   if (resolved.skip) return { skip: true }
   const compiled = compilePattern(resolved.value)
@@ -2108,7 +2223,12 @@ export function collectPaging(sent, pagination) {
   const body = sent?.body
   if (body && typeof body === 'object' && !Array.isArray(body)) {
     for (const name of names) {
-      if (Object.prototype.hasOwnProperty.call(body, name)) bag[name] = body[name]
+      if (Object.prototype.hasOwnProperty.call(body, name)) {
+        bag[name] = body[name]
+        continue
+      }
+      const nested = readPath(body, String(name).split('.').filter(Boolean))
+      if (nested !== undefined) bag[name] = nested
     }
   }
   return bag
@@ -2369,7 +2489,7 @@ function judgeCustom(expect, status, text, context = {}) {
   if (fields.length === 0) {
     return { passed: true, detail: wanted ? `HTTP ${wanted}` : 'Accepted' }
   }
-  const compared = matchCustomFields(text, fields, context)
+  const compared = matchCustomFields(text, fields, { ...context, omit: expect.omit || context.omit || [] })
   if (!compared.ok) return { passed: false, detail: compared.detail }
   return { passed: true, detail: 'Response matched' }
 }
@@ -2382,23 +2502,28 @@ function matchCustomFields(text, fields, context) {
     parsed = null
   }
   if (!parsed || typeof parsed !== 'object') return { ok: false, detail: 'Response was not JSON' }
-  const grouped = {}
-  const rest = []
+  const values = {}
+  const ordered = []
   for (const field of fields) {
     const path = String(field.path).trim()
-    const nested = path.match(/^(.*)\[\]\.(.+)$/)
-    if (nested && nested[1] === 'exceptions') grouped[path] = String(field.equals ?? '')
-    else rest.push(field)
+    if (field.ordered) {
+      ordered.push(field)
+      continue
+    }
+    const stored = storedErrorExpectation(field.equals, errorMatchType(field.match))
+    if (stored != null) values[path] = stored
   }
-  if (Object.keys(grouped).length > 0) {
-    const compared = matchResponseValues(parsed, grouped, '', context)
+  const omitted = Array.isArray(context.omit) ? context.omit.filter((name) => typeof name === 'string' && name) : []
+  const subject = omitted.length === 1 ? omitted[0] : ''
+  if (Object.keys(values).length > 0) {
+    const compared = matchResponseValues(parsed, values, subject, context)
     if (!compared.ok) return compared
   }
-  for (const field of rest) {
+  for (const field of ordered) {
     const path = String(field.path).trim()
     const resolved = resolveRequestTemplate(String(field.equals ?? ''), context.request, context.variables)
     if (resolved.skip || filterAny(path, resolved.value)) continue
-    const compared = comparePath(parsed, path, resolved.value, Boolean(field.ordered))
+    const compared = comparePath(parsed, path, resolved.value, true)
     if (compared.skip || compared.ok) continue
     return {
       ok: false,
@@ -2490,12 +2615,20 @@ function requestBodyParameters(spec, operation) {
   const content = operation?.requestBody && operation.requestBody.content
   const media = content && (content['application/json'] || content['application/*+json'] || content['*/*'] || Object.values(content)[0])
   if (!media?.schema) return []
-  const schema = resolveSchema(spec, media.schema)
-  return Object.entries(schema.properties || {}).map(([name, property]) => ({
-    raw: name,
-    key: normalizeName(name),
-    schema: resolveSchema(spec, property || {}),
-  }))
+  return bodyParameterFields(spec, resolveSchema(spec, media.schema), '')
+}
+
+function bodyParameterFields(spec, schema, prefix) {
+  const listed = []
+  for (const [name, property] of Object.entries(schema?.properties || {})) {
+    const resolved = resolveSchema(spec, property || {})
+    const raw = prefix ? `${prefix}.${name}` : name
+    listed.push({ raw, key: normalizeName(name), schema: resolved })
+    if (resolved.type !== 'array' && resolved.properties) {
+      listed.push(...bodyParameterFields(spec, resolved, raw))
+    }
+  }
+  return listed
 }
 
 function normalizeName(name) {

@@ -80,15 +80,6 @@ public class ApiExceptionHandler {
         )));
     }
 
-    @ExceptionHandler(ShipmentNotFoundException.class)
-    public ResponseEntity<ApiErrorResponse> handleShipmentNotFound(ShipmentNotFoundException exception) {
-        return error(HttpStatus.NOT_FOUND, List.of(new FieldException(
-                "id",
-                "NotFound",
-                exception.getMessage()
-        )));
-    }
-
     private static ResponseEntity<ApiErrorResponse> error(HttpStatus status, List<FieldException> exceptions) {
         return ResponseEntity.status(status).body(new ApiErrorResponse(status.value(), exceptions));
     }
