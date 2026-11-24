@@ -890,46 +890,213 @@ export function withFixtureId(item, field, id, location = 'path') {
   }
 }
 
-export function fixtureSteps(operation, operations, defaults, savedId) {
+export function fixtureSteps(operation, operations, defaults, savedId, saved = {}) {
   const plan = fixturePlan(operation, operations, defaults, savedId)
-  if (!plan) return null
-  const calls = []
-  if (plan.create) {
-    calls.push({
-      role: 'before',
-      operation: plan.create,
-      hint: plan.consumeSuccess
-        ? 'Creates a record before each successful delete.'
-        : 'Creates the record, then the checks use its id.',
-    })
-  }
   const listed = Array.isArray(operations) ? operations : []
-  const enquiry = plan.location === 'body'
-    ? (plan.enquiry || null)
-    : (listed.find((item) => item && item.method === 'GET' && item.path === operation.path && item.id !== operation.id) || null)
-  if (enquiry) {
-    calls.push({
+  const byId = Object.fromEntries(listed.filter(Boolean).map((item) => [item.id, item]))
+  const detectedEnquiry = plan
+    ? ((plan.location === 'body'
+      ? (plan.enquiry || null)
+      : (listed.find((item) => item && item.method === 'GET' && item.path === operation?.path && item.id !== operation?.id) || null))
+    )
+    : null
+  const pick = (role, detected) => {
+    const chosen = String(saved?.[`${role}Op`] || '').trim()
+    if (chosen && byId[chosen]) return byId[chosen]
+    return detected || null
+  }
+  const beforeOp = pick('before', plan?.create || null)
+  const afterOp = pick('after', plan?.cleanup || null)
+  const enquiryOp = pick('enquiry', detectedEnquiry)
+  const calls = [
+    {
+      role: 'before',
+      operation: beforeOp,
+      detected: Boolean(plan?.create),
+      hint: plan?.consumeSuccess
+        ? 'Creates a record before each successful delete.'
+        : 'Runs before the checks. Detected create calls supply the record id when needed.',
+    },
+    {
       role: 'enquiry',
-      operation: enquiry,
-      hint: 'Reads the record after each check.',
-    })
-  }
-  if (plan.cleanup) {
-    calls.push({
+      operation: enquiryOp,
+      detected: Boolean(detectedEnquiry),
+      hint: 'Reads the record after each check, using values carried from that check.',
+    },
+    {
       role: 'after',
-      operation: plan.cleanup,
-      hint: plan.cleanup.id === operation.id
+      operation: afterOp,
+      detected: Boolean(plan?.cleanup),
+      hint: plan?.cleanup?.id === operation?.id
         ? 'Removes a record that a check did not delete.'
-        : 'Deletes the record created for this run.',
-    })
+        : 'Runs after the checks. Detected delete calls remove the record created for this run.',
+    },
+  ]
+  return {
+    plan,
+    enquiry: enquiryOp,
+    calls,
+    fields: {
+      before: aroundFieldMap(saved?.beforeFields),
+      enquiry: aroundFieldMap(saved?.enquiryFields),
+      after: aroundFieldMap(saved?.afterFields),
+    },
   }
-  if (calls.length === 0) return null
-  return { plan, enquiry, calls }
 }
 
 export function fixtureEnabled(saved, role) {
   if (saved && typeof saved[role] === 'boolean') return saved[role]
   return role !== 'enquiry'
+}
+
+export function aroundFieldMap(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {}
+  const out = {}
+  for (const [name, item] of Object.entries(raw)) {
+    const field = String(name || '').trim()
+    if (!field) continue
+    if (typeof item === 'string') {
+      out[field] = { source: 'value', path: '', value: item }
+      continue
+    }
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue
+    const source = aroundFieldSource(item.source)
+    out[field] = {
+      source,
+      path: typeof item.path === 'string' ? item.path.trim() : '',
+      value: item.value == null ? '' : String(item.value),
+    }
+  }
+  return out
+}
+
+function aroundFieldSource(value) {
+  if (value === 'default' || value === 'request' || value === 'response' || value === 'value') return value
+  return 'auto'
+}
+
+export function aroundRequest(operation, mappings, previous, defaults, inject = {}) {
+  if (!operation) return { body: {}, query: {}, path: {} }
+  const fields = applyDefaults(operation.fields || [], operation.id, defaults)
+  const overrides = {}
+  const map = aroundFieldMap(mappings)
+  for (const field of fields) {
+    if (!field?.name || field.object) continue
+    const mapping = map[field.name] || { source: 'auto', path: '', value: '' }
+    const resolved = resolveAroundField(field, mapping, previous, defaults)
+    if (resolved.skip) continue
+    overrides[field.name] = resolved.value
+  }
+  for (const [name, value] of Object.entries(inject || {})) {
+    if (!name || value === undefined) continue
+    const match = fields.find((field) => field.name === name)
+      || fields.find((field) => !field.object && responseLeaf(field.name) === name)
+    if (match) overrides[match.name] = value
+    else overrides[name] = value
+  }
+  return assemble(fields, overrides)
+}
+
+function resolveAroundField(field, mapping, previous, defaults) {
+  const source = aroundFieldSource(mapping?.source)
+  if (source === 'default') {
+    return { skip: false, value: field.sample }
+  }
+  if (source === 'request') {
+    const found = readCarried(previous?.request, mapping.path || field.name)
+    return found.found ? { skip: false, value: coerceAround(field, found.value) } : { skip: true }
+  }
+  if (source === 'response') {
+    const found = readCarried(previous?.response, mapping.path || field.name)
+    return found.found ? { skip: false, value: coerceAround(field, found.value) } : { skip: true }
+  }
+  if (source === 'value') {
+    const resolved = resolveAroundTemplate(mapping.value, previous, defaults?.variables)
+    if (resolved.skip) return { skip: true }
+    return { skip: false, value: coerceAround(field, resolved.value) }
+  }
+  const carried = carryAroundValue(field, previous)
+  if (carried.found) return { skip: false, value: coerceAround(field, carried.value) }
+  if (field.sample === undefined || field.sample === '') return { skip: true }
+  return { skip: false, value: field.sample }
+}
+
+function carryAroundValue(field, previous) {
+  const names = aroundLookupNames(field.name)
+  for (const name of names) {
+    const fromRequest = readCarried(previous?.request, name)
+    if (fromRequest.found) return fromRequest
+  }
+  for (const name of names) {
+    const fromResponse = readCarried(previous?.response, name)
+    if (fromResponse.found) return fromResponse
+  }
+  return { found: false }
+}
+
+function aroundLookupNames(name) {
+  const full = String(name || '').trim()
+  if (!full) return []
+  const leaf = responseLeaf(full)
+  const names = [full]
+  if (leaf && leaf !== full) names.push(leaf, `data.${leaf}`)
+  if (full.startsWith('data.') && leaf) names.push(leaf)
+  return [...new Set(names)]
+}
+
+function readCarried(source, path) {
+  const name = String(path || '').trim()
+  if (!name) return { found: false }
+  if (!source || typeof source !== 'object') return { found: false }
+  for (const bag of [source.body, source.query, source.path, source, source.data].filter(Boolean)) {
+    if (!bag || typeof bag !== 'object' || Array.isArray(bag)) continue
+    const found = valueAt(bag, name)
+    if (!found.present || found.value === undefined) continue
+    return { found: true, value: found.value }
+  }
+  return { found: false }
+}
+
+function resolveAroundTemplate(template, previous, variables) {
+  const substituted = evaluateDynamics(substitute(String(template ?? ''), variables || {}))
+  if (typeof substituted !== 'string') return { skip: false, value: substituted }
+  const whole = substituted.match(/^@\{(request|response)\.([^}]+)\}$/)
+  if (whole) {
+    const found = readCarried(previous?.[whole[1]], whole[2].trim())
+    return found.found ? { skip: false, value: found.value } : { skip: true }
+  }
+  let missing = false
+  const text = substituted.replace(/@\{(request|response)\.([^}]+)\}/g, (token, kind, path) => {
+    const found = readCarried(previous?.[kind], path.trim())
+    if (!found.found) {
+      missing = true
+      return token
+    }
+    return found.value == null ? '' : String(found.value)
+  })
+  if (missing) return { skip: true }
+  return { skip: false, value: text }
+}
+
+function coerceAround(field, value) {
+  if (value === undefined) return undefined
+  if (value === null || value === '') return value
+  try {
+    return coerceFieldValue(field, value)
+  } catch {
+    return value
+  }
+}
+
+export function parseJsonBody(text) {
+  if (text && typeof text === 'object') return text
+  if (typeof text !== 'string' || !text.trim()) return null
+  try {
+    const parsed = JSON.parse(text)
+    return parsed && typeof parsed === 'object' ? parsed : null
+  } catch {
+    return null
+  }
 }
 
 export function enquiryTarget(item, field, location = 'path') {
@@ -1398,22 +1565,27 @@ export function readExpectation(raw) {
         ordered: false,
         match: 'when',
         ignoreCase: false,
+        nullable: raw.nullable === true,
         rules: raw.rules.map(readWhenRule).filter(Boolean),
       }
     }
     const ignoreCase = raw.ignoreCase === true
+    const nullable = raw.nullable === true
     if (typeof raw.pattern === 'string') {
-      return { text: raw.pattern.trim(), ordered: false, match: 'pattern', ignoreCase: false, rules: [] }
+      return { text: raw.pattern.trim(), ordered: false, match: 'pattern', ignoreCase: false, nullable, rules: [] }
     }
     if (typeof raw.regex === 'string') {
-      return { text: raw.regex, ordered: Boolean(raw.ordered), match: 'regex', ignoreCase: false, rules: [] }
+      return { text: raw.regex, ordered: Boolean(raw.ordered), match: 'regex', ignoreCase: false, nullable, rules: [] }
+    }
+    if (raw.match === 'null' || raw.match === 'nullable') {
+      return { text: '', ordered: false, match: 'null', ignoreCase: false, nullable: false, rules: [] }
     }
     if (raw.match === 'pattern' || raw.match === 'regex' || raw.match === 'contains' || raw.match === 'expression') {
-      return { text: raw.value == null ? '' : String(raw.value), ordered: Boolean(raw.ordered), match: raw.match, ignoreCase: false, rules: [] }
+      return { text: raw.value == null ? '' : String(raw.value), ordered: Boolean(raw.ordered), match: raw.match, ignoreCase: false, nullable, rules: [] }
     }
-    return { text: raw.value == null ? '' : String(raw.value), ordered: Boolean(raw.ordered), match: 'equals', ignoreCase, rules: [] }
+    return { text: raw.value == null ? '' : String(raw.value), ordered: Boolean(raw.ordered), match: 'equals', ignoreCase, nullable, rules: [] }
   }
-  return { text: raw == null ? '' : String(raw), ordered: false, match: 'equals', ignoreCase: false, rules: [] }
+  return { text: raw == null ? '' : String(raw), ordered: false, match: 'equals', ignoreCase: false, nullable: false, rules: [] }
 }
 
 function readWhenRule(raw) {
@@ -1457,24 +1629,33 @@ export function storedExpectation(expectation) {
   const match = expectation.match || 'equals'
   if (match === 'when') {
     const rules = (expectation.rules || []).map(storedWhenRule).filter(Boolean)
-    return rules.length ? { rules } : undefined
+    if (!rules.length) return undefined
+    return expectation.nullable ? { rules, nullable: true } : { rules }
   }
   const text = expectation.text == null ? '' : expectation.text
   const ignoreCase = expectation.ignoreCase === true
+  const nullable = expectation.nullable === true
+  if (match === 'null' || match === 'nullable') return { match: 'null' }
+  let stored
   if (match === 'pattern') {
     const name = String(text).trim()
-    return name ? { pattern: name } : { match: 'pattern' }
-  }
-  if (match === 'regex') return text ? { regex: String(text) } : { match: 'regex' }
-  if (match === 'contains') return text ? { match: 'contains', value: String(text) } : { match: 'contains' }
-  if (match === 'expression') return text ? { match: 'expression', value: String(text) } : { match: 'expression' }
-  if (expectation.ordered || ignoreCase) {
-    const stored = { value: text }
+    stored = name ? { pattern: name } : { match: 'pattern' }
+  } else if (match === 'regex') {
+    stored = text ? { regex: String(text) } : { match: 'regex' }
+  } else if (match === 'contains') {
+    stored = text ? { match: 'contains', value: String(text) } : { match: 'contains' }
+  } else if (match === 'expression') {
+    stored = text ? { match: 'expression', value: String(text) } : { match: 'expression' }
+  } else if (expectation.ordered || ignoreCase || nullable) {
+    stored = { value: text }
     if (expectation.ordered) stored.ordered = true
     if (ignoreCase) stored.ignoreCase = true
-    return stored
+  } else {
+    stored = text
   }
-  return text
+  if (!nullable) return stored
+  if (stored && typeof stored === 'object' && !Array.isArray(stored)) return { ...stored, nullable: true }
+  return { value: stored == null ? '' : stored, nullable: true }
 }
 
 function storedWhenRule(rule) {
@@ -1553,6 +1734,10 @@ export function responseChecks(views, requestNames, overridesByStatus = {}) {
     for (const field of view.fields || []) {
       if (Object.prototype.hasOwnProperty.call(overrides, field.name)) {
         const expectation = readExpectation(overrides[field.name])
+        if (expectation.match === 'null') {
+          fields[field.name] = storedExpectation(expectation)
+          continue
+        }
         if (expectation.match === 'regex' || expectation.match === 'pattern') {
           if (expectation.text !== '') fields[field.name] = storedExpectation(expectation)
           continue
@@ -1562,7 +1747,7 @@ export function responseChecks(views, requestNames, overridesByStatus = {}) {
           if (stored) fields[field.name] = stored
           continue
         }
-        if (expectation.text !== '' || expectation.ignoreCase || expectation.ordered) {
+        if (expectation.text !== '' || expectation.ignoreCase || expectation.ordered || expectation.nullable) {
           fields[field.name] = storedExpectation(expectation)
         }
         continue
@@ -1720,6 +1905,11 @@ function matchResponseValues(parsed, values, subject, context) {
 }
 
 function matchErrorActual(actual, expectation, subject, context) {
+  if (expectation?.match === 'null') {
+    if (actual === null) return { ok: true }
+    return { ok: false, detail: `expected null, got ${describeActual(actual)}` }
+  }
+  if (expectation?.nullable && actual === null) return { ok: true }
   const filled = {
     ...expectation,
     text: String(expectation?.text ?? '').replaceAll('@{field}', subject || '').replaceAll(
@@ -1769,7 +1959,9 @@ function judgeExpectedValues(context, status, text) {
       const where = page.label ? `${page.label} ` : ''
       if (parsed == null || typeof parsed !== 'object') {
         if (expectation.match === 'when' && (expectation.rules || []).length === 0) continue
-        if (expectation.match === 'regex' || expectation.match === 'pattern') {
+        if (expectation.match === 'null') {
+          checked = true
+        } else if (expectation.match === 'regex' || expectation.match === 'pattern') {
           const prepared = resolvePatternExpectation(expectation, context)
           if (prepared.skip) continue
           checked = true
@@ -1790,6 +1982,10 @@ function judgeExpectedValues(context, status, text) {
         }
         continue
       }
+      if (expectation.match !== 'null' && expectation.nullable && pathIsNull(parsed, path)) {
+        checked = true
+        continue
+      }
       if (expectation.match === 'when') {
         const compared = compareWhenPath(parsed, path, expectation, context)
         if (compared.skip) continue
@@ -1798,6 +1994,13 @@ function judgeExpectedValues(context, status, text) {
         misses.push(compared.detail
           ? `${where}${path} ${compared.detail}`
           : `${where}${path} expected ${describeExpected(compared.expected)}, got ${describeActual(compared.actual)}`)
+        continue
+      }
+      if (expectation.match === 'null') {
+        checked = true
+        const compared = comparePathNull(parsed, path)
+        if (compared.ok) continue
+        misses.push(`${where}${path} expected null, got ${describeActual(compared.actual)}`)
         continue
       }
       if (expectation.match === 'regex' || expectation.match === 'pattern') {
@@ -1975,6 +2178,11 @@ function readConditionValue(body, record, field) {
 }
 
 function matchRuleActual(actual, path, rule, context) {
+  if (rule.match === 'null') {
+    if (actual === null) return { ok: true }
+    return { ok: false, actual, expected: null, detail: `expected null, got ${describeActual(actual)}` }
+  }
+  if (rule.nullable && actual === null) return { ok: true }
   if (rule.match === 'regex' || rule.match === 'pattern') {
     const prepared = resolvePatternExpectation(rule, context)
     if (prepared.skip) return { skip: true }
@@ -1992,6 +2200,24 @@ function matchRuleActual(actual, path, rule, context) {
   if (resolved.skip || filterAny(path, resolved.value)) return { skip: true }
   if (sameValue(actual, resolved.value, rule.ignoreCase)) return { ok: true }
   return { ok: false, actual, expected: resolved.value }
+}
+
+function comparePathNull(body, path) {
+  const values = valuesAt(body, path)
+  if (String(path).includes('[]')) {
+    if (values.length === 0) return { skip: true }
+    const actual = values.find((value) => value !== null)
+    return actual === undefined ? { ok: true } : { ok: false, actual }
+  }
+  if (values.length === 0) return { ok: false, actual: undefined }
+  return values[0] === null ? { ok: true } : { ok: false, actual: values[0] }
+}
+
+function pathIsNull(body, path) {
+  const values = valuesAt(body, path)
+  if (values.length === 0) return false
+  if (String(path).includes('[]')) return values.every((value) => value === null)
+  return values[0] === null
 }
 
 function comparePath(body, path, expected, ordered = false, regex = null, ignoreCase = false) {
@@ -2747,7 +2973,30 @@ function responseRecordColumns(spec, operation) {
   const item = schema.type === 'array' || schema.items
     ? resolveSchema(spec, schema.items || {})
     : itemSchema(spec, schema)
-  return Object.keys(item?.properties || {})
+  return flattenRecordColumns(spec, item)
+}
+
+function flattenRecordColumns(spec, schema, prefix = '', into = []) {
+  if (!schema) return into
+  const resolved = resolveSchema(spec, schema)
+  const properties = resolved?.properties || {}
+  const names = Object.keys(properties)
+  if (names.length === 0) {
+    if (prefix) into.push(prefix)
+    return into
+  }
+  for (const name of names) {
+    const path = prefix ? `${prefix}.${name}` : name
+    const child = resolveSchema(spec, properties[name])
+    if (child?.properties && child.type !== 'array') {
+      const before = into.length
+      flattenRecordColumns(spec, child, path, into)
+      if (into.length === before) into.push(path)
+    } else {
+      into.push(path)
+    }
+  }
+  return into
 }
 
 function itemSchema(spec, schema) {

@@ -17,6 +17,9 @@ public record ShipmentQuery(
 
         @Schema(description = "Optional reference filter. Matches when the stored reference contains this text.", example = "SHP")
         @Size(max = 40)
-        String reference
+        String reference,
+
+        @Schema(description = "Optional status filter. Matches the stored status exactly.", example = "BOOKED")
+        ShipmentStatus status
 ) {
 }

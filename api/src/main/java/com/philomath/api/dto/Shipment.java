@@ -5,7 +5,6 @@ import io.swagger.v3.oas.annotations.media.Schema;
 import java.time.LocalDate;
 import java.time.LocalTime;
 import java.time.OffsetDateTime;
-import java.util.Map;
 
 @Schema(description = "Stored shipment")
 public record Shipment(
@@ -24,7 +23,6 @@ public record Shipment(
         LocalTime cutoffTime,
         @Schema(format = "date-time")
         OffsetDateTime bookedAt,
-        @Schema(description = "Empty object when packaging was sent.", additionalProperties = Schema.AdditionalPropertiesValue.FALSE)
-        Map<String, Object> packaging
+        Packaging packaging
 ) {
 }

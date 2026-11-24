@@ -498,10 +498,37 @@ function stepMaps(source) {
     const next = {}
     for (const role of ['before', 'after', 'enquiry']) {
       if (typeof item[role] === 'boolean') next[role] = item[role]
+      if (typeof item[`${role}Op`] === 'string' && item[`${role}Op`].trim()) next[`${role}Op`] = item[`${role}Op`].trim()
+      const fields = aroundFieldsMap(item[`${role}Fields`])
+      if (Object.keys(fields).length > 0) next[`${role}Fields`] = fields
     }
     if (Object.keys(next).length > 0) steps[operationId] = next
   }
   return steps
+}
+
+function aroundFieldsMap(source) {
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return {}
+  const out = {}
+  for (const [name, item] of Object.entries(source)) {
+    const field = String(name || '').trim()
+    if (!field) continue
+    if (typeof item === 'string') {
+      out[field] = { source: 'value', value: item }
+      continue
+    }
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue
+    const sourceName = item.source === 'default' || item.source === 'request' || item.source === 'response' || item.source === 'value'
+      ? item.source
+      : (item.source === 'auto' ? 'auto' : '')
+    if (!sourceName) continue
+    const entry = { source: sourceName }
+    if (typeof item.path === 'string' && item.path.trim()) entry.path = item.path.trim()
+    if (item.value != null && String(item.value) !== '') entry.value = String(item.value)
+    if (sourceName === 'auto' && !entry.path && !entry.value) continue
+    out[field] = entry
+  }
+  return out
 }
 
 function errorMaps(source) {

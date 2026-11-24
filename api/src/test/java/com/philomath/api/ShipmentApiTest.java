@@ -103,7 +103,7 @@ class ShipmentApiTest {
     }
 
     @Test
-    void storesDateTimeAndEmptyPackaging() throws Exception {
+    void storesDateTimeAndNestedPackaging() throws Exception {
         mockMvc.perform(post("/api/shipments/createShipment")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(call("""
@@ -118,15 +118,23 @@ class ShipmentApiTest {
                                   "readyDate": "2026-03-01",
                                   "cutoffTime": "18:30:00",
                                   "bookedAt": "2026-03-01T10:15:30Z",
-                                  "packaging": {}
+                                  "packaging": {
+                                    "type": "BOX",
+                                    "dimensions": { "lengthCm": 30, "widthCm": 20, "heightCm": 15 },
+                                    "label": { "code": "LBL-2002", "carrier": "DHL" }
+                                  }
                                 }
                                 """)))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.data.readyDate").value("2026-03-01"))
                 .andExpect(jsonPath("$.data.cutoffTime").value("18:30:00"))
                 .andExpect(jsonPath("$.data.bookedAt").value("2026-03-01T10:15:30Z"))
-                .andExpect(jsonPath("$.data.packaging").isMap())
-                .andExpect(jsonPath("$.data.packaging").isEmpty());
+                .andExpect(jsonPath("$.data.packaging.type").value("BOX"))
+                .andExpect(jsonPath("$.data.packaging.dimensions.lengthCm").value(30.0))
+                .andExpect(jsonPath("$.data.packaging.dimensions.widthCm").value(20.0))
+                .andExpect(jsonPath("$.data.packaging.dimensions.heightCm").value(15.0))
+                .andExpect(jsonPath("$.data.packaging.label.code").value("LBL-2002"))
+                .andExpect(jsonPath("$.data.packaging.label.carrier").value("DHL"));
     }
 
     @Test
@@ -157,6 +165,38 @@ class ShipmentApiTest {
                 .andExpect(jsonPath("$.data.content.length()").value(1))
                 .andExpect(jsonPath("$.data.totalSize").value(1))
                 .andExpect(jsonPath("$.data.nextCursor").value("0"));
+    }
+
+    @Test
+    void queryFiltersByStatusAndReference() throws Exception {
+        mockMvc.perform(post("/api/shipments/createShipment")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(call(VALID_DATA)))
+                .andExpect(status().isCreated());
+        mockMvc.perform(post("/api/shipments/createShipment")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(call(VALID_DATA.replace("SHP-1001", "SHP-1002").replace("DRAFT", "BOOKED"))))
+                .andExpect(status().isCreated());
+        mockMvc.perform(post("/api/shipments/createShipment")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(call(VALID_DATA.replace("SHP-1001", "HK-2001").replace("DRAFT", "BOOKED"))))
+                .andExpect(status().isCreated());
+
+        mockMvc.perform(post("/api/shipments/queryShipments")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(call("{\"nextCursor\":\"0\",\"size\":20,\"status\":\"BOOKED\"}")))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.content.length()").value(2))
+                .andExpect(jsonPath("$.data.content[*].status", hasItem("BOOKED")))
+                .andExpect(jsonPath("$.data.content[*].status", not(hasItem("DRAFT"))));
+
+        mockMvc.perform(post("/api/shipments/queryShipments")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(call("{\"nextCursor\":\"0\",\"size\":20,\"reference\":\"SHP\",\"status\":\"BOOKED\"}")))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.content.length()").value(1))
+                .andExpect(jsonPath("$.data.content[0].reference").value("SHP-1002"))
+                .andExpect(jsonPath("$.data.content[0].status").value("BOOKED"));
     }
 
     @Test
@@ -216,6 +256,7 @@ class ShipmentApiTest {
                 .andExpect(jsonPath("$.paths['/api/shipments/deleteShipment'].post.operationId").value("deleteShipment"))
                 .andExpect(jsonPath("$.paths['/api/shipments/createShipment'].get").doesNotExist())
                 .andExpect(jsonPath("$.components.schemas.ShipmentQuery.properties.nextCursor").exists())
+                .andExpect(jsonPath("$.components.schemas.ShipmentQuery.properties.status").exists())
                 .andExpect(jsonPath("$.components.schemas.ShipmentQuery.properties.page").doesNotExist())
                 .andExpect(jsonPath("$.components.schemas.ShipmentPage.properties.totalSize").exists())
                 .andExpect(jsonPath("$.components.schemas.ShipmentPage.properties.totalElements").doesNotExist())
@@ -223,6 +264,11 @@ class ShipmentApiTest {
                 .andExpect(jsonPath("$.components.schemas.ShipmentRequest.properties.cutoffTime").exists())
                 .andExpect(jsonPath("$.components.schemas.ShipmentRequest.properties.bookedAt").exists())
                 .andExpect(jsonPath("$.components.schemas.ShipmentRequest.properties.packaging").exists())
+                .andExpect(jsonPath("$.components.schemas.Packaging.properties.type").exists())
+                .andExpect(jsonPath("$.components.schemas.Packaging.properties.dimensions").exists())
+                .andExpect(jsonPath("$.components.schemas.Packaging.properties.label").exists())
+                .andExpect(jsonPath("$.components.schemas.PackagingDimensions.properties.lengthCm").exists())
+                .andExpect(jsonPath("$.components.schemas.PackagingLabel.properties.carrier").exists())
                 .andExpect(jsonPath("$.components.schemas.CreateCall.properties.userId").exists())
                 .andExpect(jsonPath("$.components.schemas.CreateCall.properties.data").exists())
                 .andExpect(jsonPath("$.components.schemas.ItemReply.properties.code").exists())

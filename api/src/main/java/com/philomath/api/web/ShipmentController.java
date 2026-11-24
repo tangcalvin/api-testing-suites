@@ -67,7 +67,7 @@ public class ShipmentController {
                     content = @Content(schema = @Schema(implementation = ShipmentEnvelope.ErrorReply.class)))
     })
     public ResponseEntity<?> queryShipments(@Valid @RequestBody ShipmentEnvelope.QueryCall request) {
-        ShipmentQuery query = request.data() == null ? new ShipmentQuery(null, null, null) : request.data();
+        ShipmentQuery query = request.data() == null ? new ShipmentQuery(null, null, null, null) : request.data();
         int size = query.size() == null ? 20 : query.size();
         if (size < 1) {
             return constraint(request.userId(), "size", "Min");
@@ -81,7 +81,7 @@ public class ShipmentController {
         } catch (IllegalArgumentException exception) {
             return constraint(request.userId(), "nextCursor", "InvalidFormat");
         }
-        return ResponseEntity.ok(ShipmentEnvelope.page(request.userId(), shipments.query(startId, size, query.reference())));
+        return ResponseEntity.ok(ShipmentEnvelope.page(request.userId(), shipments.query(startId, size, query.reference(), query.status())));
     }
 
     @PostMapping("/updateShipment")

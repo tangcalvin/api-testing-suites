@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import test from 'node:test'
 import { compareRecords, filterRecords, filterRules, parseRecordBuffer, parseRecordCsv, parseRecordJson } from './records.js'
 
@@ -152,12 +153,14 @@ test('uploaded rows match the filtered response by id, shared fields, and order'
   assert.equal(same.passed, true)
   const missing = compareRecords(expected, [ROWS[0]])
   assert.equal(missing.passed, false)
-  assert.match(missing.detail, /Missing id 3/)
+  assert.match(missing.detail, /Missing from response: id 3/)
   const extra = compareRecords(expected, [...expected, ROWS[1]])
-  assert.match(extra.detail, /Extra id 2/)
+  assert.match(extra.detail, /Extra in response: id 2/)
   const changed = compareRecords([ROWS[0]], [{ ...ROWS[0], customerName: 'Other' }])
   assert.equal(changed.passed, false)
-  assert.match(changed.detail, /customerName/)
+  assert.match(changed.detail, /Field mismatch on id 1:/)
+  assert.match(changed.detail, /customerName: expected "Ada Lovelace", got "Other"/)
+  assert.match(changed.detail, /\n/)
   const ordered = compareRecords(expected, [ROWS[2], ROWS[0]], { ordered: true })
   assert.match(ordered.detail, /out of order/)
   const instant = compareRecords(
@@ -166,6 +169,31 @@ test('uploaded rows match the filtered response by id, shared fields, and order'
   )
   assert.equal(instant.passed, true)
   assert.equal(compareRecords([], []).detail, 'No records match this filter.')
+  const nested = compareRecords(
+    [{ id: 1, 'packaging.type': 'BOX', 'packaging.label.code': 'LBL-1' }],
+    [{ id: 1, packaging: { type: 'ENVELOPE', label: { code: 'LBL-1', carrier: 'DHL' }, dimensions: { lengthCm: 1, widthCm: 1, heightCm: 1 } } }],
+  )
+  assert.equal(nested.passed, false)
+  assert.match(nested.detail, /packaging\.type: expected "BOX", got "ENVELOPE"/)
+  const nullPackaging = compareRecords(
+    [{ id: 1, reference: 'SHP-1', 'packaging.type': 'BOX', 'packaging.label.code': 'LBL-1' }],
+    [{ id: 1, reference: 'SHP-1', packaging: null }],
+  )
+  assert.equal(nullPackaging.passed, false)
+  assert.match(nullPackaging.detail, /packaging\.type: expected "BOX", got \(missing\)/)
+  assert.match(nullPackaging.detail, /packaging\.label\.code: expected "LBL-1", got \(missing\)/)
+  const emptyExcelPackaging = compareRecords(
+    [{ id: 1, reference: 'SHP-1', 'packaging.type': null, 'packaging.label.code': null }],
+    [{ id: 1, reference: 'SHP-1', packaging: null }],
+  )
+  assert.equal(emptyExcelPackaging.passed, true)
+  const noId = compareRecords(
+    [{ reference: 'A', status: 'DRAFT' }, { reference: 'B', status: 'BOOKED' }],
+    [{ reference: 'B', status: 'SHIPPED' }, { reference: 'A', status: 'DRAFT' }],
+  )
+  assert.equal(noId.passed, false)
+  assert.match(noId.detail, /Field mismatch on reference B:/)
+  assert.match(noId.detail, /status: expected "BOOKED", got "SHIPPED"/)
 })
 
 test('csv and json files become records', () => {
@@ -190,4 +218,68 @@ test('an xlsx sheet becomes records', async () => {
   assert.equal(rows[0].id, 4)
   assert.equal(rows[0].customerName, 'Ada')
   assert.equal(rows[0].quantity, 2)
+})
+
+test('nested request filters use the record leaf and skip fields that are not columns', () => {
+  const fields = [
+    field('userId', { location: 'body' }),
+    field('data', { location: 'body', type: 'object', object: true }),
+    field('data.nextCursor', { location: 'body' }),
+    field('data.size', { location: 'body', type: 'integer' }),
+    field('data.reference', { location: 'body' }),
+    field('data.status', { location: 'body', enum: true, members: ['DRAFT', 'BOOKED'] }),
+  ]
+  const columns = ['id', 'reference', 'status', 'recipient']
+  const rows = [
+    { id: 1, reference: 'SHP-1001', status: 'DRAFT', recipient: 'Ada Lovelace' },
+    { id: 2, reference: 'SHP-1002', status: 'BOOKED', recipient: 'Ada Lovelace' },
+    { id: 3, reference: 'HK-2001', status: 'BOOKED', recipient: 'Grace Hopper' },
+  ]
+  const pagination = { request: { cursor: 'data.nextCursor', size: 'data.size' } }
+  const rules = filterRules(fields, columns, {}, pagination)
+  const byName = Object.fromEntries(rules.map((rule) => [rule.field, rule]))
+  assert.equal(byName.userId, undefined)
+  assert.equal(byName['data.nextCursor'], undefined)
+  assert.equal(byName['data.size'], undefined)
+  assert.equal(byName['data.reference'].column, 'reference')
+  assert.equal(byName['data.reference'].mode, 'contains')
+  assert.equal(byName['data.status'].column, 'status')
+  assert.equal(byName['data.status'].mode, 'equals')
+  const all = filterRecords(rows, rules, { body: { userId: 'user-ada', data: { nextCursor: '0', size: 20 } }, query: {} })
+  assert.deepEqual(all.map((row) => row.id), [1, 2, 3])
+  const booked = filterRecords(rows, rules, {
+    body: { userId: 'user-ada', data: { nextCursor: '0', size: 20, status: 'BOOKED' } },
+    query: {},
+  })
+  assert.deepEqual(booked.map((row) => row.id), [2, 3])
+  const both = filterRecords(rows, rules, {
+    body: { userId: 'user-ada', data: { reference: 'SHP', status: 'BOOKED' } },
+    query: {},
+  })
+  assert.deepEqual(both.map((row) => row.id), [2])
+})
+
+test('the shipment example workbook matches the query response columns', async () => {
+  const buffer = readFileSync(new URL('../../public/examples/shipments.xlsx', import.meta.url))
+  const rows = await parseRecordBuffer(buffer, 'shipments.xlsx')
+  assert.equal(rows.length, 48)
+  assert.deepEqual(Object.keys(rows[0]), [
+    'id', 'reference', 'recipient', 'destination', 'weightKg', 'priority', 'status', 'insured', 'readyDate', 'cutoffTime', 'bookedAt',
+    'packaging.type', 'packaging.dimensions.lengthCm', 'packaging.dimensions.widthCm', 'packaging.dimensions.heightCm',
+    'packaging.label.code', 'packaging.label.carrier',
+  ])
+  assert.equal(rows[0].id, 1)
+  assert.equal(rows[0].reference, 'SHP-1001')
+  assert.equal(rows[0].destination, 'HK')
+  assert.equal(rows[0].readyDate, '2026-03-01')
+  assert.equal(rows[0].cutoffTime, '08:30:00')
+  assert.equal(rows[0].bookedAt, '2026-03-01T10:15:30Z')
+  assert.equal(rows[0]['packaging.type'], 'BOX')
+  assert.equal(rows[0]['packaging.dimensions.lengthCm'], 10)
+  assert.equal(rows[0]['packaging.label.code'], 'LBL-1001')
+  assert.equal(rows[3]['packaging.type'], null)
+  assert.equal(rows[35].reference, 'SHP-1036')
+  assert.equal(rows[36].reference, 'HK-2001')
+  assert.equal(rows[47].id, 48)
+  assert.equal(rows[4].readyDate, null)
 })

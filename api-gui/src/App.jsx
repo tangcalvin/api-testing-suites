@@ -58,14 +58,14 @@ import {
   detectPayloadId,
   resolvedId,
   payloadIdFields,
+  aroundRequest,
   assignFixture,
   enquiryShouldMiss,
   enquiryTarget,
   fixtureEnabled,
-  fixtureRequest,
   fixtureSteps,
+  parseJsonBody,
   readCreatedId,
-  sampleCall,
   withFixtureId,
   applyErrorOverrides,
   applyErrorInclude,
@@ -331,8 +331,8 @@ export default function App() {
     if (!pageRate.current.touched) setTps(storedRate(defaults.tps))
   }, [activeId, selectedId, defaults.tps])
   const preparation = useMemo(
-    () => fixtureSteps(selected, operations, defaults, savedRecordId),
-    [defaults, operations, selected, savedRecordId],
+    () => (selected ? fixtureSteps(selected, operations, defaults, savedRecordId, customCases.steps?.[selected.id] || {}) : null),
+    [customCases.steps, defaults, operations, savedRecordId, selected],
   )
   const finishedChecks = results.filter((result) => !result.step).length
 
@@ -955,13 +955,14 @@ export default function App() {
     })
   }
 
-  function writeFixtureStep(operationId, role, enabled) {
-    const fallback = role !== 'enquiry'
+  function writeFixtureStep(operationId, patch) {
     setCustomCases((current) => {
       const steps = { ...(current.steps || {}) }
-      const operation = { ...(steps[operationId] || {}) }
-      if (enabled === fallback) delete operation[role]
-      else operation[role] = enabled
+      const operation = { ...(steps[operationId] || {}), ...patch }
+      for (const [key, value] of Object.entries(patch)) {
+        if (value === undefined || value === null || value === '') delete operation[key]
+        if (value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length === 0) delete operation[key]
+      }
       if (Object.keys(operation).length === 0) delete steps[operationId]
       else steps[operationId] = operation
       return { ...current, steps }
@@ -1066,14 +1067,18 @@ export default function App() {
       return
     }
     const next = []
-    const around = fixtureSteps(selected, operations, defaults, customCases.ids?.[selected.id])
-    const plan = around?.plan || null
     const savedSteps = customCases.steps?.[selected.id] || {}
-    const useBefore = activeMode !== 'trial' && Boolean(plan) && fixtureEnabled(savedSteps, 'before')
-    const useAfter = useBefore && Boolean(plan?.cleanup) && fixtureEnabled(savedSteps, 'after')
-    const useEnquiry = activeMode !== 'trial' && Boolean(around?.enquiry) && fixtureEnabled(savedSteps, 'enquiry')
-    const assigned = useBefore ? assignFixture(cases, plan) : cases
+    const around = fixtureSteps(selected, operations, defaults, customCases.ids?.[selected.id], savedSteps)
+    const plan = around?.plan || null
+    const beforeOp = around?.calls?.find((call) => call.role === 'before')?.operation || null
+    const afterOp = around?.calls?.find((call) => call.role === 'after')?.operation || null
+    const enquiryOp = around?.enquiry || null
+    const useBefore = activeMode !== 'trial' && Boolean(beforeOp) && fixtureEnabled(savedSteps, 'before')
+    const useAfter = activeMode !== 'trial' && Boolean(afterOp) && fixtureEnabled(savedSteps, 'after')
+    const useEnquiry = activeMode !== 'trial' && Boolean(enquiryOp) && fixtureEnabled(savedSteps, 'enquiry')
+    const assigned = useBefore && plan ? assignFixture(cases, plan) : cases
     let sharedId = null
+    let beforeContext = null
     const releaseIds = []
     const headers = requestHeaders(defaults)
     const sendOnce = async (operation, item, honorStop) => {
@@ -1091,32 +1096,41 @@ export default function App() {
     }
     const createRecord = async () => {
       setActivity('creating a record to test')
-      const response = await sendOnce(plan.create, sampleCall(plan.create, defaults), true)
+      const request = aroundRequest(beforeOp, around.fields.before, null, defaults)
+      const response = await sendOnce(beforeOp, request, true)
       if (!response) return { stopped: true }
-      return { id: readCreatedId(response.status, response.text, response.location), response }
+      const id = readCreatedId(response.status, response.text, response.location)
+      beforeContext = { request: response.request, response: parseJsonBody(response.text) }
+      return { id, response }
     }
     const pushResult = (entry) => {
       next.push({ index: next.length + 1, ...entry })
       setResults([...next])
     }
     const noteCreate = (response, id, label) => {
+      const ok = response.status >= 200 && response.status < 300
       pushResult({
         step: 'before',
         label,
         status: response.status,
-        passed: id != null,
-        detail: id != null ? `Created id ${id}.` : 'Creating a record did not return an id.',
+        passed: plan ? id != null : ok,
+        detail: id != null
+          ? `Created id ${id}.`
+          : (ok ? 'Before call succeeded.' : 'Before call failed.'),
         text: pretty(response.text),
         ...(response.request ? { request: response.request } : {}),
       })
     }
     try {
-      if (assigned.some((item) => item.needsFixture)) {
+      const needsShared = Boolean(plan) && assigned.some((item) => item.needsFixture)
+      if (useBefore && (needsShared || !plan)) {
         const created = await createRecord()
         if (created.stopped) return
-        noteCreate(created.response, created.id, `Before · ${plan.create.method} ${plan.create.path}`)
-        if (created.id == null) return
-        sharedId = created.id
+        noteCreate(created.response, created.id, `Before · ${beforeOp.method} ${beforeOp.path}`)
+        if (needsShared) {
+          if (created.id == null) return
+          sharedId = created.id
+        }
       }
       for (let index = 0; index < assigned.length; index += 1) {
         if (stopRef.current) break
@@ -1125,7 +1139,7 @@ export default function App() {
         if (item.ownRecord) {
           const created = await createRecord()
           if (created.stopped) break
-          noteCreate(created.response, created.id, `Before · ${plan.create.method} ${plan.create.path}`)
+          noteCreate(created.response, created.id, `Before · ${beforeOp.method} ${beforeOp.path}`)
           if (created.id == null) break
           ownId = created.id
           item = withFixtureId(item, plan.idField, ownId, plan.location)
@@ -1161,18 +1175,24 @@ export default function App() {
           const expectedRows = filterRecords(table.rows, rules, response.request || { body: item.body, query: item.query, path: item.path })
           const actualRows = (response.records || []).map((record) => record.value)
           const compared = compareRecords(expectedRows, actualRows, { ordered: Boolean(table.ordered) })
-          verdict.detail = [verdict.detail, compared.detail].filter(Boolean).join(' ')
+          verdict.detail = [verdict.detail, compared.detail].filter(Boolean).join('\n')
           if (!compared.passed) verdict.passed = false
         }
+        const request = response.request || { body: item.body, query: item.query, path: item.path }
         let enquiry = null
-        const target = useEnquiry ? enquiryTarget(item, plan.idField, plan.location) : null
-        if (target != null && !stopRef.current) {
+        if (useEnquiry && enquiryOp && !stopRef.current) {
           setActivity('reading the record back')
-          const follow = await sendOnce(around.enquiry, fixtureRequest(around.enquiry, plan, target, defaults), true)
+          const target = plan ? enquiryTarget(item, plan.idField, plan.location) : null
+          const previous = {
+            request,
+            response: parseJsonBody(bodyText),
+          }
+          const inject = plan && target != null ? { [plan.idField]: target } : {}
+          const follow = await sendOnce(enquiryOp, aroundRequest(enquiryOp, around.fields.enquiry, previous, defaults, inject), true)
           if (follow) {
             const miss = enquiryShouldMiss(item, response.status, ownId != null)
             const ok = miss ? follow.status === 404 : follow.status >= 200 && follow.status < 300
-            const call = `${around.enquiry.method} ${around.enquiry.path}`
+            const call = `${enquiryOp.method} ${enquiryOp.path}`
             enquiry = { status: follow.status, text: pretty(follow.text), label: call }
             const note = ok
               ? `Enquiry ${call} returned ${follow.status}.`
@@ -1181,7 +1201,6 @@ export default function App() {
             if (!ok) verdict.passed = false
           }
         }
-        const request = response.request || { body: item.body, query: item.query, path: item.path }
         pushResult({
           label: item.label,
           status: response.status,
@@ -1197,17 +1216,22 @@ export default function App() {
     } finally {
       const leftover = [...releaseIds]
       if (sharedId != null) leftover.push(sharedId)
-      if (useAfter && leftover.length > 0) {
+      if (useAfter && afterOp) {
         setActivity('removing the record created for this run')
-        for (const id of leftover) {
-          const response = await sendOnce(plan.cleanup, fixtureRequest(plan.cleanup, plan, id, defaults), false)
+        const ids = leftover.length > 0 ? leftover : [null]
+        for (const id of ids) {
+          const inject = plan && id != null ? { [plan.idField]: id } : {}
+          const previous = beforeContext || { request: null, response: null }
+          const response = await sendOnce(afterOp, aroundRequest(afterOp, around.fields.after, previous, defaults, inject), false)
           const removed = Boolean(response) && (response.status === 404 || (response.status >= 200 && response.status < 300))
           pushResult({
             step: 'after',
-            label: `After · ${plan.cleanup.method} ${plan.cleanup.path}`,
+            label: `After · ${afterOp.method} ${afterOp.path}`,
             status: response?.status || 0,
             passed: removed,
-            detail: removed ? `Removed id ${id}.` : 'The record created for this run could not be removed.',
+            detail: id != null
+              ? (removed ? `Removed id ${id}.` : 'The record created for this run could not be removed.')
+              : (removed ? 'After call succeeded.' : 'After call failed.'),
             text: pretty(response?.text || ''),
             ...(response?.request ? { request: response.request } : {}),
           })
@@ -1777,9 +1801,11 @@ export default function App() {
                   {preparation && activeMode !== 'trial' && (
                     <FixtureCalls
                       calls={preparation.calls}
+                      operations={operations}
                       saved={customCases.steps?.[selected.id]}
+                      fields={preparation.fields}
                       disabled={running}
-                      onChange={(role, enabled) => writeFixtureStep(selected.id, role, enabled)}
+                      onChange={(patch) => writeFixtureStep(selected.id, patch)}
                     />
                   )}
                   <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ alignItems: { sm: 'center' } }}>
@@ -1971,7 +1997,7 @@ export default function App() {
                       </TableCell>
                       <TableCell sx={{ fontVariantNumeric: 'tabular-nums', fontWeight: 650 }}>{result.status || '—'}</TableCell>
                       <TableCell>{result.label}</TableCell>
-                      <TableCell sx={{ color: 'text.secondary' }}>{result.detail}</TableCell>
+                      <TableCell sx={{ color: 'text.secondary' }}>{String(result.detail || '').replace(/\n+/g, ' ')}</TableCell>
                       <TableCell onClick={(event) => event.stopPropagation()} onMouseDown={(event) => event.stopPropagation()}>
                         <ResponsePreview result={result} />
                       </TableCell>
@@ -2117,6 +2143,7 @@ function ExpectedField({ field, status, automatic, stored, hasOverride, objectAr
   const shown = stored.text
   const ordered = stored.ordered
   const ignoreCase = stored.ignoreCase === true
+  const nullable = stored.nullable === true
   const rules = stored.rules || []
   const objectArrayError = objectArray ? parseObjectArray(shown)?.error : ''
   const regexIssue = match === 'regex' && shown ? compilePattern(shown).error : ''
@@ -2124,12 +2151,17 @@ function ExpectedField({ field, status, automatic, stored, hasOverride, objectAr
   const patternOptions = shown && match === 'pattern' && !names.includes(shown) ? [shown, ...names] : names
 
   function write(patch) {
-    const next = { text: shown, ordered, match, ignoreCase, rules, ...patch }
+    const next = { text: shown, ordered, match, ignoreCase, nullable, rules, ...patch }
+    if (next.match === 'null') next.nullable = false
     if (objectArray) {
-      onExpected(status, field.name, next.ordered || next.text ? storedExpectation({ ...next, match: 'equals' }) : undefined)
+      onExpected(status, field.name, next.ordered || next.text || next.nullable ? storedExpectation({ ...next, match: 'equals' }) : undefined)
       return
     }
-    if (next.match === 'equals' && next.text === automatic && !next.ordered && !next.ignoreCase) {
+    if (next.match === 'null') {
+      onExpected(status, field.name, storedExpectation({ ...next, match: 'null', text: '', nullable: false }))
+      return
+    }
+    if (next.match === 'equals' && next.text === automatic && !next.ordered && !next.ignoreCase && !next.nullable) {
       onExpected(status, field.name, undefined)
       return
     }
@@ -2165,12 +2197,18 @@ function ExpectedField({ field, status, automatic, stored, hasOverride, objectAr
           >
             <MenuItem value="equals">Value</MenuItem>
             <MenuItem value="expression">Expression</MenuItem>
+            <MenuItem value="null">Null</MenuItem>
             <MenuItem value="pattern">Pattern</MenuItem>
             <MenuItem value="regex">Regex</MenuItem>
             <MenuItem value="when">When</MenuItem>
           </TextField>
         )}
-        {match !== 'when' && (match === 'pattern' ? (
+        {match === 'null' && (
+          <Typography variant="caption" color="text.secondary" sx={{ alignSelf: 'center' }}>
+            Expects null
+          </Typography>
+        )}
+        {match !== 'when' && match !== 'null' && (match === 'pattern' ? (
           <TextField
             select
             size="small"
@@ -2230,6 +2268,22 @@ function ExpectedField({ field, status, automatic, stored, hasOverride, objectAr
                 />
               )}
               label="Case"
+            />
+          </Tooltip>
+        )}
+        {match !== 'null' && !objectArray && (
+          <Tooltip title="Also accept JSON null">
+            <FormControlLabel
+              sx={{ mr: 0, ml: 0, flexShrink: 0 }}
+              control={(
+                <Checkbox
+                  size="small"
+                  checked={nullable}
+                  onChange={(event) => write({ nullable: event.target.checked })}
+                  inputProps={{ 'aria-label': 'Nullable' }}
+                />
+              )}
+              label="Nullable"
             />
           </Tooltip>
         )}
@@ -2353,15 +2407,22 @@ function ExpectedWhenEditor({ rules, fields, patterns, onChange }) {
                 >
                   <MenuItem value="equals">Value</MenuItem>
                   <MenuItem value="expression">Expression</MenuItem>
+                  <MenuItem value="null">Null</MenuItem>
                   <MenuItem value="pattern">Pattern</MenuItem>
                   <MenuItem value="regex">Regex</MenuItem>
                 </TextField>
+                {current.match === 'null' ? (
+                  <Typography variant="caption" color="text.secondary" sx={{ alignSelf: 'center' }}>
+                    Expects null
+                  </Typography>
+                ) : (
                 <ExpectedThenInput
                   match={current.match}
                   text={current.text}
                   patterns={patterns}
                   onChange={(text) => update(index, { text })}
                 />
+                )}
                 {(current.match === 'equals' || current.match === 'expression') && (
                   <Tooltip title="Case sensitive">
                     <FormControlLabel
@@ -2442,7 +2503,9 @@ function ExpectedThenInput({ match, text, patterns, onChange }) {
 function emptyWhenRule(rule) {
   return {
     when: Array.isArray(rule?.when) ? rule.when : [],
-    match: rule?.match === 'pattern' || rule?.match === 'regex' || rule?.match === 'expression' ? rule.match : 'equals',
+    match: rule?.match === 'pattern' || rule?.match === 'regex' || rule?.match === 'expression' || rule?.match === 'null'
+      ? rule.match
+      : 'equals',
     text: rule?.text == null ? '' : String(rule.text),
     ignoreCase: rule?.ignoreCase === true,
   }
@@ -2538,7 +2601,7 @@ function ResponseSchema({ responses, requestNames, expected, patterns = {}, onEx
           ) : (
             <Box sx={{ maxHeight: 280, overflow: 'auto' }}>
               <Typography variant="caption" color="text.secondary" sx={{ display: 'block', px: 1.5, py: 0.75, borderBottom: 1, borderColor: 'divider' }}>
-                {'@{name}'} is the value sent for that request field. A null or omitted request field, including a blank list filter, is treated as any value and is not compared. Text is compared after leading and trailing spaces are removed, and a value that is only spaces is null. A success field with the same name starts as that reference, except nextCursor, which is a new token for the next page. Clear a value to skip it. {'${name}'} still reads a variable. Pattern uses a named regular expression from Setting. Regex accepts a pattern here, optionally written as /pattern/flags. When applies the first matching rule: each rule can require other fields to equal a value, be null, or be not null, then check this field as a value, pattern, or regex. Case keeps a value comparison case sensitive. For an array of objects, enter a JSON array. Each object must appear, and only the fields you include are compared. In sequence requires those objects to be the first items, in the order you wrote.
+                {'@{name}'} is the value sent for that request field. A null or omitted request field, including a blank list filter, is treated as any value and is not compared. Text is compared after leading and trailing spaces are removed, and a value that is only spaces is null. A success field with the same name starts as that reference, except nextCursor, which is a new token for the next page. Clear a value to skip it. {'${name}'} still reads a variable. Null expects the JSON value null. Nullable accepts null in addition to the expected value, pattern, or regex. Pattern uses a named regular expression from Setting. Regex accepts a pattern here, optionally written as /pattern/flags. When applies the first matching rule: each rule can require other fields to equal a value, be null, or be not null, then check this field as a value, null, pattern, or regex. Case keeps a value comparison case sensitive. For an array of objects, enter a JSON array. Each object must appear, and only the fields you include are compared. In sequence requires those objects to be the first items, in the order you wrote.
               </Typography>
               <Table size="small">
                 <TableHead>
@@ -4466,15 +4529,17 @@ function RecordSet({ fields, columns, pagination, dataset, overrides, onDataset,
           <Button size="small" color="inherit" onClick={() => setOpen((value) => !value)} endIcon={<ExpandMoreIcon sx={{ transform: open ? 'none' : 'rotate(-90deg)' }} />}>
             Filter rules
           </Button>
-          <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>{filterSummary(rules)}</Typography>
+          <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+            Request fields (left) filter the Excel using the matching Excel / response column (right). {filterSummary(rules)}
+          </Typography>
           <Collapse in={open}>
-            <Box sx={{ overflow: 'auto', maxHeight: 240, mt: 0.5 }}>
+            <Box sx={{ overflow: 'auto', maxHeight: 280, mt: 0.5 }}>
               <Table size="small" sx={{ width: '100%' }}>
                 <TableHead>
                   <TableRow>
-                    <TableCell>Filter</TableCell>
-                    <TableCell sx={{ width: '34%' }}>How</TableCell>
-                    <TableCell sx={{ width: '34%' }}>Record field</TableCell>
+                    <TableCell>Request field</TableCell>
+                    <TableCell sx={{ width: '28%' }}>How it filters</TableCell>
+                    <TableCell sx={{ width: '34%' }}>Excel / response column</TableCell>
                   </TableRow>
                 </TableHead>
                 <TableBody>
@@ -4485,7 +4550,9 @@ function RecordSet({ fields, columns, pagination, dataset, overrides, onDataset,
                       <TableRow key={rule.field}>
                         <TableCell>
                           <Typography variant="body2">{rule.field}</Typography>
-                          {rule.or ? <Typography variant="caption" color="text.secondary">Any of this group</Typography> : null}
+                          <Typography variant="caption" color="text.secondary">
+                            {[rule.location || 'body', rule.or ? 'any of this group' : ''].filter(Boolean).join(' · ')}
+                          </Typography>
                         </TableCell>
                         <TableCell>
                           <TextField
@@ -4506,7 +4573,7 @@ function RecordSet({ fields, columns, pagination, dataset, overrides, onDataset,
                             fullWidth
                             value={rule.column}
                             onChange={(event) => onFilter(rule.field, { mode: rule.mode, column: event.target.value }, origin)}
-                            {...(unmapped ? { helperText: 'Not in the response' } : {})}
+                            {...(unmapped ? { helperText: 'Not in the uploaded Excel or response' } : {})}
                           />
                         </TableCell>
                       </TableRow>
@@ -4801,7 +4868,11 @@ function ResultDialog({ result, onClose }) {
       </DialogTitle>
       <DialogContent dividers>
         <Stack spacing={1.25}>
-          {result.detail && <Typography variant="body2" color="text.secondary">{result.detail}</Typography>}
+          {result.detail && (
+            <Typography variant="body2" color="text.secondary" sx={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+              {result.detail}
+            </Typography>
+          )}
           {displayRequest(result.request) && (
             <PayloadBlock title="Request" text={displayRequest(result.request)} />
           )}
@@ -4880,48 +4951,178 @@ function CopyButton({ label, text }) {
   )
 }
 
-function FixtureCalls({ calls, saved, disabled, onChange }) {
-  const beforeOn = fixtureEnabled(saved, 'before')
+function FixtureCalls({ calls, operations, saved, fields, disabled, onChange }) {
+  const [openRole, setOpenRole] = useState('')
+  const listed = Array.isArray(operations) ? operations : []
   return (
     <Box sx={{ border: 1, borderColor: 'divider', borderRadius: 1, px: 1.5, py: 1 }}>
-      <Typography variant="subtitle2" sx={{ mb: 0.75 }}>Calls around this run</Typography>
-      <Stack spacing={0.5}>
+      <Typography variant="subtitle2" sx={{ mb: 0.25 }}>Calls around this run</Typography>
+      <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 0.75 }}>
+        Available on every endpoint. Pick a call when none is detected. Fields default to Auto: same name from the previous request, then response, then Setting defaults. Override with Default, Request, Response, or a Value. Values can use @{'{request.path}'} and @{'{response.path}'}.
+      </Typography>
+      <Stack spacing={1}>
         {calls.map((call) => {
-          const locked = call.role === 'after' && !beforeOn
-          const checked = fixtureEnabled(saved, call.role) && !locked
+          const checked = fixtureEnabled(saved, call.role)
+          const selectedId = call.operation?.id || ''
+          const fallback = call.role !== 'enquiry'
+          const mapping = fields?.[call.role] || {}
+          const open = openRole === call.role
           return (
-            <FormControlLabel
-              key={call.role}
-              sx={{ m: 0, alignItems: 'flex-start' }}
-              control={(
-                <Checkbox
-                  size="small"
-                  checked={checked}
-                  disabled={disabled || locked}
-                  onChange={(event) => onChange(call.role, event.target.checked)}
-                  sx={{ pt: 0.25 }}
-                />
-              )}
-              label={(
-                <Stack spacing={0.15}>
-                  <Stack direction="row" spacing={1} useFlexGap sx={{ alignItems: 'center', flexWrap: 'wrap' }}>
-                    <Typography variant="body2" sx={{ width: 64, fontWeight: 700 }}>
-                      {call.role === 'before' ? 'Before' : call.role === 'after' ? 'After' : 'Enquiry'}
-                    </Typography>
-                    <MethodBadge method={call.operation.method} />
-                    <Typography variant="body2" sx={{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}>{call.operation.path}</Typography>
-                    <Typography variant="body2" color="text.secondary">{call.operation.summary}</Typography>
-                  </Stack>
-                  <Typography variant="caption" color="text.secondary">
-                    {locked ? 'Turn on Before to remove the record this run creates.' : call.hint}
-                  </Typography>
+            <Box key={call.role} sx={{ border: 1, borderColor: 'divider', borderRadius: 1, px: 1, py: 0.75 }}>
+              <Stack spacing={0.75}>
+                <Stack direction="row" spacing={1} useFlexGap sx={{ alignItems: 'flex-start', flexWrap: 'wrap' }}>
+                  <FormControlLabel
+                    sx={{ m: 0, mr: 0.5 }}
+                    control={(
+                      <Checkbox
+                        size="small"
+                        checked={checked}
+                        disabled={disabled || !selectedId}
+                        onChange={(event) => {
+                          const enabled = event.target.checked
+                          onChange({ [call.role]: enabled === fallback ? undefined : enabled })
+                        }}
+                      />
+                    )}
+                    label={(
+                      <Typography variant="body2" sx={{ width: 64, fontWeight: 700 }}>
+                        {call.role === 'before' ? 'Before' : call.role === 'after' ? 'After' : 'Enquiry'}
+                      </Typography>
+                    )}
+                  />
+                  <TextField
+                    select
+                    size="small"
+                    value={selectedId}
+                    disabled={disabled}
+                    onChange={(event) => {
+                      const next = event.target.value
+                      const patch = { [`${call.role}Op`]: next || undefined }
+                      if (!next) patch[call.role] = undefined
+                      onChange(patch)
+                    }}
+                    sx={{ minWidth: 280, flex: 1 }}
+                    slotProps={{ htmlInput: { 'aria-label': `${call.role} operation` } }}
+                  >
+                    <MenuItem value="">{call.detected ? 'Detected call' : 'Choose a call'}</MenuItem>
+                    {listed.map((operation) => (
+                      <MenuItem key={operation.id} value={operation.id}>
+                        {operation.method} {operation.path}
+                      </MenuItem>
+                    ))}
+                  </TextField>
+                  {selectedId ? (
+                    <Button
+                      size="small"
+                      color="inherit"
+                      disabled={disabled}
+                      onClick={() => setOpenRole((value) => (value === call.role ? '' : call.role))}
+                      endIcon={<ExpandMoreIcon sx={{ transform: open ? 'none' : 'rotate(-90deg)' }} />}
+                    >
+                      Fields
+                    </Button>
+                  ) : null}
                 </Stack>
-              )}
-            />
+                <Typography variant="caption" color="text.secondary">
+                  {call.operation
+                    ? `${call.detected ? 'Detected · ' : 'Manual · '}${call.operation.summary || call.operation.id}. ${call.hint}`
+                    : 'No call detected. Choose an operation to enable this step.'}
+                </Typography>
+                <Collapse in={open && Boolean(call.operation)}>
+                  <AroundFieldMap
+                    operation={call.operation}
+                    mapping={mapping}
+                    disabled={disabled}
+                    previousHint={call.role === 'before' ? 'Before has no previous call, so Auto uses defaults.' : 'Previous is the earlier call in this run (request and response).'}
+                    onChange={(next) => onChange({ [`${call.role}Fields`]: Object.keys(next).length ? next : undefined })}
+                  />
+                </Collapse>
+              </Stack>
+            </Box>
           )
         })}
       </Stack>
     </Box>
+  )
+}
+
+function AroundFieldMap({ operation, mapping, disabled, previousHint, onChange }) {
+  const fields = (operation?.fields || []).filter((field) => field?.name && !field.object)
+  if (fields.length === 0) {
+    return <Typography variant="caption" color="text.secondary">This call has no scalar fields to map.</Typography>
+  }
+  function write(name, patch) {
+    const current = mapping?.[name] || { source: 'auto', path: '', value: '' }
+    const nextEntry = { ...current, ...patch }
+    const next = { ...mapping }
+    if (nextEntry.source === 'auto' && !nextEntry.path && !nextEntry.value) delete next[name]
+    else next[name] = nextEntry
+    onChange(next)
+  }
+  return (
+    <Stack spacing={0.5} sx={{ mt: 0.5 }}>
+      <Typography variant="caption" color="text.secondary">{previousHint}</Typography>
+      <Box sx={{ overflow: 'auto', maxHeight: 240 }}>
+        <Table size="small">
+          <TableHead>
+            <TableRow>
+              <TableCell>Field</TableCell>
+              <TableCell sx={{ width: '28%' }}>Source</TableCell>
+              <TableCell>Path / value</TableCell>
+            </TableRow>
+          </TableHead>
+          <TableBody>
+            {fields.map((field) => {
+              const entry = mapping?.[field.name] || { source: 'auto', path: '', value: '' }
+              const source = entry.source || 'auto'
+              return (
+                <TableRow key={field.name}>
+                  <TableCell>
+                    <Typography variant="body2">{field.name}</Typography>
+                    <Typography variant="caption" color="text.secondary">{field.location || 'body'}</Typography>
+                  </TableCell>
+                  <TableCell>
+                    <TextField
+                      select
+                      size="small"
+                      fullWidth
+                      value={source}
+                      disabled={disabled}
+                      onChange={(event) => write(field.name, { source: event.target.value, path: entry.path || '', value: entry.value || '' })}
+                    >
+                      <MenuItem value="auto">Auto</MenuItem>
+                      <MenuItem value="default">Default</MenuItem>
+                      <MenuItem value="request">Request</MenuItem>
+                      <MenuItem value="response">Response</MenuItem>
+                      <MenuItem value="value">Value</MenuItem>
+                    </TextField>
+                  </TableCell>
+                  <TableCell>
+                    {source === 'auto' || source === 'default' ? (
+                      <Typography variant="caption" color="text.secondary">
+                        {source === 'auto' ? 'Previous request → response → default' : 'Setting / sample default'}
+                      </Typography>
+                    ) : (
+                      <TextField
+                        size="small"
+                        fullWidth
+                        disabled={disabled}
+                        value={source === 'value' ? (entry.value || '') : (entry.path || '')}
+                        placeholder={source === 'value' ? '@{response.data.id}' : field.name}
+                        onChange={(event) => write(field.name, source === 'value'
+                          ? { source, value: event.target.value, path: entry.path || '' }
+                          : { source, path: event.target.value, value: entry.value || '' })}
+                        sx={{ '& input': { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12.5 } }}
+                      />
+                    )}
+                  </TableCell>
+                </TableRow>
+              )
+            })}
+          </TableBody>
+        </Table>
+      </Box>
+    </Stack>
   )
 }
 

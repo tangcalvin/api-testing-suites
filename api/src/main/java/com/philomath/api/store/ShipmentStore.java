@@ -3,6 +3,7 @@ package com.philomath.api.store;
 import com.philomath.api.dto.Shipment;
 import com.philomath.api.dto.ShipmentPage;
 import com.philomath.api.dto.ShipmentRequest;
+import com.philomath.api.dto.ShipmentStatus;
 import com.philomath.api.dto.ShipmentUpdate;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
@@ -31,12 +32,10 @@ public class ShipmentStore {
     }
 
     @Transactional(readOnly = true)
-    public ShipmentPage query(long startId, int size, String reference) {
+    public ShipmentPage query(long startId, int size, String reference, ShipmentStatus status) {
         String filter = reference == null ? "" : reference.trim();
         PageRequest page = PageRequest.of(0, size + 1);
-        List<ShipmentEntity> rows = filter.isEmpty()
-                ? shipments.findByIdGreaterThanEqualOrderByIdAsc(startId, page)
-                : shipments.findByIdGreaterThanEqualAndReferenceContainingIgnoreCaseOrderByIdAsc(startId, filter, page);
+        List<ShipmentEntity> rows = shipments.search(startId, filter, status, page);
         boolean more = rows.size() > size;
         List<ShipmentEntity> content = more ? rows.subList(0, size) : rows;
         String nextCursor = more ? ShipmentCursors.encode(rows.get(size).getId()) : ShipmentCursors.START;

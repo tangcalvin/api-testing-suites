@@ -1,6 +1,7 @@
 package com.philomath.api.dto;
 
 import io.swagger.v3.oas.annotations.media.Schema;
+import jakarta.validation.Valid;
 import jakarta.validation.constraints.DecimalMax;
 import jakarta.validation.constraints.DecimalMin;
 import jakarta.validation.constraints.NotBlank;
@@ -11,7 +12,6 @@ import jakarta.validation.constraints.Size;
 import java.time.LocalDate;
 import java.time.LocalTime;
 import java.time.OffsetDateTime;
-import java.util.Map;
 
 @Schema(description = "Fields accepted when creating a shipment")
 public record ShipmentRequest(
@@ -55,8 +55,7 @@ public record ShipmentRequest(
         @Schema(description = "When the booking was recorded", example = "2026-03-01T10:15:30Z", format = "date-time")
         OffsetDateTime bookedAt,
 
-        @Schema(description = "Must be an empty object when sent.", example = "{}", additionalProperties = Schema.AdditionalPropertiesValue.FALSE)
-        @Size(max = 0)
-        Map<String, Object> packaging
+        @Valid
+        Packaging packaging
 ) {
 }

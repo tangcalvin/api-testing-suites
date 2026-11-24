@@ -1,5 +1,6 @@
 package com.philomath.api.store;
 
+import com.philomath.api.dto.Packaging;
 import com.philomath.api.dto.Priority;
 import com.philomath.api.dto.Shipment;
 import com.philomath.api.dto.ShipmentRequest;
@@ -13,11 +14,12 @@ import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
+import org.hibernate.annotations.JdbcTypeCode;
+import org.hibernate.type.SqlTypes;
 
 import java.time.LocalDate;
 import java.time.LocalTime;
 import java.time.OffsetDateTime;
-import java.util.Map;
 
 @Entity
 @Table(name = "shipment")
@@ -59,8 +61,9 @@ public class ShipmentEntity {
     @Column
     private OffsetDateTime bookedAt;
 
-    @Column
-    private Boolean packaging;
+    @JdbcTypeCode(SqlTypes.JSON)
+    @Column(columnDefinition = "json")
+    private Packaging packaging;
 
     public static ShipmentEntity from(ShipmentRequest request) {
         ShipmentEntity entity = new ShipmentEntity();
@@ -107,7 +110,7 @@ public class ShipmentEntity {
             LocalDate readyDate,
             LocalTime cutoffTime,
             OffsetDateTime bookedAt,
-            Map<String, Object> packaging
+            Packaging packaging
     ) {
         this.reference = Text.trim(reference);
         this.recipient = Text.trim(recipient);
@@ -119,7 +122,7 @@ public class ShipmentEntity {
         this.readyDate = readyDate;
         this.cutoffTime = cutoffTime;
         this.bookedAt = bookedAt;
-        this.packaging = packaging == null ? null : Boolean.TRUE;
+        this.packaging = packaging;
     }
 
     public Shipment toRecord() {
@@ -135,7 +138,7 @@ public class ShipmentEntity {
                 readyDate,
                 cutoffTime,
                 bookedAt,
-                Boolean.TRUE.equals(packaging) ? Map.of() : null
+                packaging
         );
     }
 

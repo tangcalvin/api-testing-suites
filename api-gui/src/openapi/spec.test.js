@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { OMIT, OBJECT_COMPOSITE, OBJECT_FIELDS, applyPaging, collectPaging, individualChoices, buildIndividualCases, applyErrorOverrides, applyErrorInclude, applyErrorRowToGroup, assignFixture, buildCases, buildCustomCases, buildCustomErrorCases, buildErrorCases, buildTrialCases, caseCount, combinationObjectMode, compilePattern, compositeField, detectPagination, enquiryShouldMiss, enquiryTarget, fillRunRequests, firstPageQuery, fixtureEnabled, fixtureNote, fixturePlan, fixtureRequest, fixtureSteps, includedErrorCases, judge, listOperations, operationGroups, operationRole, parseSpecText, planContinuation, readCreatedId, readItems, recordId, detectPayloadId, idNameRank, resolvedId, readExpectation, responseChecks, responseViews, responsesForMode, sampleCall, scalarCombinationField, specGaps, storedExpectation, textCombinationField, underComposite, viewsWithStatuses, withFixtureId, withTextCombinationValues } from './spec.js'
+import { OMIT, OBJECT_COMPOSITE, OBJECT_FIELDS, applyPaging, aroundRequest, collectPaging, individualChoices, buildIndividualCases, applyErrorOverrides, applyErrorInclude, applyErrorRowToGroup, assignFixture, buildCases, buildCustomCases, buildCustomErrorCases, buildErrorCases, buildTrialCases, caseCount, combinationObjectMode, compilePattern, compositeField, detectPagination, enquiryShouldMiss, enquiryTarget, fillRunRequests, firstPageQuery, fixtureEnabled, fixtureNote, fixturePlan, fixtureRequest, fixtureSteps, includedErrorCases, judge, listOperations, operationGroups, operationRole, parseSpecText, planContinuation, readCreatedId, readItems, recordId, detectPayloadId, idNameRank, resolvedId, readExpectation, responseChecks, responseViews, responsesForMode, sampleCall, scalarCombinationField, specGaps, storedExpectation, textCombinationField, underComposite, viewsWithStatuses, withFixtureId, withTextCombinationValues } from './spec.js'
 import { resolvePagination, storedPaging } from './pagination.js'
 
 const SPEC = `
@@ -1629,6 +1629,55 @@ test('response expectations compare a sent request field and a typed value', () 
   assert.match(kept.detail, /orderNumber expected AB/)
 })
 
+test('a response field can expect null, or allow null with nullable', () => {
+  assert.deepEqual(storedExpectation({ match: 'null', text: '' }), { match: 'null' })
+  assert.equal(readExpectation({ match: 'null' }).match, 'null')
+  assert.equal(readExpectation({ match: 'nullable' }).match, 'null')
+  assert.deepEqual(storedExpectation({ match: 'equals', text: 'BOX', nullable: true }), { value: 'BOX', nullable: true })
+  assert.equal(readExpectation({ value: 'BOX', nullable: true }).nullable, true)
+  const views = [{ status: '200', fields: [{ name: 'packaging', type: 'object' }, { name: 'status', type: 'string' }] }]
+  assert.deepEqual(
+    responseChecks(views, new Set(), { '200': { packaging: { match: 'null' } } }),
+    { '200': { packaging: { match: 'null' } } },
+  )
+  const alwaysNull = judge(
+    { outcome: 'success' },
+    200,
+    '{"status":"DRAFT","packaging":null}',
+    { request: { body: {}, query: {}, path: {} }, expectations: { '200': { packaging: { match: 'null' } } } },
+  )
+  assert.equal(alwaysNull.passed, true)
+  const missedNull = judge(
+    { outcome: 'success' },
+    200,
+    '{"status":"DRAFT","packaging":{"type":"BOX"}}',
+    { request: { body: {}, query: {}, path: {} }, expectations: { '200': { packaging: { match: 'null' } } } },
+  )
+  assert.equal(missedNull.passed, false)
+  assert.match(missedNull.detail, /packaging expected null/)
+  const nullableValue = judge(
+    { outcome: 'success' },
+    200,
+    '{"status":null}',
+    { request: { body: {}, query: {}, path: {} }, expectations: { '200': { status: { value: 'DRAFT', nullable: true } } } },
+  )
+  assert.equal(nullableValue.passed, true)
+  const nullableMatch = judge(
+    { outcome: 'success' },
+    200,
+    '{"status":"DRAFT"}',
+    { request: { body: {}, query: {}, path: {} }, expectations: { '200': { status: { value: 'DRAFT', nullable: true } } } },
+  )
+  assert.equal(nullableMatch.passed, true)
+  const nullableMiss = judge(
+    { outcome: 'success' },
+    200,
+    '{"status":"BOOKED"}',
+    { request: { body: {}, query: {}, path: {} }, expectations: { '200': { status: { value: 'DRAFT', nullable: true } } } },
+  )
+  assert.equal(nullableMiss.passed, false)
+})
+
 test('a response field can match a typed regex or a named pattern', () => {
   assert.equal(compilePattern('^[A-Z]{2}$').regex.test('HK'), true)
   assert.equal(compilePattern('/ord-\\d+/i').regex.test('ORD-12'), true)
@@ -2119,12 +2168,13 @@ test('a run for one record creates it from the collection and deletes it afterwa
   assert.equal(readCreatedId(400, '{"id":1}', '/api/orders/1'), null)
 
   const getSteps = fixtureSteps(getOne, operations, {})
-  assert.deepEqual(getSteps.calls.map((call) => call.role), ['before', 'after'])
+  assert.deepEqual(getSteps.calls.map((call) => call.role), ['before', 'enquiry', 'after'])
   assert.equal(getSteps.calls[0].operation.id, 'POST /api/orders')
-  assert.equal(getSteps.calls[1].operation.id, 'DELETE /api/orders/{id}')
+  assert.equal(getSteps.calls[1].operation, null)
+  assert.equal(getSteps.calls[2].operation.id, 'DELETE /api/orders/{id}')
   assert.equal(getSteps.enquiry, null)
   const replaceSteps = fixtureSteps(byId['PUT /api/orders/{id}'], operations, {})
-  assert.deepEqual(replaceSteps.calls.map((call) => `${call.role} ${call.operation.method} ${call.operation.path}`), [
+  assert.deepEqual(replaceSteps.calls.filter((call) => call.operation).map((call) => `${call.role} ${call.operation.method} ${call.operation.path}`), [
     'before POST /api/orders',
     'enquiry GET /api/orders/{id}',
     'after DELETE /api/orders/{id}',
@@ -2390,6 +2440,9 @@ paths:
   const query = byPath['/api/shipments/queryShipments']
 
   assert.equal(fixturePlan(query, operations, {}), null)
+  const querySteps = fixtureSteps(query, operations, {})
+  assert.deepEqual(querySteps.calls.map((call) => call.role), ['before', 'enquiry', 'after'])
+  assert.equal(querySteps.calls.every((call) => call.operation == null), true)
   const getPlan = fixturePlan(getOne, operations, {})
   assert.equal(getPlan.location, 'body')
   assert.equal(getPlan.idField, 'instructionNumber')
@@ -2397,7 +2450,7 @@ paths:
   assert.equal(getPlan.cleanup.path, '/api/shipments/deleteShipment')
   assert.equal(getPlan.enquiry, null)
   const getSteps = fixtureSteps(getOne, operations, {})
-  assert.deepEqual(getSteps.calls.map((call) => call.role), ['before', 'after'])
+  assert.deepEqual(getSteps.calls.filter((call) => call.operation).map((call) => call.role), ['before', 'after'])
 
   const assigned = assignFixture(buildCases(getOne.fields, {}), getPlan)
   assert.equal(assigned[0].needsFixture, true)
@@ -2409,11 +2462,42 @@ paths:
   assert.deepEqual(fixtureRequest(getPlan.cleanup, getPlan, 'IN-15', {}).body, { instructionNumber: 'IN-15' })
 
   const updateSteps = fixtureSteps(update, operations, {})
-  assert.deepEqual(updateSteps.calls.map((call) => `${call.role} ${call.operation.path}`), [
+  assert.deepEqual(updateSteps.calls.filter((call) => call.operation).map((call) => `${call.role} ${call.operation.path}`), [
     'before /api/shipments/createShipment',
     'enquiry /api/shipments/getShipment',
     'after /api/shipments/deleteShipment',
   ])
+  const manual = fixtureSteps(query, operations, {}, undefined, {
+    before: true,
+    beforeOp: 'POST /api/shipments/createShipment',
+    afterOp: 'POST /api/shipments/deleteShipment',
+  })
+  assert.equal(manual.calls[0].operation.path, '/api/shipments/createShipment')
+  assert.equal(manual.calls[2].operation.path, '/api/shipments/deleteShipment')
+  const carried = aroundRequest(
+    remove,
+    {
+      instructionNumber: { source: 'response', path: 'data.instructionNumber' },
+      reference: { source: 'request', path: 'reference' },
+    },
+    { request: { body: { reference: 'SHP-22' } }, response: { data: { instructionNumber: 'IN-22' } } },
+    {},
+  )
+  assert.equal(carried.body.instructionNumber, 'IN-22')
+  const auto = aroundRequest(
+    remove,
+    {},
+    { request: { body: { instructionNumber: 'IN-7' } }, response: null },
+    {},
+  )
+  assert.equal(auto.body.instructionNumber, 'IN-7')
+  const valued = aroundRequest(
+    remove,
+    { instructionNumber: { source: 'value', value: '@{response.data.instructionNumber}' } },
+    { request: {}, response: { data: { instructionNumber: 'IN-9' } } },
+    {},
+  )
+  assert.equal(valued.body.instructionNumber, 'IN-9')
   const removePlan = fixturePlan(remove, operations, {})
   assert.equal(removePlan.consumeSuccess, true)
   assert.equal(removePlan.cleanup.id, remove.id)

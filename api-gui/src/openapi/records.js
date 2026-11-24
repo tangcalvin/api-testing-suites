@@ -98,7 +98,9 @@ export function filterRules(fields, columns, overrides = {}, pagination = null) 
   for (const field of list) {
     if (!field?.name || field.object || hidden.has(field.name)) continue
     const rule = scalarRule(field, columns, names)
-    if (rule) rules.push(rule)
+    if (!rule || rule.mode === 'skip') continue
+    if (!String(rule.column).includes('.') && Array.isArray(columns) && columns.length > 0 && !columnKnown(rule.column, columns)) continue
+    rules.push(rule)
   }
   return rules.map((rule) => applyOverride(rule, overrides?.[rule.field]))
 }
@@ -132,52 +134,108 @@ export function filterRecords(rows, rules, sent) {
 }
 
 export function compareRecords(expected, actual, options = {}) {
-  const exp = Array.isArray(expected) ? expected : []
-  const got = Array.isArray(actual) ? actual : []
-  const keys = sharedKeys(exp, got)
-  const useId = exp.length > 0 && got.length > 0 && exp.every(hasId) && got.every(hasId)
-  const keyOf = (row) => (useId ? `id:${identity(row.id)}` : signature(row, keys))
-  const left = tally(exp, keyOf)
-  const right = tally(got, keyOf)
+  const exp = (Array.isArray(expected) ? expected : []).map((row) => flattenRow(row))
+  const got = (Array.isArray(actual) ? actual : []).map((row) => flattenRow(row))
+  const keys = expectedKeys(exp)
+  const overlap = sharedKeys(exp, got)
+  const matchKey = pickMatchKey(exp, got, keys.length ? keys : overlap)
   const problems = []
-  if (!useId && exp.length > 0 && got.length > 0 && keys.length === 0) {
+  if (!matchKey && exp.length > 0 && got.length > 0 && overlap.length === 0) {
     return { passed: false, detail: 'The uploaded columns do not match the response.' }
   }
+  const pairs = []
   const missing = []
   const extra = []
-  for (const [key, rows] of left.map) {
-    const have = right.map.get(key)?.length || 0
-    if (have < rows.length) missing.push(labelFor(key, rows.length - have))
-  }
-  for (const [key, rows] of right.map) {
-    const have = left.map.get(key)?.length || 0
-    if (rows.length > have) extra.push(labelFor(key, rows.length - have))
-  }
-  if (missing.length) problems.push(`Missing ${missing.slice(0, 4).join(', ')}.`)
-  if (extra.length) problems.push(`Extra ${extra.slice(0, 4).join(', ')}.`)
-  if (useId) {
-    const mismatched = []
+  if (matchKey) {
+    const keyOf = (row) => `${matchKey}:${identity(row[matchKey])}`
+    const left = tally(exp, keyOf)
+    const right = tally(got, keyOf)
     for (const [key, rows] of left.map) {
       const other = right.map.get(key) || []
       const count = Math.min(rows.length, other.length)
-      for (let index = 0; index < count; index += 1) {
-        const diff = fieldDiff(rows[index], other[index], keys)
-        if (diff) mismatched.push(`${labelFor(key, 1)} ${diff}`)
-      }
+      for (let index = 0; index < count; index += 1) pairs.push([rows[index], other[index], labelFor(key, 1)])
+      if (rows.length > other.length) missing.push(labelFor(key, rows.length - other.length))
     }
-    if (mismatched.length) problems.push(mismatched.slice(0, 3).join(' '))
+    for (const [key, rows] of right.map) {
+      const have = left.map.get(key)?.length || 0
+      if (rows.length > have) extra.push(labelFor(key, rows.length - have))
+    }
+    if (options.ordered && missing.length === 0 && extra.length === 0) {
+      const leftOrder = left.order
+      const rightOrder = right.order
+      if (leftOrder.some((key, index) => rightOrder[index] !== key)) problems.push('Records are out of order.')
+    }
+  } else {
+    const unused = got.map((row, index) => ({ row, index }))
+    const used = new Set()
+    exp.forEach((row, index) => {
+      let best = -1
+      let bestScore = Number.POSITIVE_INFINITY
+      for (let cursor = 0; cursor < unused.length; cursor += 1) {
+        if (used.has(unused[cursor].index)) continue
+        const score = fieldDiffList(row, unused[cursor].row, keys).length
+        if (score < bestScore) {
+          best = cursor
+          bestScore = score
+          if (score === 0) break
+        }
+      }
+      if (best < 0) {
+        missing.push(`Excel row ${index + 1}`)
+        return
+      }
+      used.add(unused[best].index)
+      pairs.push([row, unused[best].row, `Excel row ${index + 1}`])
+    })
+    unused.forEach((item, index) => {
+      if (!used.has(item.index)) extra.push(`response row ${index + 1}`)
+    })
+    if (options.ordered && missing.length === 0 && extra.length === 0 && keys.length > 0) {
+      const leftOrder = exp.map((row) => signature(row, keys))
+      const rightOrder = got.map((row) => signature(row, keys))
+      if (leftOrder.some((key, index) => rightOrder[index] !== key)) problems.push('Records are out of order.')
+    }
   }
-  if (options.ordered && problems.length === 0 && left.order.some((key, index) => right.order[index] !== key)) {
-    problems.push('Records are out of order.')
+  if (missing.length) problems.push(`Missing from response: ${missing.slice(0, 4).join(', ')}.`)
+  if (extra.length) problems.push(`Extra in response: ${extra.slice(0, 4).join(', ')}.`)
+  const mismatched = []
+  for (const [left, right, label] of pairs) {
+    const diffs = fieldDiffList(left, right, keys.filter((key) => key !== matchKey))
+    if (diffs.length === 0) continue
+    mismatched.push(`Field mismatch on ${label}:\n  ${diffs.slice(0, 5).join('\n  ')}`)
   }
+  if (mismatched.length) problems.push(mismatched.slice(0, 3).join('\n'))
   if (problems.length > 0) {
-    const count = `Expected ${exp.length}, received ${got.length}.`
-    return { passed: false, detail: [count, ...problems].join(' ') }
+    const count = `Expected ${exp.length} Excel row${exp.length === 1 ? '' : 's'} after filters, received ${got.length} from the response.`
+    return { passed: false, detail: [count, ...problems].join('\n') }
   }
   return {
     passed: true,
     detail: exp.length === 0 ? 'No records match this filter.' : `${exp.length} ${exp.length === 1 ? 'record' : 'records'} matched.`,
   }
+}
+
+export function flattenRow(value, prefix = '', into = {}) {
+  if (Array.isArray(value)) {
+    into[prefix || 'value'] = value
+    return into
+  }
+  if (value == null || typeof value !== 'object') {
+    if (prefix) into[prefix] = value
+    return into
+  }
+  const keys = Object.keys(value)
+  if (keys.length === 0) {
+    if (prefix) into[prefix] = value
+    return into
+  }
+  for (const key of keys) {
+    const path = prefix ? `${prefix}.${key}` : key
+    const child = value[key]
+    if (child && typeof child === 'object' && !Array.isArray(child)) flattenRow(child, path, into)
+    else into[path] = child
+  }
+  return prefix ? into : { ...into }
 }
 
 export function parseRecordCsv(text) {
@@ -326,6 +384,9 @@ function scalarRule(field, columns, paging) {
     if (columnKnown(column, columns)) return rule(field, column, 'present', 'string')
   }
   let column = field.name.includes('.') ? field.name : columnFor(leaf, columns)
+  if (/^data\.[^.]+$/.test(field.name) && !columnKnown(column, columns)) {
+    column = columnFor(leaf, columns)
+  }
   if (!field.name.includes('.') && !columnKnown(column, columns)) {
     const plural = pluralColumn(leaf, columns)
     if (plural) column = plural
@@ -660,6 +721,14 @@ function identity(value) {
   return String(value).trim()
 }
 
+function expectedKeys(expected) {
+  const keys = new Set()
+  for (const row of expected) {
+    for (const key of Object.keys(row || {})) keys.add(key)
+  }
+  return [...keys]
+}
+
 function sharedKeys(expected, actual) {
   const have = new Set(actual.flatMap((row) => Object.keys(row || {})))
   const keys = new Set()
@@ -703,20 +772,65 @@ function tally(rows, keyOf) {
 }
 
 function labelFor(key, count) {
-  const name = key.startsWith('id:') ? `id ${key.slice(3)}` : 'a record'
+  const split = String(key || '').indexOf(':')
+  const name = split > 0 ? `${key.slice(0, split)} ${key.slice(split + 1)}` : 'a record'
   return count > 1 ? `${name} ×${count}` : name
 }
 
-function fieldDiff(expected, actual, keys) {
+function pickMatchKey(expected, actual, keys) {
+  if (expected.length === 0 || actual.length === 0) return ''
+  for (const candidate of ['id', 'reference', 'orderNumber']) {
+    if (keys.length && !keys.includes(candidate)) continue
+    if (!expected.every((row) => row?.[candidate] != null && row[candidate] !== '')) continue
+    if (!actual.every((row) => row?.[candidate] != null && row[candidate] !== '')) continue
+    const left = new Set(expected.map((row) => identity(row[candidate])))
+    const right = new Set(actual.map((row) => identity(row[candidate])))
+    if (left.size === expected.length && right.size === actual.length) return candidate
+  }
+  return ''
+}
+
+function fieldDiffList(expected, actual, keys) {
   const diffs = []
   for (const key of keys) {
-    if (key === 'id') continue
-    if (!Object.prototype.hasOwnProperty.call(expected, key)) continue
-    if (!Object.prototype.hasOwnProperty.call(actual, key)) continue
-    if (!sameValue(expected[key], actual[key])) diffs.push(key)
+    if (!Object.prototype.hasOwnProperty.call(expected || {}, key)) continue
+    const want = expected[key]
+    const got = readPath(actual, key)
+    if (got.missing) {
+      if (isEmpty(want)) continue
+      diffs.push(`${key}: expected ${quoteValue(want)}, got (missing)`)
+      continue
+    }
+    if (sameValue(want, got.value)) continue
+    diffs.push(`${key}: expected ${quoteValue(want)}, got ${quoteValue(got.value)}`)
   }
-  if (diffs.length === 0) return ''
-  return `(${diffs.slice(0, 3).join(', ')})`
+  return diffs
+}
+
+function readPath(row, key) {
+  if (Object.prototype.hasOwnProperty.call(row || {}, key)) return { missing: false, value: row[key] }
+  const parts = String(key || '').split('.').filter(Boolean)
+  for (let index = parts.length - 1; index > 0; index -= 1) {
+    const parent = parts.slice(0, index).join('.')
+    if (!Object.prototype.hasOwnProperty.call(row || {}, parent)) continue
+    if (isEmpty(row[parent])) return { missing: true, value: undefined }
+  }
+  return { missing: true, value: undefined }
+}
+
+function quoteValue(value) {
+  if (isEmpty(value)) return '(empty)'
+  if (typeof value === 'string') {
+    const text = value.length > 60 ? `${value.slice(0, 57)}...` : value
+    return JSON.stringify(text)
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+  try {
+    const text = JSON.stringify(canonical(value))
+    return text.length > 60 ? `${text.slice(0, 57)}...` : text
+  } catch {
+    return String(value)
+  }
 }
 
 function sameValue(expected, actual) {
