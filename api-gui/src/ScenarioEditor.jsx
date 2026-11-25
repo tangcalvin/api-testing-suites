@@ -293,11 +293,17 @@ export default function ScenarioEditor({
 function StepCard({ step, index, operations, onChange, onMove, onRemove, first, last }) {
   const operation = operations.find((item) => item.id === step.operationId) || null
   const fields = (operation?.fields || []).filter((field) => !field.object)
+  const available = fields.filter((field) => !Object.prototype.hasOwnProperty.call(step.request || {}, field.name))
+  const requestNames = Object.keys(step.request || {})
+  const captures = step.captures || []
+  const expectFields = step.expect?.fields || []
+
   function setRequest(name, value) {
     onChange({ request: { ...step.request, [name]: value } })
   }
+
   return (
-    <Stack spacing={1} sx={{ border: 1, borderColor: 'divider', borderRadius: 1, px: 1.25, py: 1 }}>
+    <Stack spacing={1.25} sx={{ border: 1, borderColor: 'divider', borderRadius: 1, px: 1.5, py: 1.25 }}>
       <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ alignItems: { sm: 'center' } }}>
         <Typography variant="body2" sx={{ fontWeight: 700, width: 24 }}>{index + 1}</Typography>
         <TextField
@@ -312,7 +318,7 @@ function StepCard({ step, index, operations, onChange, onMove, onRemove, first, 
             <MenuItem value={step.operationId}>{step.operationId}</MenuItem>
           )}
           {operations.map((item) => (
-            <MenuItem key={item.id} value={item.id}>{item.method} {item.path}</MenuItem>
+            <MenuItem key={item.id} value={item.id}>{endpointLabel(item)}</MenuItem>
           ))}
         </TextField>
         <TextField
@@ -323,129 +329,240 @@ function StepCard({ step, index, operations, onChange, onMove, onRemove, first, 
           onChange={(event) => onChange({ expect: { ...step.expect, status: event.target.value.replace(/\D/g, '').slice(0, 3) } })}
           sx={{ width: { xs: '100%', sm: 120 } }}
         />
-      </Stack>
-      <Stack direction="row" spacing={0.5} useFlexGap sx={{ alignItems: 'center', flexWrap: 'wrap' }}>
-        <FormControlLabel
-          sx={{ ml: 0 }}
-          control={<Checkbox size="small" checked={Boolean(step.cleanup)} onChange={(event) => onChange({ cleanup: event.target.checked })} />}
-          label="Cleanup"
-        />
-        <Button size="small" color="inherit" disabled={first} onClick={() => onMove(-1)}>Up</Button>
-        <Button size="small" color="inherit" disabled={last} onClick={() => onMove(1)}>Down</Button>
-        <Button size="small" color="inherit" onClick={onRemove}>Remove</Button>
-      </Stack>
-      {(step.captures || []).map((entry, entryIndex) => (
-        <Stack key={`${entry.name}-${entryIndex}`} direction={{ xs: 'column', sm: 'row' }} spacing={1}>
-          <TextField
-            size="small"
-            label="Response field"
-            value={entry.path}
-            onChange={(event) => {
-              const captures = step.captures.slice()
-              captures[entryIndex] = { ...entry, path: event.target.value }
-              onChange({ captures })
-            }}
-            sx={{ flex: 1 }}
+        <Stack direction="row" spacing={0.25} useFlexGap sx={{ alignItems: 'center', flexWrap: 'wrap' }}>
+          <FormControlLabel
+            sx={{ ml: 0, mr: 0.5 }}
+            control={<Checkbox size="small" checked={Boolean(step.cleanup)} onChange={(event) => onChange({ cleanup: event.target.checked })} />}
+            label="Cleanup"
           />
-          <TextField
-            size="small"
-            label="Keep as"
-            value={entry.name}
-            onChange={(event) => {
-              const captures = step.captures.slice()
-              captures[entryIndex] = { ...entry, name: event.target.value }
-              onChange({ captures })
-            }}
-            sx={{ flex: 1 }}
-          />
-          <Button size="small" color="inherit" onClick={() => onChange({ captures: step.captures.filter((_, item) => item !== entryIndex) })}>Remove</Button>
+          <Button size="small" color="inherit" disabled={first} onClick={() => onMove(-1)}>Up</Button>
+          <Button size="small" color="inherit" disabled={last} onClick={() => onMove(1)}>Down</Button>
+          <Button size="small" color="inherit" onClick={onRemove}>Remove</Button>
         </Stack>
-      ))}
-      <Button size="small" sx={{ alignSelf: 'flex-start' }} onClick={() => onChange({ captures: [...(step.captures || []), { path: 'id', name: '' }] })}>
-        Keep a response field
-      </Button>
-      {Object.keys(step.request || {}).map((name) => {
-        const omitted = (step.omit || []).includes(name)
-        return (
-          <Stack key={name} direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ alignItems: { sm: 'center' } }}>
-            <Typography variant="body2" sx={{ width: { sm: 160 }, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12.5 }}>{name}</Typography>
-            <TextField
-              size="small"
-              fullWidth
-              disabled={omitted}
-              placeholder={omitted ? 'Omitted' : 'Default, or ${name}'}
-              value={step.request[name] ?? ''}
-              onChange={(event) => setRequest(name, event.target.value)}
-            />
-            <FormControlLabel
-              sx={{ ml: 0 }}
-              control={<Checkbox size="small" checked={omitted} onChange={() => {
-                const omit = new Set(step.omit || [])
-                if (omit.has(name)) omit.delete(name)
-                else omit.add(name)
-                onChange({ omit: [...omit] })
-              }}
-              />}
-              label="Omit"
-            />
-            <Button size="small" color="inherit" onClick={() => {
-              const request = { ...step.request }
-              delete request[name]
-              onChange({ request, omit: (step.omit || []).filter((item) => item !== name) })
+      </Stack>
+
+      <StepSection
+        title="Request"
+        hint="Override a field for this step. Use ${name} for an iteration or kept value."
+        action={available.length > 0 && (
+          <TextField
+            select
+            size="small"
+            label="Add field"
+            value=""
+            onChange={(event) => {
+              if (!event.target.value || Object.prototype.hasOwnProperty.call(step.request, event.target.value)) return
+              onChange({ request: { ...step.request, [event.target.value]: '' } })
             }}
-            >
-              Remove
-            </Button>
+            sx={{ minWidth: 180 }}
+          >
+            <MenuItem value="">Add field</MenuItem>
+            {available.map((field) => (
+              <MenuItem key={field.name} value={field.name}>{field.name}</MenuItem>
+            ))}
+          </TextField>
+        )}
+      >
+        {requestNames.length === 0 ? (
+          <Typography variant="body2" color="text.secondary">No field overrides yet.</Typography>
+        ) : (
+          <Stack spacing={0.75}>
+            {requestNames.map((name) => {
+              const omitted = (step.omit || []).includes(name)
+              return (
+                <Stack key={name} direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ alignItems: { sm: 'center' } }}>
+                  <Typography
+                    variant="body2"
+                    sx={{ width: { sm: 150 }, flexShrink: 0, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12.5 }}
+                  >
+                    {name}
+                  </Typography>
+                  <TextField
+                    size="small"
+                    fullWidth
+                    disabled={omitted}
+                    placeholder={omitted ? 'Omitted' : 'Default, or ${name}'}
+                    value={step.request[name] ?? ''}
+                    onChange={(event) => setRequest(name, event.target.value)}
+                  />
+                  <FormControlLabel
+                    sx={{ ml: 0, flexShrink: 0 }}
+                    control={<Checkbox size="small" checked={omitted} onChange={() => {
+                      const omit = new Set(step.omit || [])
+                      if (omit.has(name)) omit.delete(name)
+                      else omit.add(name)
+                      onChange({ omit: [...omit] })
+                    }}
+                    />}
+                    label="Omit"
+                  />
+                  <Button
+                    size="small"
+                    color="inherit"
+                    sx={{ flexShrink: 0 }}
+                    onClick={() => {
+                      const request = { ...step.request }
+                      delete request[name]
+                      onChange({ request, omit: (step.omit || []).filter((item) => item !== name) })
+                    }}
+                  >
+                    Remove
+                  </Button>
+                </Stack>
+              )
+            })}
           </Stack>
-        )
-      })}
-      {fields.length > 0 && (
-        <TextField
-          select
-          size="small"
-          label="Add field"
-          value=""
-          onChange={(event) => {
-            if (!event.target.value || Object.prototype.hasOwnProperty.call(step.request, event.target.value)) return
-            onChange({ request: { ...step.request, [event.target.value]: '' } })
-          }}
-          sx={{ maxWidth: 280 }}
-        >
-          <MenuItem value="">Add field</MenuItem>
-          {fields.filter((field) => !Object.prototype.hasOwnProperty.call(step.request || {}, field.name)).map((field) => (
-            <MenuItem key={field.name} value={field.name}>{field.name}</MenuItem>
-          ))}
-        </TextField>
-      )}
-      {(step.expect?.fields || []).map((field, fieldIndex) => (
-        <Stack key={`${field.path}-${fieldIndex}`} direction={{ xs: 'column', sm: 'row' }} spacing={1}>
-          <TextField
+        )}
+      </StepSection>
+
+      <StepSection
+        title="Keep from response"
+        hint={'Save a response value as ${name} for later steps.'}
+        action={(
+          <Button
             size="small"
-            label="Expect field"
-            value={field.path}
-            onChange={(event) => {
-              const list = step.expect.fields.slice()
-              list[fieldIndex] = { ...field, path: event.target.value }
-              onChange({ expect: { ...step.expect, fields: list } })
-            }}
-            sx={{ flex: 1 }}
-          />
-          <TextField
+            variant="outlined"
+            onClick={() => onChange({ captures: [...captures, { path: 'id', name: '' }] })}
+          >
+            Add
+          </Button>
+        )}
+      >
+        {captures.length === 0 ? (
+          <Typography variant="body2" color="text.secondary">Nothing kept yet.</Typography>
+        ) : (
+          <Stack spacing={0.75}>
+            {captures.map((entry, entryIndex) => (
+              <Stack key={`capture-${entryIndex}`} direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ alignItems: { sm: 'center' } }}>
+                <TextField
+                  size="small"
+                  label="Response field"
+                  placeholder="id"
+                  value={entry.path}
+                  onChange={(event) => {
+                    const next = captures.slice()
+                    next[entryIndex] = { ...entry, path: event.target.value }
+                    onChange({ captures: next })
+                  }}
+                  sx={{ flex: 1 }}
+                />
+                <TextField
+                  size="small"
+                  label="Keep as"
+                  placeholder="orderId"
+                  value={entry.name}
+                  onChange={(event) => {
+                    const next = captures.slice()
+                    next[entryIndex] = { ...entry, name: event.target.value }
+                    onChange({ captures: next })
+                  }}
+                  sx={{ flex: 1 }}
+                />
+                <Button
+                  size="small"
+                  color="inherit"
+                  sx={{ flexShrink: 0 }}
+                  onClick={() => onChange({ captures: captures.filter((_, item) => item !== entryIndex) })}
+                >
+                  Remove
+                </Button>
+              </Stack>
+            ))}
+          </Stack>
+        )}
+      </StepSection>
+
+      <StepSection
+        title="Expect from response"
+        hint="Check a response field after this call."
+        action={(
+          <Button
             size="small"
-            label="Equals"
-            value={field.equals || ''}
-            onChange={(event) => {
-              const list = step.expect.fields.slice()
-              list[fieldIndex] = { ...field, equals: event.target.value }
-              onChange({ expect: { ...step.expect, fields: list } })
-            }}
-            sx={{ flex: 1 }}
-          />
-        </Stack>
-      ))}
-      <Button size="small" sx={{ alignSelf: 'flex-start' }} onClick={() => onChange({ expect: { ...step.expect, fields: [...(step.expect?.fields || []), { path: '', equals: '' }] } })}>
-        Expect a response field
-      </Button>
+            variant="outlined"
+            onClick={() => onChange({ expect: { ...step.expect, fields: [...expectFields, { path: '', equals: '' }] } })}
+          >
+            Add
+          </Button>
+        )}
+      >
+        {expectFields.length === 0 ? (
+          <Typography variant="body2" color="text.secondary">No field checks yet. Status above still applies.</Typography>
+        ) : (
+          <Stack spacing={0.75}>
+            {expectFields.map((field, fieldIndex) => (
+              <Stack key={`expect-${fieldIndex}`} direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ alignItems: { sm: 'center' } }}>
+                <TextField
+                  size="small"
+                  label="Response field"
+                  placeholder="customerName"
+                  value={field.path}
+                  onChange={(event) => {
+                    const list = expectFields.slice()
+                    list[fieldIndex] = { ...field, path: event.target.value }
+                    onChange({ expect: { ...step.expect, fields: list } })
+                  }}
+                  sx={{ flex: 1 }}
+                />
+                <TextField
+                  size="small"
+                  label="Equals"
+                  placeholder="${customerName}"
+                  value={field.equals || ''}
+                  onChange={(event) => {
+                    const list = expectFields.slice()
+                    list[fieldIndex] = { ...field, equals: event.target.value }
+                    onChange({ expect: { ...step.expect, fields: list } })
+                  }}
+                  sx={{ flex: 1 }}
+                />
+                <Button
+                  size="small"
+                  color="inherit"
+                  sx={{ flexShrink: 0 }}
+                  onClick={() => {
+                    const list = expectFields.filter((_, item) => item !== fieldIndex)
+                    onChange({ expect: { ...step.expect, fields: list } })
+                  }}
+                >
+                  Remove
+                </Button>
+              </Stack>
+            ))}
+          </Stack>
+        )}
+      </StepSection>
     </Stack>
   )
+}
+
+function StepSection({ title, hint, action, children }) {
+  return (
+    <Stack
+      spacing={0.75}
+      sx={{
+        bgcolor: '#f8fafc',
+        border: 1,
+        borderColor: 'divider',
+        borderRadius: 1,
+        px: 1.25,
+        py: 1,
+      }}
+    >
+      <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ alignItems: { sm: 'flex-start' }, justifyContent: 'space-between' }}>
+        <Box sx={{ minWidth: 0 }}>
+          <Typography variant="subtitle2">{title}</Typography>
+          <Typography variant="caption" color="text.secondary">{hint}</Typography>
+        </Box>
+        {action || null}
+      </Stack>
+      {children}
+    </Stack>
+  )
+}
+
+function endpointLabel(operation) {
+  const route = `${operation.method} ${operation.path}`
+  const name = String(operation.summary || operation.operationId || '').trim()
+  if (!name || name === route) return route
+  return `${name} · ${route}`
 }
