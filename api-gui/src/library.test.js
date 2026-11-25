@@ -252,15 +252,17 @@ test('defaults and custom cases import as separate files', () => {
       id: 'place',
       name: 'Place and ship',
       columns: ['orderNumber'],
-      steps: [{ id: 's1', operationId: 'POST /api/orders', request: { orderNumber: '${orderNumber}' }, save: { orderId: 'id' }, cleanup: false, expect: { status: '201', fields: [] } }],
+      steps: [{ id: 's1', operationId: 'POST /api/orders', profileId: 'client-b', request: { orderNumber: '${orderNumber}' }, save: { orderId: 'id' }, cleanup: false, expect: { status: '201', fields: [] } }],
       iterations: [{ id: 'r1', values: { orderNumber: 'A-1', extra: 'no' } }],
     }],
   }))
   assert.equal(withScenarios.scenarios[0].steps[0].captures[0].name, 'orderId')
   assert.equal(withScenarios.scenarios[0].steps[0].captures[0].path, 'id')
+  assert.equal(withScenarios.scenarios[0].steps[0].profileId, 'client-b')
   assert.equal(withScenarios.scenarios[0].iterations[0].values.orderNumber, 'A-1')
   assert.equal(withScenarios.scenarios[0].iterations[0].values.extra, undefined)
   assert.equal(casesDocument(withScenarios).scenarios[0].name, 'Place and ship')
+  assert.equal(casesDocument(withScenarios).scenarios[0].steps[0].profileId, 'client-b')
   assert.equal(casesDocument(parseCases('{"kind":"cases","operations":{}}')).scenarios, undefined)
   const withPaging = parseCases(JSON.stringify({
     kind: 'cases',

@@ -20,6 +20,7 @@ export function newScenarioStep(operationId = '') {
   return {
     id: newId(),
     operationId,
+    profileId: '',
     request: {},
     omit: [],
     expect: { status: '', fields: [] },

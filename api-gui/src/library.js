@@ -460,9 +460,11 @@ function normalizeScenarioStep(item) {
     })
   }
   const fields = (Array.isArray(item.expect?.fields) ? item.expect.fields : []).map(normalizeExpectedField).filter(Boolean)
+  const profileId = typeof item.profileId === 'string' ? item.profileId.trim() : ''
   return {
     id: typeof item.id === 'string' && item.id ? item.id : newId(),
     operationId: typeof item.operationId === 'string' ? item.operationId : '',
+    profileId,
     request,
     omit: Array.isArray(item.omit) ? item.omit.filter((name) => typeof name === 'string' && name) : [],
     expect: { status: item.expect?.status ? String(item.expect.status).replace(/\D/g, '').slice(0, 3) : '', fields },

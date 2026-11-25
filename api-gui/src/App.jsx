@@ -1261,6 +1261,26 @@ export default function App() {
     }
   }
 
+  function resolveScenarioClient(step, clients) {
+    const id = String(step?.profileId || '').trim()
+    if (!id || id === activeId) {
+      return {
+        defaults,
+        oauth,
+        label: profileLabel({ name: profileName, oauth }),
+        overridden: Boolean(id),
+      }
+    }
+    const profile = (clients || []).find((item) => item.id === id)
+    if (!profile) return { missing: true, label: id, overridden: true }
+    return {
+      defaults: profile.defaults,
+      oauth: profile.oauth,
+      label: profileLabel(profile),
+      overridden: true,
+    }
+  }
+
   async function runScenario() {
     const scenario = (customCases.scenarios || []).find((item) => item.id === scenarioId)
     if (!scenario || scenario.steps.length === 0 || running) return
@@ -1280,7 +1300,7 @@ export default function App() {
       return
     }
     const next = []
-    const headers = requestHeaders(defaults)
+    const clients = commitProfiles()
     const iterations = scenario.iterations.length > 0 ? scenario.iterations : [{ id: 'once', values: {} }]
     const push = (entry) => {
       next.push({ index: next.length + 1, ...entry })
@@ -1294,27 +1314,38 @@ export default function App() {
         for (const step of scenario.steps) {
           if (stopRef.current) break
           const operation = operations.find((item) => item.id === step.operationId)
-          const label = `${rowIndex + 1} · ${operation?.summary || step.operationId || 'Step'}`
+          const client = resolveScenarioClient(step, clients)
+          const label = [
+            `${rowIndex + 1} · ${operation?.summary || step.operationId || 'Step'}`,
+            client.overridden ? client.label : '',
+          ].filter(Boolean).join(' · ')
           if (!operation) {
             rowFailed = true
             push({ label, status: 0, passed: false, detail: 'That endpoint is not in the loaded document.' })
+            continue
+          }
+          if (client.missing) {
+            rowFailed = true
+            push({ label, status: 0, passed: false, detail: 'That client is not in the library anymore.' })
             continue
           }
           if (!stepShouldRun(step, rowFailed)) {
             push({ label, status: 0, passed: false, skipped: true, detail: 'Skipped because an earlier step failed.' })
             continue
           }
+          const stepDefaults = client.defaults
+          const stepOauth = client.oauth
           const variables = { ...iterations[rowIndex].values, ...captured }
-          const call = scenarioCall(operation, step, defaults, variables)
+          const call = scenarioCall(operation, step, stepDefaults, variables)
           setActivity(`iteration ${rowIndex + 1} of ${iterations.length} · ${operation.summary || operation.path}`)
           await pace()
           if (stopRef.current) break
           const sent = scenarioRequest(call)
-          const response = await callOperation(apiBase, idpBase, operation, sent, null, headers, oauth)
+          const response = await callOperation(apiBase, idpBase, operation, sent, null, requestHeaders(stepDefaults), stepOauth)
           const verdict = judge(call.expect, response.status, response.text, {
             request: sent,
-            variables: { ...(defaults.variables || {}), ...variables },
-            patterns: defaults.patterns,
+            variables: { ...(stepDefaults.variables || {}), ...variables },
+            patterns: stepDefaults.patterns,
           })
           if (!verdict.passed) rowFailed = true
           Object.assign(captured, capturedFrom(step.captures, response.status, response.text, response.location))
@@ -1518,6 +1549,13 @@ export default function App() {
                 scenarios={customCases.scenarios || []}
                 scenarioId={scenarioId}
                 operations={operations}
+                profiles={profiles.map((profile) => ({
+                  id: profile.id,
+                  label: profile.id === activeId
+                    ? profileLabel({ name: profileName, oauth })
+                    : profileLabel(profile),
+                }))}
+                activeProfileId={activeId}
                 variableNames={Object.keys(defaults.variables || {})}
                 running={running}
                 activity={activity}

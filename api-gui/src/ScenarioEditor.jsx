@@ -21,6 +21,8 @@ export default function ScenarioEditor({
   scenarios,
   scenarioId,
   operations,
+  profiles = [],
+  activeProfileId = '',
   variableNames,
   running,
   activity,
@@ -130,6 +132,8 @@ export default function ScenarioEditor({
                 index={index}
                 step={step}
                 operations={operations}
+                profiles={profiles}
+                activeProfileId={activeProfileId}
                 onChange={(patch) => updateStep(step.id, patch)}
                 onMove={(direction) => moveStep(index, direction)}
                 onRemove={() => replace({ steps: scenario.steps.filter((item) => item.id !== step.id) })}
@@ -290,13 +294,15 @@ export default function ScenarioEditor({
   )
 }
 
-function StepCard({ step, index, operations, onChange, onMove, onRemove, first, last }) {
+function StepCard({ step, index, operations, profiles, activeProfileId, onChange, onMove, onRemove, first, last }) {
   const operation = operations.find((item) => item.id === step.operationId) || null
   const fields = (operation?.fields || []).filter((field) => !field.object)
   const available = fields.filter((field) => !Object.prototype.hasOwnProperty.call(step.request || {}, field.name))
   const requestNames = Object.keys(step.request || {})
   const captures = step.captures || []
   const expectFields = step.expect?.fields || []
+  const profileId = String(step.profileId || '')
+  const knownProfile = !profileId || profiles.some((item) => item.id === profileId)
 
   function setRequest(name, value) {
     onChange({ request: { ...step.request, [name]: value } })
@@ -312,13 +318,31 @@ function StepCard({ step, index, operations, onChange, onMove, onRemove, first, 
           label="Endpoint"
           value={step.operationId}
           onChange={(event) => onChange({ operationId: event.target.value, request: {}, omit: [] })}
-          sx={{ flex: 1 }}
+          sx={{ flex: 1, minWidth: 0 }}
         >
           {!operations.some((item) => item.id === step.operationId) && step.operationId && (
             <MenuItem value={step.operationId}>{step.operationId}</MenuItem>
           )}
           {operations.map((item) => (
             <MenuItem key={item.id} value={item.id}>{endpointLabel(item)}</MenuItem>
+          ))}
+        </TextField>
+        <TextField
+          select
+          size="small"
+          label="Client"
+          value={profileId}
+          onChange={(event) => onChange({ profileId: event.target.value })}
+          sx={{ width: { xs: '100%', sm: 220 } }}
+        >
+          <MenuItem value="">This client</MenuItem>
+          {!knownProfile && profileId && (
+            <MenuItem value={profileId}>{profileId} (missing)</MenuItem>
+          )}
+          {profiles.map((item) => (
+            <MenuItem key={item.id} value={item.id}>
+              {item.id === activeProfileId ? `${item.label} (current)` : item.label}
+            </MenuItem>
           ))}
         </TextField>
         <TextField
