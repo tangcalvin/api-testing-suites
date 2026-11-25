@@ -208,9 +208,31 @@ test('csv and json files become records', () => {
   assert.equal(csv[0].giftWrap, true)
   assert.equal(csv[0].notes, null)
   assert.equal(csv[1].id, 2)
-  const json = parseRecordJson('{"records":[{"id":"1","quantity":"2"}]}')
+  const spaced = parseRecordCsv('id,name,notes\n1," abc ",\n2,"",x\n')
+  assert.equal(spaced[0].name, ' abc ')
+  assert.equal(spaced[0].notes, null)
+  assert.equal(spaced[1].notes, 'x')
+  assert.equal(spaced[1].name, '')
+  const json = parseRecordJson('{"records":[{"id":"1","quantity":"2","name":" abc "}]}')
   assert.equal(json[0].id, 1)
   assert.equal(json[0].quantity, 2)
+  assert.equal(json[0].name, ' abc ')
+  const spacesMatch = compareRecords(
+    [{ id: 1, name: ' abc ' }],
+    [{ id: 1, name: ' abc ' }],
+  )
+  assert.equal(spacesMatch.passed, true)
+  const spacesMiss = compareRecords(
+    [{ id: 1, name: ' abc ' }],
+    [{ id: 1, name: 'abc' }],
+  )
+  assert.equal(spacesMiss.passed, false)
+  assert.match(spacesMiss.detail, /name: expected " abc ", got "abc"/)
+  const nullVsEmpty = compareRecords(
+    [{ id: 1, notes: null }],
+    [{ id: 1, notes: '' }],
+  )
+  assert.equal(nullVsEmpty.passed, false)
 })
 
 test('an xlsx sheet becomes records', async () => {

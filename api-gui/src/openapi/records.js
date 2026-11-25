@@ -267,14 +267,14 @@ export function flattenRow(value, prefix = '', into = {}) {
 export function parseRecordCsv(text) {
   const grid = csvGrid(String(text || '').replace(/^\uFEFF/, ''))
   if (grid.length === 0) return []
-  const headers = grid[0].map((header) => String(header || '').trim())
+  const headers = grid[0].map((header) => cellTextOf(header).trim())
   const rows = []
   for (const line of grid.slice(1)) {
-    if (line.every((cell) => String(cell || '').trim() === '')) continue
+    if (line.every((cell) => cellTextOf(cell).trim() === '')) continue
     const row = {}
     headers.forEach((header, index) => {
       if (!header) return
-      row[header] = coerceCell(line[index])
+      row[header] = coerceCell(line[index] === undefined ? '' : line[index])
     })
     rows.push(row)
   }
@@ -678,16 +678,17 @@ function compareNumber(left, right, op) {
 }
 
 function sameScalar(actual, expected, ignoreCase) {
-  if (isEmpty(actual) && isEmpty(expected)) return true
+  if (actual == null && expected == null) return true
+  if (actual == null || expected == null) return false
   if (typeof actual === 'boolean' || typeof expected === 'boolean' || expected === 'true' || expected === 'false') {
-    return Boolean(actual) === truthy(expected) && !isEmpty(actual)
+    return Boolean(actual) === truthy(expected)
   }
   const left = temporalOf(actual)
   const right = temporalOf(expected)
   if (left && right) return compareTemporal(left, right, 'eq')
   if (numericText(actual) && numericText(expected)) return asNumber(actual) === asNumber(expected)
-  const as = String(actual ?? '').trim()
-  const bs = String(expected ?? '').trim()
+  const as = String(actual)
+  const bs = String(expected)
   if (ignoreCase) return as.toLowerCase() === bs.toLowerCase()
   return as === bs
 }
@@ -772,7 +773,7 @@ function signature(row, keys) {
 
 function canonical(value) {
   if (value == null) return null
-  if (typeof value === 'string') return value.trim()
+  if (typeof value === 'string') return value
   if (typeof value === 'number' || typeof value === 'boolean') return value
   if (Array.isArray(value)) return value.map((item) => canonical(item))
   if (typeof value === 'object') {
@@ -823,7 +824,7 @@ function fieldDiffList(expected, actual, keys) {
     const want = expected[key]
     const got = readPath(actual, key)
     if (got.missing) {
-      if (isEmpty(want)) continue
+      if (want == null) continue
       diffs.push({
         path: key,
         expected: want,
@@ -972,7 +973,7 @@ function readPath(row, key) {
 }
 
 function quoteValue(value) {
-  if (isEmpty(value)) return '(empty)'
+  if (value == null) return '(empty)'
   if (typeof value === 'string') {
     const text = value.length > 60 ? `${value.slice(0, 57)}...` : value
     return JSON.stringify(text)
@@ -987,7 +988,8 @@ function quoteValue(value) {
 }
 
 function sameValue(expected, actual) {
-  if (isEmpty(expected) && isEmpty(actual)) return true
+  if (expected == null && actual == null) return true
+  if (expected == null || actual == null) return false
   if (expected && actual && typeof expected === 'object' && typeof actual === 'object') {
     if (Array.isArray(expected) || Array.isArray(actual)) return JSON.stringify(canonical(expected)) === JSON.stringify(canonical(actual))
     const keys = Object.keys(expected)
@@ -1001,7 +1003,13 @@ function csvGrid(text) {
   let row = []
   let cell = ''
   let quoted = false
+  let wasQuoted = false
   const source = String(text || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+  const pushCell = () => {
+    row.push(wasQuoted ? { quoted: true, text: cell } : cell)
+    cell = ''
+    wasQuoted = false
+  }
   for (let index = 0; index < source.length; index += 1) {
     const char = source[index]
     if (quoted) {
@@ -1019,33 +1027,42 @@ function csvGrid(text) {
     }
     if (char === '"' && cell === '') {
       quoted = true
+      wasQuoted = true
       continue
     }
     if (char === ',') {
-      row.push(cell)
-      cell = ''
+      pushCell()
       continue
     }
     if (char === '\n') {
-      row.push(cell)
+      pushCell()
       rows.push(row)
       row = []
-      cell = ''
       continue
     }
     cell += char
   }
-  if (cell !== '' || row.length > 0) {
-    row.push(cell)
+  if (cell !== '' || wasQuoted || row.length > 0) {
+    pushCell()
     rows.push(row)
   }
-  return rows.filter((line) => line.some((item) => String(item).trim() !== ''))
+  return rows.filter((line) => line.some((item) => cellTextOf(item).trim() !== ''))
+}
+
+function cellTextOf(value) {
+  if (value == null) return ''
+  if (typeof value === 'object' && value.quoted) return String(value.text ?? '')
+  return String(value)
 }
 
 function coerceCell(value) {
   if (value == null) return null
-  const text = String(value).trim()
-  if (text === '') return null
+  if (typeof value === 'object' && value.quoted) return coerceExactText(String(value.text ?? ''))
+  if (value === '') return null
+  return coerceExactText(String(value))
+}
+
+function coerceExactText(text) {
   if (text === 'true') return true
   if (text === 'false') return false
   if (/^-?\d+(\.\d+)?$/.test(text) && !/^0\d/.test(text)) return Number(text)
@@ -1064,7 +1081,7 @@ function normalizeRow(row) {
 
 function normalizeCell(value) {
   if (value instanceof Date) return excelDate(value)
-  if (typeof value === 'string') return coerceCell(value)
+  if (typeof value === 'string') return coerceExactText(value)
   if (typeof value === 'number') return Number.isFinite(value) ? value : null
   if (typeof value === 'boolean' || value == null) return value ?? null
   if (Array.isArray(value)) return value.map((item) => normalizeCell(item))
