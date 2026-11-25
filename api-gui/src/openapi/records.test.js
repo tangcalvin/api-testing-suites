@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
-import { compareRecords, filterRecords, filterRules, parseRecordBuffer, parseRecordCsv, parseRecordJson } from './records.js'
+import { annotateJsonLines, compareRecords, filterRecords, filterRules, parseRecordBuffer, parseRecordCsv, parseRecordJson } from './records.js'
 
 const COLUMNS = [
   'id', 'orderNumber', 'status', 'priority', 'customerName', 'customerEmail', 'currency',
@@ -161,6 +161,12 @@ test('uploaded rows match the filtered response by id, shared fields, and order'
   assert.match(changed.detail, /Field mismatch on id 1:/)
   assert.match(changed.detail, /customerName: expected "Ada Lovelace", got "Other"/)
   assert.match(changed.detail, /\n/)
+  assert.equal(changed.diffs.length, 1)
+  assert.equal(changed.diffs[0].matchKey, 'id')
+  assert.equal(changed.diffs[0].actualIndex, 0)
+  assert.equal(changed.diffs[0].fields[0].path, 'customerName')
+  const annotated = annotateJsonLines(JSON.stringify([{ ...ROWS[0], customerName: 'Other' }], null, 2), changed.diffs)
+  assert.ok(annotated.notes.some((note) => /customerName: expected/.test(note)))
   const ordered = compareRecords(expected, [ROWS[2], ROWS[0]], { ordered: true })
   assert.match(ordered.detail, /out of order/)
   const instant = compareRecords(

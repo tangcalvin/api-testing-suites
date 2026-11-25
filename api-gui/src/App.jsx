@@ -117,7 +117,7 @@ import {
   responsesForMode,
   withTextCombinationValues,
 } from './openapi/spec'
-import { compareRecords, filterModeChoices, filterRecords, filterRules, filterSummary, FILTER_MODE_LABELS, parseRecordFile } from './openapi/records'
+import { annotateJsonLines, compareRecords, filterModeChoices, filterRecords, filterRules, filterSummary, FILTER_MODE_LABELS, parseRecordFile } from './openapi/records'
 import { CURSOR_TYPES, PAGING_MODES, pagingForm, pathName, resolvePagination, storedPaging } from './openapi/pagination.js'
 import { capturedFrom, scenarioCall, scenarioRequest, stepShouldRun } from './openapi/scenarios'
 import ScenarioEditor from './ScenarioEditor'
@@ -1177,6 +1177,7 @@ export default function App() {
           const compared = compareRecords(expectedRows, actualRows, { ordered: Boolean(table.ordered) })
           verdict.detail = [verdict.detail, compared.detail].filter(Boolean).join('\n')
           if (!compared.passed) verdict.passed = false
+          if (compared.diffs?.length) verdict.recordDiffs = compared.diffs
         }
         const request = response.request || { body: item.body, query: item.query, path: item.path }
         let enquiry = null
@@ -1209,6 +1210,7 @@ export default function App() {
           text: response.pages ? response.text : pretty(response.text),
           pages: response.pages ? response.pages.map((page) => ({ ...page, text: pretty(page.text), ...(page.request ? { request: page.request } : {}) })) : null,
           ...(response.records?.length ? { records: response.records } : {}),
+          ...(verdict.recordDiffs?.length ? { recordDiffs: verdict.recordDiffs } : {}),
           ...(request ? { request } : {}),
           ...(enquiry ? { enquiry } : {}),
         })
@@ -4855,6 +4857,7 @@ function ResponsePreview({ result }) {
 
 function ResultDialog({ result, onClose }) {
   const pages = resultPages(result)
+  const diffs = Array.isArray(result.recordDiffs) ? result.recordDiffs : []
   return (
     <>
       <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1, pr: 1.5 }}>
@@ -4889,6 +4892,7 @@ function ResultDialog({ result, onClose }) {
               <PayloadBlock
                 title={pages.length > 1 ? `${page.label || `Page ${index + 1}`} · HTTP ${page.status}` : 'Response'}
                 text={page.text || ''}
+                diffs={diffs}
               />
             </Stack>
           ))}
@@ -4914,14 +4918,72 @@ function resultPages(result) {
   return []
 }
 
-function PayloadBlock({ title, text }) {
+function PayloadBlock({ title, text, diffs = [] }) {
+  const annotated = diffs.length > 0
   return (
     <Box sx={{ border: 1, borderColor: 'divider', borderRadius: 1, overflow: 'hidden' }}>
       <Stack direction="row" spacing={1} sx={{ alignItems: 'center', px: 1.25, py: 0.4, bgcolor: '#f8fafc' }}>
         <Typography variant="caption" sx={{ flex: 1, color: 'text.secondary', fontWeight: 700 }}>{title}</Typography>
         <CopyButton label={`Copy ${title}`} text={text} />
       </Stack>
-      <PayloadText text={text} open maxHeight={360} />
+      {annotated ? (
+        <AnnotatedJson text={text} diffs={diffs} maxHeight={360} />
+      ) : (
+        <PayloadText text={text} open maxHeight={360} />
+      )}
+    </Box>
+  )
+}
+
+function AnnotatedJson({ text, diffs, maxHeight = 360 }) {
+  const { lines, notes } = useMemo(() => annotateJsonLines(pretty(text), diffs), [diffs, text])
+  const hasNotes = notes.some(Boolean)
+  return (
+    <Box sx={{
+      display: 'grid',
+      gridTemplateColumns: hasNotes ? 'minmax(0, 1fr) minmax(160px, 0.55fr)' : '1fr',
+      maxHeight,
+      overflow: 'auto',
+      bgcolor: '#f8fafc',
+      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+      fontSize: 12,
+      lineHeight: 1.45,
+    }}
+    >
+      <Box sx={{ m: 0, px: 1, py: 0.75, whiteSpace: 'pre', overflow: 'auto' }}>
+        {lines.map((line, index) => (
+          <Box
+            key={`json-${index}`}
+            sx={{
+              minHeight: '1.45em',
+              bgcolor: notes[index] ? '#fff1f0' : 'transparent',
+              boxShadow: notes[index] ? 'inset 3px 0 0 #b42318' : 'none',
+              px: 0.5,
+            }}
+          >
+            {line || ' '}
+          </Box>
+        ))}
+      </Box>
+      {hasNotes ? (
+        <Box sx={{ m: 0, px: 1, py: 0.75, borderLeft: 1, borderColor: 'divider', overflow: 'auto' }}>
+          {notes.map((note, index) => (
+            <Box
+              key={`note-${index}`}
+              sx={{
+                minHeight: '1.45em',
+                color: '#b42318',
+                whiteSpace: 'pre-wrap',
+                wordBreak: 'break-word',
+                px: 0.5,
+              }}
+              title={note || undefined}
+            >
+              {note || ' '}
+            </Box>
+          ))}
+        </Box>
+      ) : null}
     </Box>
   )
 }
@@ -5195,6 +5257,7 @@ function RecordsTableButton({ result }) {
 function RecordsDialog({ result, onClose }) {
   const records = useMemo(() => collectRecords(result) || [], [result])
   const columns = useMemo(() => recordColumns(records), [records])
+  const diffs = Array.isArray(result?.recordDiffs) ? result.recordDiffs : []
   const pages = [...new Set(records.map((record) => record.page).filter(Boolean))]
   const showPage = pages.length > 1
   return (
@@ -5230,9 +5293,29 @@ function RecordsDialog({ result, onClose }) {
                 return (
                   <TableRow key={`${record.page}-${index}`} hover>
                     {showPage && <TableCell sx={{ whiteSpace: 'nowrap', color: 'text.secondary' }}>{record.page}</TableCell>}
-                    {columns.map((column) => (
-                      <TableCell key={column} sx={{ whiteSpace: 'nowrap', fontSize: 12.5 }}>{cellText(flat[column])}</TableCell>
-                    ))}
+                    {columns.map((column) => {
+                      const error = recordFieldError(diffs, record, index, column)
+                      return (
+                        <TableCell
+                          key={column}
+                          sx={{
+                            whiteSpace: 'nowrap',
+                            fontSize: 12.5,
+                            bgcolor: error ? '#fff1f0' : 'inherit',
+                            color: error ? '#b42318' : 'inherit',
+                            boxShadow: error ? 'inset 0 -2px 0 #f3b4b0' : 'none',
+                          }}
+                        >
+                          {error ? (
+                            <Tooltip title={error} placement="top" arrow>
+                              <Box component="span" sx={{ cursor: 'help', display: 'inline-block', minWidth: '100%' }}>
+                                {cellText(flat[column])}
+                              </Box>
+                            </Tooltip>
+                          ) : cellText(flat[column])}
+                        </TableCell>
+                      )
+                    })}
                   </TableRow>
                 )
               })}
@@ -5242,6 +5325,21 @@ function RecordsDialog({ result, onClose }) {
       </DialogContent>
     </>
   )
+}
+
+function recordFieldError(diffs, record, index, column) {
+  if (!Array.isArray(diffs) || !diffs.length) return ''
+  const flat = flattenRecord(record?.value)
+  const hit = diffs.find((diff) => {
+    if (Number.isInteger(diff.actualIndex) && diff.actualIndex === index) return true
+    if (diff.matchKey && flat && Object.prototype.hasOwnProperty.call(flat, diff.matchKey)) {
+      return String(flat[diff.matchKey]) === String(diff.matchValue)
+        || (Number.isFinite(Number(flat[diff.matchKey])) && Number(flat[diff.matchKey]) === Number(diff.matchValue))
+    }
+    return false
+  })
+  const field = hit?.fields?.find((item) => item.path === column)
+  return field?.message || ''
 }
 
 const LIST_KEYS = ['content', 'items', 'data', 'results', 'records']

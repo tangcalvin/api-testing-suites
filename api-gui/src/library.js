@@ -241,6 +241,7 @@ export function loadedRunResults(raw) {
     if (asBool(item?.skipped)) result.skipped = true
     if (item?.request) result.request = storedPayload(item.request)
     if (Array.isArray(item?.records) && item.records.length) result.records = item.records
+    if (Array.isArray(item?.recordDiffs) && item.recordDiffs.length) result.recordDiffs = item.recordDiffs
     if (item?.step) result.step = String(item.step)
     if (item?.enquiry && typeof item.enquiry === 'object') {
       result.enquiry = {

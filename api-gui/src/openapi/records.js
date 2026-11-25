@@ -135,25 +135,35 @@ export function filterRecords(rows, rules, sent) {
 
 export function compareRecords(expected, actual, options = {}) {
   const exp = (Array.isArray(expected) ? expected : []).map((row) => flattenRow(row))
-  const got = (Array.isArray(actual) ? actual : []).map((row) => flattenRow(row))
+  const got = (Array.isArray(actual) ? actual : []).map((row, index) => ({ flat: flattenRow(row), index }))
+  const flats = got.map((item) => item.flat)
   const keys = expectedKeys(exp)
-  const overlap = sharedKeys(exp, got)
-  const matchKey = pickMatchKey(exp, got, keys.length ? keys : overlap)
+  const overlap = sharedKeys(exp, flats)
+  const matchKey = pickMatchKey(exp, flats, keys.length ? keys : overlap)
   const problems = []
-  if (!matchKey && exp.length > 0 && got.length > 0 && overlap.length === 0) {
-    return { passed: false, detail: 'The uploaded columns do not match the response.' }
+  if (!matchKey && exp.length > 0 && flats.length > 0 && overlap.length === 0) {
+    return { passed: false, detail: 'The uploaded columns do not match the response.', diffs: [] }
   }
   const pairs = []
   const missing = []
   const extra = []
   if (matchKey) {
-    const keyOf = (row) => `${matchKey}:${identity(row[matchKey])}`
-    const left = tally(exp, keyOf)
-    const right = tally(got, keyOf)
+    const keyOfFlat = (row) => `${matchKey}:${identity(row[matchKey])}`
+    const left = tally(exp, keyOfFlat)
+    const right = tally(got, (item) => keyOfFlat(item.flat))
     for (const [key, rows] of left.map) {
       const other = right.map.get(key) || []
       const count = Math.min(rows.length, other.length)
-      for (let index = 0; index < count; index += 1) pairs.push([rows[index], other[index], labelFor(key, 1)])
+      for (let index = 0; index < count; index += 1) {
+        pairs.push({
+          expected: rows[index],
+          actual: other[index].flat,
+          actualIndex: other[index].index,
+          label: labelFor(key, 1),
+          matchKey,
+          matchValue: rows[index]?.[matchKey],
+        })
+      }
       if (rows.length > other.length) missing.push(labelFor(key, rows.length - other.length))
     }
     for (const [key, rows] of right.map) {
@@ -166,14 +176,14 @@ export function compareRecords(expected, actual, options = {}) {
       if (leftOrder.some((key, index) => rightOrder[index] !== key)) problems.push('Records are out of order.')
     }
   } else {
-    const unused = got.map((row, index) => ({ row, index }))
+    const unused = got.map((item) => ({ ...item }))
     const used = new Set()
     exp.forEach((row, index) => {
       let best = -1
       let bestScore = Number.POSITIVE_INFINITY
       for (let cursor = 0; cursor < unused.length; cursor += 1) {
         if (used.has(unused[cursor].index)) continue
-        const score = fieldDiffList(row, unused[cursor].row, keys).length
+        const score = fieldDiffList(row, unused[cursor].flat, keys).length
         if (score < bestScore) {
           best = cursor
           bestScore = score
@@ -185,33 +195,49 @@ export function compareRecords(expected, actual, options = {}) {
         return
       }
       used.add(unused[best].index)
-      pairs.push([row, unused[best].row, `Excel row ${index + 1}`])
+      pairs.push({
+        expected: row,
+        actual: unused[best].flat,
+        actualIndex: unused[best].index,
+        label: `Excel row ${index + 1}`,
+        matchKey: '',
+        matchValue: null,
+      })
     })
-    unused.forEach((item, index) => {
-      if (!used.has(item.index)) extra.push(`response row ${index + 1}`)
+    unused.forEach((item) => {
+      if (!used.has(item.index)) extra.push(`response row ${item.index + 1}`)
     })
     if (options.ordered && missing.length === 0 && extra.length === 0 && keys.length > 0) {
       const leftOrder = exp.map((row) => signature(row, keys))
-      const rightOrder = got.map((row) => signature(row, keys))
+      const rightOrder = flats.map((row) => signature(row, keys))
       if (leftOrder.some((key, index) => rightOrder[index] !== key)) problems.push('Records are out of order.')
     }
   }
   if (missing.length) problems.push(`Missing from response: ${missing.slice(0, 4).join(', ')}.`)
   if (extra.length) problems.push(`Extra in response: ${extra.slice(0, 4).join(', ')}.`)
+  const diffs = []
   const mismatched = []
-  for (const [left, right, label] of pairs) {
-    const diffs = fieldDiffList(left, right, keys.filter((key) => key !== matchKey))
-    if (diffs.length === 0) continue
-    mismatched.push(`Field mismatch on ${label}:\n  ${diffs.slice(0, 5).join('\n  ')}`)
+  for (const pair of pairs) {
+    const fields = fieldDiffList(pair.expected, pair.actual, keys.filter((key) => key !== matchKey))
+    if (fields.length === 0) continue
+    diffs.push({
+      label: pair.label,
+      matchKey: pair.matchKey || '',
+      matchValue: pair.matchValue,
+      actualIndex: pair.actualIndex,
+      fields,
+    })
+    mismatched.push(`Field mismatch on ${pair.label}:\n  ${fields.slice(0, 5).map((item) => item.message).join('\n  ')}`)
   }
   if (mismatched.length) problems.push(mismatched.slice(0, 3).join('\n'))
   if (problems.length > 0) {
-    const count = `Expected ${exp.length} Excel row${exp.length === 1 ? '' : 's'} after filters, received ${got.length} from the response.`
-    return { passed: false, detail: [count, ...problems].join('\n') }
+    const count = `Expected ${exp.length} Excel row${exp.length === 1 ? '' : 's'} after filters, received ${flats.length} from the response.`
+    return { passed: false, detail: [count, ...problems].join('\n'), diffs }
   }
   return {
     passed: true,
     detail: exp.length === 0 ? 'No records match this filter.' : `${exp.length} ${exp.length === 1 ? 'record' : 'records'} matched.`,
+    diffs: [],
   }
 }
 
@@ -798,13 +824,140 @@ function fieldDiffList(expected, actual, keys) {
     const got = readPath(actual, key)
     if (got.missing) {
       if (isEmpty(want)) continue
-      diffs.push(`${key}: expected ${quoteValue(want)}, got (missing)`)
+      diffs.push({
+        path: key,
+        expected: want,
+        actual: undefined,
+        message: `${key}: expected ${quoteValue(want)}, got (missing)`,
+      })
       continue
     }
     if (sameValue(want, got.value)) continue
-    diffs.push(`${key}: expected ${quoteValue(want)}, got ${quoteValue(got.value)}`)
+    diffs.push({
+      path: key,
+      expected: want,
+      actual: got.value,
+      message: `${key}: expected ${quoteValue(want)}, got ${quoteValue(got.value)}`,
+    })
   }
   return diffs
+}
+
+export function annotateJsonLines(text, diffs) {
+  const lines = String(text || '').split('\n')
+  const notes = Array.from({ length: lines.length }, () => '')
+  for (const diff of diffs || []) {
+    if (!diff?.fields?.length) continue
+    const range = recordLineRange(lines, diff)
+    if (!range) continue
+    for (const field of diff.fields) {
+      let line = findFieldLine(lines, range.start, range.end, field.path)
+      if (line < 0) {
+        const parts = String(field.path || '').split('.').filter(Boolean)
+        while (line < 0 && parts.length > 1) {
+          parts.pop()
+          line = findFieldLine(lines, range.start, range.end, parts.join('.'))
+        }
+      }
+      if (line < 0) continue
+      const note = field.message || `${field.path} mismatch`
+      notes[line] = notes[line] ? `${notes[line]} · ${note}` : note
+    }
+  }
+  return { lines, notes }
+}
+
+function recordLineRange(lines, diff) {
+  if (diff.matchKey != null && String(diff.matchKey) !== '' && diff.matchValue != null && diff.matchValue !== '') {
+    const idLine = findKeyValueLine(lines, 0, lines.length, diff.matchKey, diff.matchValue)
+    if (idLine >= 0) return objectBounds(lines, idLine)
+  }
+  if (Number.isInteger(diff.actualIndex) && diff.actualIndex >= 0) {
+    const starts = recordObjectStarts(lines)
+    if (diff.actualIndex < starts.length) return objectBounds(lines, starts[diff.actualIndex])
+  }
+  return null
+}
+
+function recordObjectStarts(lines) {
+  const starts = []
+  let depth = 0
+  let arrayDepth = 0
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]
+    const openArr = (line.match(/\[/g) || []).length
+    const closeArr = (line.match(/\]/g) || []).length
+    const openObj = (line.match(/\{/g) || []).length
+    const closeObj = (line.match(/\}/g) || []).length
+    if (arrayDepth >= 1 && depth === arrayDepth && /^\s*\{/.test(line)) starts.push(index)
+    arrayDepth += openArr - closeArr
+    depth += openObj - closeObj
+  }
+  return starts
+}
+
+function findFieldLine(lines, start, end, path) {
+  const parts = String(path || '').split('.').filter(Boolean)
+  if (parts.length === 0) return -1
+  let from = start
+  let to = end
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index]
+    const line = findKeyLine(lines, from, to, part)
+    if (line < 0) return -1
+    if (index === parts.length - 1) return line
+    const nested = objectBounds(lines, line)
+    if (!nested) return -1
+    from = nested.start
+    to = nested.end
+  }
+  return -1
+}
+
+function findKeyLine(lines, start, end, key) {
+  const pattern = new RegExp(`^\\s*"${escapeRegExp(key)}"\\s*:`)
+  for (let index = start; index < end; index += 1) {
+    if (pattern.test(lines[index])) return index
+  }
+  return -1
+}
+
+function findKeyValueLine(lines, start, end, key, value) {
+  const pattern = new RegExp(`^\\s*"${escapeRegExp(key)}"\\s*:\\s*${jsonLiteralPattern(value)}\\s*,?\\s*$`)
+  for (let index = start; index < end; index += 1) {
+    if (pattern.test(lines[index])) return index
+  }
+  return -1
+}
+
+function jsonLiteralPattern(value) {
+  if (value == null) return 'null'
+  if (typeof value === 'boolean') return String(value)
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value)
+  const text = String(value)
+  if (/^-?\d+(\.\d+)?$/.test(text)) return `(?:${escapeRegExp(text)}|"${escapeRegExp(text)}")`
+  return `"${escapeRegExp(text)}"`
+}
+
+function objectBounds(lines, anchor) {
+  if (anchor < 0 || anchor >= lines.length) return null
+  let start = anchor
+  while (start > 0 && !/\{/.test(lines[start])) start -= 1
+  if (!/\{/.test(lines[start])) start = anchor
+  let depth = 0
+  let begun = false
+  for (let index = start; index < lines.length; index += 1) {
+    const open = (lines[index].match(/\{/g) || []).length
+    const close = (lines[index].match(/\}/g) || []).length
+    depth += open - close
+    if (open > 0) begun = true
+    if (begun && depth <= 0) return { start, end: index + 1 }
+  }
+  return { start, end: lines.length }
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
 function readPath(row, key) {
