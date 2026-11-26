@@ -973,7 +973,8 @@ function readPath(row, key) {
 }
 
 function quoteValue(value) {
-  if (value == null) return '(empty)'
+  if (value === undefined) return '(missing)'
+  if (value === null) return 'null'
   if (typeof value === 'string') {
     const text = value.length > 60 ? `${value.slice(0, 57)}...` : value
     return JSON.stringify(text)

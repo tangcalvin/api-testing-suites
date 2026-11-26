@@ -233,6 +233,13 @@ test('csv and json files become records', () => {
     [{ id: 1, notes: '' }],
   )
   assert.equal(nullVsEmpty.passed, false)
+  assert.match(nullVsEmpty.detail, /notes: expected null, got ""/)
+  const emptyVsNull = compareRecords(
+    [{ id: 1, notes: '' }],
+    [{ id: 1, notes: null }],
+  )
+  assert.equal(emptyVsNull.passed, false)
+  assert.match(emptyVsNull.detail, /notes: expected "", got null/)
 })
 
 test('an xlsx sheet becomes records', async () => {

@@ -4881,6 +4881,8 @@ function statusTone(code) {
 
 function ResponsePreview({ result }) {
   const summary = responseSummary(result)
+  const records = hasRecordList(result)
+  const fields = !records && hasFieldMap(result)
   return (
     <Stack direction="row" spacing={0.75} sx={{ alignItems: 'center', minWidth: 0 }}>
       {summary ? (
@@ -4888,7 +4890,8 @@ function ResponsePreview({ result }) {
       ) : result.text ? (
         <Typography variant="caption" color="text.secondary">JSON</Typography>
       ) : null}
-      {hasRecordList(result) && <RecordsTableButton result={result} />}
+      {records && <RecordsTableButton result={result} />}
+      {fields && <ResponseFieldsButton result={result} />}
     </Stack>
   )
 }
@@ -5238,6 +5241,17 @@ function hasRecordList(result) {
   return Array.isArray(result?.pages) && result.pages.some((page) => page.count > 0)
 }
 
+function hasFieldMap(result) {
+  const body = responseBody(result)
+  return Boolean(body && typeof body === 'object' && !Array.isArray(body))
+}
+
+function responseBody(result) {
+  if (result?.text) return parseJson(result.text)
+  if (Array.isArray(result?.pages) && result.pages[0]?.text) return parseJson(result.pages[0].text)
+  return null
+}
+
 let resultOpenGuard = 0
 
 function suppressResultOpen() {
@@ -5333,12 +5347,14 @@ function RecordsDialog({ result, onClose }) {
                     {showPage && <TableCell sx={{ whiteSpace: 'nowrap', color: 'text.secondary' }}>{record.page}</TableCell>}
                     {columns.map((column) => {
                       const error = recordFieldError(diffs, record, index, column)
+                      const display = cellDisplay(flat[column])
                       return (
                         <TableCell
                           key={column}
                           sx={{
                             whiteSpace: 'nowrap',
                             fontSize: 12.5,
+                            p: 0,
                             bgcolor: error ? '#fff1f0' : 'inherit',
                             color: error ? '#b42318' : 'inherit',
                             boxShadow: error ? 'inset 0 -2px 0 #f3b4b0' : 'none',
@@ -5346,11 +5362,15 @@ function RecordsDialog({ result, onClose }) {
                         >
                           {error ? (
                             <Tooltip title={error} placement="top" arrow>
-                              <Box component="span" sx={{ cursor: 'help', display: 'inline-block', minWidth: '100%' }}>
-                                {cellText(flat[column])}
+                              <Box sx={{ cursor: 'help', display: 'block', width: '100%', minHeight: 32, px: 2, py: 1, boxSizing: 'border-box' }}>
+                                <CellValue display={display} />
                               </Box>
                             </Tooltip>
-                          ) : cellText(flat[column])}
+                          ) : (
+                            <Box sx={{ display: 'block', width: '100%', minHeight: 32, px: 2, py: 1, boxSizing: 'border-box' }}>
+                              <CellValue display={display} />
+                            </Box>
+                          )}
                         </TableCell>
                       )
                     })}
@@ -5438,9 +5458,127 @@ function flattenRecord(value, prefix = '', into = {}) {
 }
 
 function cellText(value) {
-  if (value == null) return ''
-  if (typeof value === 'object') return JSON.stringify(value)
-  return String(value)
+  return cellDisplay(value).text
+}
+
+function cellDisplay(value) {
+  if (value === undefined) return { text: '(missing)', muted: true }
+  if (value === null) return { text: 'null', muted: true }
+  if (value === '') return { text: '""', muted: true }
+  if (typeof value === 'object') return { text: JSON.stringify(value), muted: false }
+  return { text: String(value), muted: false }
+}
+
+function CellValue({ display }) {
+  return (
+    <Box
+      component="span"
+      sx={{
+        color: display.muted ? 'text.secondary' : 'inherit',
+        fontStyle: display.muted ? 'italic' : 'normal',
+        fontFamily: display.muted ? 'ui-monospace, SFMono-Regular, Menlo, monospace' : 'inherit',
+      }}
+    >
+      {display.text}
+    </Box>
+  )
+}
+
+function ResponseFieldsButton({ result }) {
+  const [open, setOpen] = useState(false)
+  const close = (event) => {
+    event?.stopPropagation?.()
+    suppressResultOpen()
+    setOpen(false)
+  }
+  return (
+    <>
+      <Button
+        size="small"
+        variant="outlined"
+        onMouseDown={(event) => event.stopPropagation()}
+        onClick={(event) => {
+          event.stopPropagation()
+          setOpen(true)
+        }}
+        sx={{ minWidth: 0, px: 0.75, py: 0, fontSize: 11, lineHeight: 1.7, textTransform: 'none', flexShrink: 0 }}
+      >
+        Fields
+      </Button>
+      <Dialog
+        open={open}
+        onClose={close}
+        onClick={(event) => event.stopPropagation()}
+        onMouseDown={(event) => event.stopPropagation()}
+        maxWidth="md"
+        fullWidth
+        slotProps={{
+          backdrop: {
+            onClick: (event) => event.stopPropagation(),
+            onMouseDown: (event) => event.stopPropagation(),
+          },
+        }}
+      >
+        <ResponseFieldsDialog result={result} onClose={close} />
+      </Dialog>
+    </>
+  )
+}
+
+function ResponseFieldsDialog({ result, onClose }) {
+  const rows = useMemo(() => {
+    const body = responseBody(result)
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return []
+    const flat = flattenRecord(body)
+    return Object.keys(flat).map((path) => ({ path, value: flat[path] }))
+  }, [result])
+  return (
+    <>
+      <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+        <Box sx={{ flex: 1 }}>Response fields</Box>
+        <Button
+          onMouseDown={(event) => event.stopPropagation()}
+          onClick={(event) => {
+            event.stopPropagation()
+            onClose(event)
+          }}
+        >
+          Close
+        </Button>
+      </DialogTitle>
+      <DialogContent dividers sx={{ p: 0 }}>
+        <Box sx={{ overflow: 'auto', maxHeight: '70vh' }}>
+          <Table size="small" stickyHeader>
+            <TableHead>
+              <TableRow>
+                <TableCell sx={{ width: '36%', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12 }}>Field</TableCell>
+                <TableCell sx={{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12 }}>Value</TableCell>
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {rows.length === 0 ? (
+                <TableRow>
+                  <TableCell colSpan={2} sx={{ color: 'text.secondary' }}>No fields in this response.</TableCell>
+                </TableRow>
+              ) : rows.map((row) => {
+                const display = cellDisplay(row.value)
+                return (
+                  <TableRow key={row.path} hover>
+                    <TableCell sx={{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12.5, verticalAlign: 'top' }}>
+                      {row.path}
+                    </TableCell>
+                    <TableCell sx={{ fontSize: 12.5, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                      <CellValue display={display} />
+                    </TableCell>
+                  </TableRow>
+                )
+              })}
+            </TableBody>
+          </Table>
+        </Box>
+      </DialogContent>
+    </>
+  )
 }
 
 function PayloadText({ text, open, maxHeight = 220 }) {

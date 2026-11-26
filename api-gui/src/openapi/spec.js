@@ -2330,7 +2330,9 @@ function sameInstant(actual, expected) {
 }
 
 function describeExpected(value) {
-  if (value == null) return 'null'
+  if (value === undefined) return '(missing)'
+  if (value === null) return 'null'
+  if (value === '') return '""'
   if (typeof value === 'object') return JSON.stringify(value)
   return String(value)
 }
@@ -2762,12 +2764,10 @@ function matchCustomFields(text, fields, context) {
 }
 
 function describeActual(actual) {
-  if (actual === undefined || actual === null) {
-    return 'missing'
-  }
-  if (typeof actual === 'object') {
-    return JSON.stringify(actual)
-  }
+  if (actual === undefined) return 'missing'
+  if (actual === null) return 'null'
+  if (actual === '') return '""'
+  if (typeof actual === 'object') return JSON.stringify(actual)
   return String(actual)
 }
 
